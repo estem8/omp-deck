@@ -16,7 +16,8 @@
 //! stall anywhere on the way (OmpDeck's PTY thread, the tmux server, ConPTY) delivered the old timed
 //! `Esc` … 150 ms … Enter back to back — a newline under a still-open popup, the command unsent.
 //! The popup is detected as a change of [`composer::rows_below`] against the empty composer before
-//! the paste; without one no `Esc` is sent at all. A step omp never shows in time ([`SHOW_TIMEOUT`],
+//! the paste, omp's status line aside (it redraws on input; [`composer::rows_below_changed`]);
+//! without one no `Esc` is sent at all. A step omp never shows in time ([`SHOW_TIMEOUT`],
 //! [`ESC_TIMEOUT`]) abandons the job without Enter ([`End::Stalled`]): the command stays in the
 //! composer rather than risk the merge.
 //!
@@ -881,7 +882,7 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     let popup = if env.activity == Activity::Idle {
         let below = composer::rows_below(&screen).unwrap_or_default();
         match settle {
-            Some((rows, since)) if *rows == below => {
+            Some((rows, since)) if !composer::rows_below_changed(rows, &below) => {
                 let due = *since + SETTLE;
                 if now < due {
                     return Step::Wait(SCREEN_POLL.min(due - now));
@@ -892,7 +893,7 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
                 return Step::Wait(SCREEN_POLL);
             }
         }
-        (below != *baseline).then_some(below)
+        composer::rows_below_changed(baseline, &below).then_some(below)
     } else {
         None
     };
@@ -921,7 +922,9 @@ fn after_escape(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     if now < due {
         return Step::Wait(due - now);
     }
-    if composer::rows_below(&(env.screen)()).is_some_and(|rows| rows != *popup) {
+    if composer::rows_below(&(env.screen)())
+        .is_some_and(|rows| composer::rows_below_changed(popup, &rows))
+    {
         write(a, out, ENTER_KEY);
         Step::Done
     } else if now >= *at + ESC_TIMEOUT {
@@ -937,6 +940,8 @@ mod tests {
 
     const ALT_SHIFT: Mods = Mods::new(true, true, false);
     const STATUS: &str = " π · ◒ Fake One · 🗑 w3f/proj · ◫ 7.4%/100K ⟲";
+    /// [`STATUS`] after omp refreshed its git segment on input.
+    const STATUS_REDRAWN: &str = " π · ◒ Fake One · 🗑 w3f/proj · @ main ?7 · ◫ 7.4%/100K ⟲";
     /// omp's autocomplete popup under the composer.
     const POPUP: [&str; 2] = ["> a/b     Model B", "  a/bc    Model BC"];
 
@@ -996,6 +1001,10 @@ mod tests {
         stuck_from_esc: bool,
         /// An Enter reached omp while its popup was open (it would apply a completion).
         enter_into_popup: bool,
+        /// omp's status line, the last row; omp draws the popup above it.
+        status: String,
+        /// omp redraws the status line on the paste (a git count refreshed on input).
+        redraw_status_on_paste: bool,
     }
 
     impl Fixture {
@@ -1012,6 +1021,8 @@ mod tests {
                 react: true,
                 stuck_from_esc: false,
                 enter_into_popup: false,
+                status: STATUS.to_owned(),
+                redraw_status_on_paste: false,
             }
         }
 
@@ -1019,8 +1030,12 @@ mod tests {
             if let Some(s) = &self.fixed {
                 return s.clone();
             }
-            let below: &[&str] = if self.popup { &POPUP } else { &["", STATUS] };
-            rail_screen(&self.draft, below)
+            let mut below = vec![""];
+            if self.popup {
+                below.extend(POPUP);
+            }
+            below.push(&self.status);
+            rail_screen(&self.draft, &below)
         }
 
         fn poll(&mut self, inj: &mut Injector, ms: u64) -> Poll {
@@ -1052,6 +1067,9 @@ mod tests {
                     let inner = &b[PASTE_START.len()..b.len() - PASTE_END.len()];
                     self.draft.push_str(&String::from_utf8_lossy(inner));
                     self.popup = self.paste_opens_popup && self.draft.starts_with('/');
+                    if self.redraw_status_on_paste {
+                        self.status = STATUS_REDRAWN.to_owned();
+                    }
                 }
                 Write::Key(Key::Escape, _) => self.popup = false,
                 Write::Key(Key::Enter, _) => {
@@ -1113,6 +1131,54 @@ mod tests {
         let w = drain(&mut fx, &mut inj);
         assert_eq!(keys(&w), vec![paste("/rename new title"), ENTER_KEY]);
         assert!(fx.draft.is_empty());
+    }
+
+    /// The bug: omp refreshes its git segment on input, so in a repo whose files were changing the
+    /// status line redrew right after the paste; read as a popup, the prompt got an `Esc`, waited
+    /// for a popup to close and stalled in the composer without its Enter.
+    #[test]
+    fn a_status_line_redraw_after_the_paste_is_not_a_popup() {
+        let mut fx = Fixture::new();
+        fx.redraw_status_on_paste = true;
+        let mut inj = Injector::default();
+        inj.push(Job::text("Send prompt", "Reply with ok.", true));
+        let w = drain(&mut fx, &mut inj);
+        assert_eq!(keys(&w), vec![paste("Reply with ok."), ENTER_KEY]);
+        assert!(fx.draft.is_empty());
+    }
+
+    #[test]
+    fn a_popup_is_still_closed_first_when_the_status_line_redraws_too() {
+        let mut fx = Fixture::new();
+        fx.redraw_status_on_paste = true;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Switch model", "/switch a/b", Requires::Any));
+        let w = drain(&mut fx, &mut inj);
+        assert_eq!(keys(&w), vec![paste("/switch a/b"), ESC_KEY, ENTER_KEY]);
+        assert!(!fx.enter_into_popup && fx.draft.is_empty());
+    }
+
+    /// A status redraw while the popup is still open is not the popup closing: no Enter yet.
+    #[test]
+    fn a_status_line_redraw_under_an_open_popup_is_not_its_close() {
+        let mut fx = Fixture::new();
+        fx.stuck_from_esc = true;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Switch model", "/switch a/b", Requires::Any));
+        let mut writes = Vec::new();
+        let mut stalled = Vec::new();
+        let mut t = 0;
+        while inj.is_busy() && t < 10_000 {
+            if writes.contains(&ESC_KEY) {
+                fx.status = STATUS_REDRAWN.to_owned();
+            }
+            let p = fx.poll(&mut inj, t);
+            stalled.extend(p.stalled());
+            writes.extend(p.writes);
+            t += 10;
+        }
+        assert_eq!(writes, vec![paste("/switch a/b"), ESC_KEY]);
+        assert_eq!(stalled, vec!["Switch model".to_owned()]);
     }
 
     /// The bug: the Esc and the Enter reached omp back to back (Alt+Enter, a newline under a still

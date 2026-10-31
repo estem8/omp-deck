@@ -77,6 +77,21 @@ pub fn rows_below(screen: &ScreenText) -> Option<Vec<String>> {
     Some(rows)
 }
 
+/// Whether two [`rows_below`] snapshots differ the way omp's autocomplete popup changes them. omp
+/// draws the popup inside its editor, directly under the composer rows (`tui/src/components/
+/// editor.ts`), and its status line last (`tui/src/prompt/composer.ts`: `[...runtime roots,
+/// statusHost]`), so a popup opening or closing always changes the rows above the status line or
+/// their count. The status line also redraws on its own — omp refreshes the git counts on input —
+/// and that alone is no popup: read as one, every injection into a repo whose files were changing
+/// sent `Esc`, waited for a popup to close and stalled without its Enter.
+pub fn rows_below_changed(before: &[String], after: &[String]) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    let above_status = before.len().saturating_sub(1);
+    before[..above_status] != after[..above_status]
+}
+
 /// omp's empty-composer hint is `<key> <label>` (bundle `composer-hints.ts`, captured on 18.12.5 for
 /// `rail` and `band`: `⇧⇥ to change thinking effort`), drawn right-aligned on the cursor row.
 const HINT_LABELS: [&str; 2] = ["to change thinking effort", "to see "];

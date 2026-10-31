@@ -150,6 +150,11 @@ Harness: python `pty.fork()` → `tmux -L omp-deck-test-act -f docs/notes/tmux.c
    rows below == baseline → 0x0d                          # no popup: no Esc at all
    else (idle only) Esc ; ≥ 150 ms, then until the rows below change (popup closed; ≤ 2 s, else give up) → 0x0d
    ```
+   "Rows below change" ignores omp's status line, the last row (`composer::rows_below_changed`): omp draws the popup
+   inside the editor right under the composer (`tui/src/components/editor.ts`) and the status host last
+   (`tui/src/prompt/composer.ts`), so a popup always changes the rows above it or their count, while the status line
+   redraws on its own — omp refreshes git counts on input (V 0.22.2: `?6` → `?7` 30 ms after the paste in a repo with
+   changing files). Treating that as a popup sent Esc and stalled every prompt/command there without its Enter.
    A step omp never shows in time abandons the job without Enter (`Poll::stalled`, toast "… check the composer").
    Measured (omp 18.12.6 in tmux): the pasted text renders ~230 ms after the paste, the popup ~16 ms later; after Esc
    the popup closes in ~62 ms. After a Ctrl+C the old popup stays on screen (stale); Enter with that popup open applies
