@@ -76,7 +76,7 @@ export function SessionActionsSheet({
                 ['Messages', entryMessages(entry)],
                 ...(entry.artifact_files > 0 ? [['Artifacts', `${plural(entry.artifact_files, 'file')} · ${bytes(entry.artifact_bytes)}`] as const] : []),
               ] as const)),
-          ...(running ? [['Running', 'left running; only the file goes'] as const] : []),
+          ...(running ? [['Running', 'stopped first, then deleted'] as const] : []),
         ]}
         confirm="Delete"
         busy={busy}

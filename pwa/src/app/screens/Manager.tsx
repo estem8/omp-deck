@@ -284,7 +284,7 @@ export function ManagerScreen(): ReactNode {
             ['Messages', totals.messages],
             ...chosen.slice(0, 4).map((entry, index) => [`#${index + 1}`, `${entryTitle(entry)} · ${bytes(entrySize(entry))}`] as const),
             ...(chosen.length > 4 ? [['More', `${chosen.length - 4} others`] as const] : []),
-            ...(totals.running > 0 ? [['Running', `${totals.running} (left running)`] as const] : []),
+            ...(totals.running > 0 ? [['Running', `${totals.running} (stopped first)`] as const] : []),
           ]}
           confirm={`Delete ${chosen.length}`}
           busy={busy}

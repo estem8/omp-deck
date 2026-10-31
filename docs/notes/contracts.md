@@ -2492,6 +2492,12 @@ No gateway daemon, public listener, relay or PWA is enabled by this slice.
   shared helpers. Existing core ctl/tree/git/worktree/Drive/update executors remain the implementation
   for their action families, not empty service-command wrappers. The complete route matrix is in
   `mobile-companion.md`; native dialogs/clipboard/folder/window effects remain client-local.
+- Delete and move stop every live session that runs a target (gateway jobs `delete_sessions`/`move_session`):
+  the caller's `stop` (sessions holding the file open, tabs) plus, via `jobs::with_ctl_holders`, each live
+  session with a control endpoint and no held session file whose ctl snapshot reports a target as its
+  `session_file` (≤ 2 s, on the worker). Reason: omp drops its jsonl writer handle on every atomic rewrite (the
+  title after the first turn) until its next append, so an idle session is often invisible to the open-file map;
+  it was left running and omp's session lease refused the delete ("it is open in another omp process").
 
 ### Delivery, close and later IPC
 

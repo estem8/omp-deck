@@ -1180,11 +1180,11 @@ impl App {
     }
 
     /// Kill the backend session `name` (the sidebar's "Stop session"); the outcome arrives as a
-    /// toast.
+    /// toast and, once it is stopped, the tabs showing it close.
     fn kill_session(&mut self, name: String, label: String) {
         self.gw.mutate(
             Mutation::KillNames {
-                names: vec![name],
+                names: vec![name.clone()],
                 wait: false,
             },
             move |app, result| match result {
@@ -1195,7 +1195,10 @@ impl App {
                         format!("Could not stop “{label}”: {}", why.join("; ")),
                     );
                 }
-                Ok(_) => app.toasts.success(&app.ctx, format!("Stopped “{label}”")),
+                Ok(_) => {
+                    app.close_tabs_where(|t| t.mux_name() == Some(name.as_str()));
+                    app.toasts.success(&app.ctx, format!("Stopped “{label}”"));
+                }
                 Err(e) => app
                     .toasts
                     .error(&app.ctx, format!("Could not stop “{label}”: {e}")),
@@ -1204,22 +1207,38 @@ impl App {
         self.refresh_sessions();
     }
 
-    /// Kill the process of tab `i` — only that tab's session.
+    /// Kill the process of tab `i` — only that tab's session — and close the tab once it is
+    /// stopped.
     fn kill_tab(&mut self, i: usize) {
         let Some(tab) = self.tabs.get(i) else {
             return;
         };
         let target = tab.target().clone();
+        let key = target.key.clone();
         let label = tab.title(&self.labels).to_owned();
         let announce = tab.mux_name.is_some();
         self.gw
             .mutate(Mutation::Kill(target), move |app, result| match result {
-                Ok(_) if announce => app.toasts.success(&app.ctx, format!("Stopped “{label}”")),
-                Ok(_) => {}
+                Ok(_) => {
+                    app.close_tabs_where(|t| t.target().key == key);
+                    if announce {
+                        app.toasts.success(&app.ctx, format!("Stopped “{label}”"));
+                    }
+                }
                 Err(e) => app
                     .toasts
                     .error(&app.ctx, format!("Could not stop “{label}”: {e}")),
             });
+    }
+
+    /// Close (remembered for Ctrl+Shift+T) every tab `hit` selects: a process the user stopped
+    /// on purpose takes its tabs along instead of leaving them on `[process exited]`.
+    fn close_tabs_where(&mut self, hit: impl Fn(&Tab) -> bool) {
+        for i in (0..self.tabs.len()).rev() {
+            if hit(&self.tabs[i]) {
+                self.close_tab(i, true);
+            }
+        }
     }
 
     fn apply_tab_action(&mut self, action: TabAction) {
@@ -1560,7 +1579,7 @@ impl App {
             Confirm {
                 title: "Stop session process?".to_owned(),
                 body: format!(
-                    "“{label}” will be terminated. Its session file stays in the sidebar, so you can resume it later."
+                    "“{label}” will be terminated and its open tab closes. Its session file stays in the sidebar, so you can resume it later."
                 ),
                 confirm_label: "Stop session".to_owned(),
                 danger: true,
@@ -2569,7 +2588,9 @@ impl App {
         ));
     }
 
-    /// When an update or install tab's process has exited: re-check, and report the outcome.
+    /// When an update or install tab's process has exited: re-check, and report the outcome. A
+    /// successful update closes its tab (the toast reports the result); a failed one stays open
+    /// with the output.
     fn check_update_tabs(&mut self) {
         let mut finished = Vec::new();
         for tab in self.tabs.iter_mut() {
@@ -2578,16 +2599,23 @@ impl App {
                 && tab.terminal().is_exited()
             {
                 tab.exit_handled = true;
-                finished.push((tab.role, tab.terminal().exit_code()));
+                finished.push((
+                    tab.role,
+                    tab.terminal().exit_code(),
+                    tab.target().key.clone(),
+                ));
             }
         }
-        for (role, code) in finished {
+        for (role, code, key) in finished {
             let TabRole::Update(kind) = role else {
                 self.finish_omp_install(code);
                 continue;
             };
             match code {
-                Some(0) => self.update.recheck.push_back(Some(kind)),
+                Some(0) => {
+                    self.close_tabs_where(|t| t.target().key == key);
+                    self.update.recheck.push_back(Some(kind));
+                }
                 other => {
                     let code = other.map_or("signal".to_owned(), |c| c.to_string());
                     self.toasts.error(

@@ -702,7 +702,8 @@ pub fn move_session(
     dest_cwd: &Path,
     stop: &[String],
 ) -> Result<Done, GatewayError> {
-    lifecycle::stop_then_move(ctx.omp()?, &ctx.backends, stop, file, dest_cwd)
+    let stop = with_ctl_holders(ctx, &[file], stop);
+    lifecycle::stop_then_move(ctx.omp()?, &ctx.backends, &stop, file, dest_cwd)
         .map(Done::Moved)
         .map_err(GatewayError::Failed)
 }
@@ -712,11 +713,70 @@ pub fn delete_sessions(
     targets: &[deck_core::omp::DeleteTarget],
     stop: &[String],
 ) -> Result<Done, GatewayError> {
+    let paths: Vec<&Path> = targets.iter().map(|t| t.path.as_path()).collect();
+    let stop = with_ctl_holders(ctx, &paths, stop);
     let mut results = Vec::with_capacity(targets.len());
-    lifecycle::stop_then_delete(ctx.omp()?, &ctx.backends, stop, targets, |p, r| {
+    lifecycle::stop_then_delete(ctx.omp()?, &ctx.backends, &stop, targets, |p, r| {
         results.push((p.to_path_buf(), r.err()));
     });
     Ok(Done::Deleted(results))
+}
+
+/// How long the live sessions asked by [`with_ctl_holders`] get, together, to report their file.
+const CTL_PROBE: Duration = Duration::from_secs(2);
+
+/// `stop` plus every other live session whose omp runs one of `paths`. The caller's names come
+/// from the files the session processes hold open, and omp drops that handle on every atomic
+/// rewrite (e.g. the title after the first turn) until its next append: an idle session can hold
+/// no handle at all, was never stopped, and omp's session lease refused the delete or move. So
+/// each live session with a control endpoint that holds no session file is asked which file its
+/// omp runs. Blocking (at most [`CTL_PROBE`]); runs on the job's worker.
+fn with_ctl_holders(ctx: &JobCtx, paths: &[&Path], stop: &[String]) -> Vec<String> {
+    let mut names = stop.to_vec();
+    let mut probes: Vec<(String, CtlClient)> = Vec::new();
+    for mux in ctx.backends.all() {
+        let alive = mux.alive_sessions();
+        if alive.is_empty() {
+            continue;
+        }
+        let files = mux.session_files(&ctx.root.path);
+        for name in alive {
+            if names.contains(&name) || files.get(&name).is_some_and(|f| !f.is_empty()) {
+                continue;
+            }
+            let dir = deck_core::ctl::ctl_dir(&ctx.ctl_ns, &name);
+            if super::running::ctl_endpoint_exists(&dir) {
+                probes.push((name, CtlClient::spawn(dir, || {})));
+            }
+        }
+    }
+    let wanted: Vec<PathBuf> = paths.iter().map(|p| canonical(p)).collect();
+    let start = Instant::now();
+    while !probes.is_empty() && start.elapsed() < CTL_PROBE {
+        probes.retain(|(name, client)| {
+            let Some(snap) = client.latest() else {
+                return true;
+            };
+            if snap
+                .session_file
+                .as_deref()
+                .is_some_and(|f| wanted.contains(&canonical(f)))
+                && !names.contains(name)
+            {
+                names.push(name.clone());
+            }
+            false
+        });
+        if !probes.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    names
+}
+
+/// `path` with symlinks resolved, or as given when it cannot be resolved.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn export_html(ctx: &JobCtx, file: &Path, dest: &Path) -> Result<Done, GatewayError> {

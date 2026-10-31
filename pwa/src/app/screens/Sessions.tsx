@@ -335,7 +335,7 @@ export function SessionsScreen({ standalone }: { standalone: boolean }): ReactNo
             ['Sessions', chosen.length],
             ...chosen.slice(0, 4).map((entry, index) => [`#${index + 1}`, entry.title] as const),
             ...(chosen.length > 4 ? [['More', `${chosen.length - 4} others`] as const] : []),
-            ...(runningChosen.length > 0 ? [['Running', `${runningChosen.length} (left running)`] as const] : []),
+            ...(runningChosen.length > 0 ? [['Running', `${runningChosen.length} (stopped first)`] as const] : []),
           ]}
           confirm="Delete"
           busy={busy}
