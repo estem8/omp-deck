@@ -471,6 +471,18 @@ A browser allows one `PushSubscription` per service-worker registration, bound t
   - The `Client` still talks to a `PairingStore` bound to one pairing (`KeyStore.scoped(id)`: load, save, reserve a
     timestamp, clear), so the Noise, relay and `Client` logic is unchanged. A scoped store refuses to save another
     desktop's key.
+  - **An upgrade blocked by an old window.** Version 1 keeps its connection for the page's whole life and has no
+    `versionchange` handler, so while an old window is open (a browser tab *and* the installed app, say) the version 2
+    open request is blocked, and boot would sit on a blank screen. Therefore: `boot()` registers the worker first, then
+    `KeyStore.open(indexedDB, hooks)`. On `onblocked` it shows "Finishing the update…" (non-fatal; the request stays
+    pending and completes when the others close) and posts `RELOAD_OTHERS` to the worker. The root worker then
+    `navigate`s every *controlled* window except the sender to its own URL, so the old windows reload into the new code
+    and let go (a window it cannot navigate is left alone; the screen tells the user to close it). Once open, the new
+    code's `db.onversionchange` closes its connection and reloads the page, so it never blocks a later upgrade. Covered
+    by two e2e scenarios (old window reloaded by the worker; old window the worker cannot reload) with the
+    `test/smoke/holder.ts` stand-in for the old app. Not covered: a blocking window that is uncontrolled *and* never
+    closed (the screen stays until the user closes it), and a page on new code still served by an old active worker
+    (it ignores `RELOAD_OTHERS`; the screen asks the user to close the other windows).
   - **Migration from version 1:** the old `pairing/current` record moves into `pairings` in the `onupgradeneeded` of
     the version bump, becomes active and carries its `last` over; no re-pairing. The old store is deleted. A damaged or
     foreign record counts as "not paired" for its slot (a damaged v1 record leaves the app unpaired; a damaged v2
@@ -540,6 +552,7 @@ A browser allows one `PushSubscription` per service-worker registration, bound t
     The desktop is read from `self.registration.scope`; the notification's tag is namespaced per desktop and its
     `navigate` carries `d=<id>`; with 2+ desktops the title carries the desktop's label (kept per scope by the app).
   - `notificationclick` focuses or opens the app at `navigate`.
+  - `RELOAD_OTHERS` (root worker only): reloads the other controlled windows (see "An upgrade blocked by an old window").
   - `pushsubscriptionchange` resubscribes, and the app re-checks `getSubscription()` at every start.
   - Updates are user-confirmed ("Update available → Reload" posts `SKIP_WAITING`), and the reload waits for open
     requests.

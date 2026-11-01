@@ -210,6 +210,63 @@ try {
     await gatewayConnections(page, { first: 1, second: 0 });
   });
 
+  // -- the upgrade while the old app is still open in another window --
+  // Version 1 keeps its IndexedDB connection for the page's life and cannot be told to let go, so it
+  // blocks the new version's upgrade of the database. The holder page (test/smoke/holder.ts) stands
+  // in for it. The first page of each scenario installs the worker, as the app does on its first run.
+  const holderUrl = new URL('/__smoke/holder', smoke.url('')).href;
+  const controlled = (page: Page) => page.waitForFunction(() => navigator.serviceWorker.controller !== null);
+  const watch = (page: Page, errors: string[]) => {
+    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('console', (message) => {
+      if (message.type() === 'error') errors.push(message.text());
+    });
+  };
+
+  await scenario('an old window holding the database is reloaded by the worker, and the new app boots paired', 'route=sessions', async (page, context) => {
+    await controlled(page);
+    // This window becomes the old app: it drops the new database and holds version 1 instead.
+    await page.goto(holderUrl);
+    await page.locator('body[data-holding="yes"]').waitFor({ state: 'attached' });
+    if (!(await page.evaluate(() => navigator.serviceWorker.controller !== null))) throw new Error('the old window is not controlled by the worker');
+    const errors: string[] = [];
+    const fresh = await context.newPage();
+    watch(fresh, errors);
+    await fresh.goto(smoke.url('route=sessions&legacy=1'));
+    await chip(fresh, 'Workstation').waitFor();
+    await fresh.getByText('Refactor tmux launcher').first().waitFor();
+    // The worker reloaded the old window: it ran again and let go.
+    await page.waitForFunction(() => document.body?.dataset['loads'] === '2');
+    if (errors.length > 0) throw new Error(`console errors: ${errors.join(' | ')}`);
+  });
+
+  await scenario('an old window the worker cannot reload: the app says it is finishing the update and boots once that window closes', 'route=sessions', async (page, context) => {
+    await controlled(page);
+    await page.goto('about:blank');
+    // Not controlled by the worker (it is bypassed for this page), so it cannot be navigated.
+    const old = await context.newPage();
+    const session = await context.newCDPSession(old);
+    await session.send('Network.enable');
+    await session.send('Network.setBypassServiceWorker', { bypass: true });
+    await old.goto(holderUrl);
+    await old.locator('body[data-holding="yes"]').waitFor({ state: 'attached' });
+    if (await old.evaluate(() => navigator.serviceWorker.controller !== null)) throw new Error('the old window is controlled by the worker');
+    const errors: string[] = [];
+    const fresh = await context.newPage();
+    watch(fresh, errors);
+    await fresh.goto(smoke.url('route=sessions&legacy=1'));
+    await fresh.getByRole('heading', { name: 'Finishing the update…' }).waitFor();
+    await fresh.getByText('close the other OmpDeck tabs').waitFor();
+    // Give the worker its chance: the window stays as it was.
+    await fresh.waitForTimeout(500);
+    if ((await old.evaluate(() => document.body.dataset['loads'])) !== '1') throw new Error('the worker reloaded a window it does not control');
+    if ((await fresh.locator('.desktop-chip').count()) !== 0) throw new Error('the app booted while the database was blocked');
+    await old.close();
+    await chip(fresh, 'Workstation').waitFor();
+    await fresh.getByText('Refactor tmux launcher').first().waitFor();
+    if (errors.length > 0) throw new Error(`console errors: ${errors.join(' | ')}`);
+  });
+
   // -- Web Push per desktop: each desktop's subscription is on its own registration (/d/<id>/) --
   await scenario(
     'push: each desktop subscribes on its own service-worker registration; forgetting one removes only its own',

@@ -128,6 +128,14 @@ function migrate(db: IDBDatabase, tx: IDBTransaction): void {
   };
 }
 
+/** What {@link KeyStore.open} reports about other windows' connections. */
+export interface KeyStoreHooks {
+  /** The upgrade waits for another window's older connection to close. */
+  onBlocked?: () => void;
+  /** Another window wants to upgrade the database; this connection has been closed for it. */
+  onVersionChange?: () => void;
+}
+
 export class KeyStore {
   readonly #db: IDBDatabase;
 
@@ -135,7 +143,15 @@ export class KeyStore {
     this.#db = db;
   }
 
-  static async open(factory: IDBFactory = indexedDB): Promise<KeyStore> {
+  /**
+   * Opens (and upgrades) the database. Another window holding an older connection blocks an
+   * upgrade until it closes: version 1 never closed its connection and has no `versionchange`
+   * handler, and its code cannot be changed. `onBlocked` tells the caller so it can say what is
+   * going on; the request itself stays pending and completes once the others close. Once open, a
+   * later upgrade by another window closes this connection (and calls `onVersionChange`), so this
+   * code never blocks one.
+   */
+  static async open(factory: IDBFactory = indexedDB, hooks: KeyStoreHooks = {}): Promise<KeyStore> {
     const request = factory.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = (event) => {
       const db = request.result;
@@ -144,7 +160,13 @@ export class KeyStore {
       if (!db.objectStoreNames.contains(META)) db.createObjectStore(META);
       if (tx !== null && event.oldVersion >= 1 && db.objectStoreNames.contains(LEGACY_STORE)) migrate(db, tx);
     };
-    return new KeyStore(await promised(request));
+    request.onblocked = () => hooks.onBlocked?.();
+    const db = await promised(request);
+    db.onversionchange = () => {
+      db.close();
+      hooks.onVersionChange?.();
+    };
+    return new KeyStore(db);
   }
 
   /** Every readable pairing, oldest first (a damaged record is skipped: not paired). */

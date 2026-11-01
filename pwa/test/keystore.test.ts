@@ -50,6 +50,13 @@ function committed(tx: IDBTransaction): Promise<void> {
   return promise;
 }
 
+/** Version 1 as it ran: the pairing written, then the connection kept open, with no `versionchange` handler. */
+async function holdLegacy(factory: IDBFactory, record: unknown): Promise<IDBDatabase> {
+  const request = factory.open('ompdeck', 1);
+  request.onupgradeneeded = () => request.result.createObjectStore('pairing').put(record, 'current');
+  return opened(request);
+}
+
 /** The version 1 layout: database version 1, store `pairing`, one record at `current` (none when `record` is undefined). */
 async function openLegacy(factory: IDBFactory, record?: unknown): Promise<void> {
   const request = factory.open('ompdeck', 1);
@@ -280,3 +287,48 @@ describe('version 1 migration', () => {
     store.close();
   });
 });
+
+describe('another window holding the database', () => {
+  test('an old connection that never closes blocks the upgrade: onBlocked fires, and the open finishes with the migrated pairing once it closes', async () => {
+    const factory = new IDBFactory();
+    const old = await holdLegacy(factory, pairing({ last: 4242 }));
+    const blocked = Promise.withResolvers<void>();
+    const opening = KeyStore.open(factory, { onBlocked: () => blocked.resolve() });
+    let settled = false;
+    void opening.then(() => {
+      settled = true;
+    });
+    await blocked.promise;
+    expect(settled).toBe(false);
+    old.close();
+    const store = await opening;
+    expect((await store.load(DESKTOP))?.last).toBe(4242);
+    expect(await store.active()).toBe(DESKTOP);
+    store.close();
+  });
+
+  test('an open store lets a later upgrade through: it closes itself, reports it, and the upgrade is not blocked', async () => {
+    const factory = new IDBFactory();
+    const changed = Promise.withResolvers<void>();
+    const store = await KeyStore.open(factory, { onVersionChange: () => changed.resolve() });
+    await store.save(pairing());
+    const request = factory.open('ompdeck', 3);
+    const blocked = counter();
+    request.onblocked = blocked.fn;
+    request.onupgradeneeded = () => undefined;
+    const next = await opened(request);
+    await changed.promise;
+    expect(blocked.calls).toBe(0);
+    expect(next.version).toBe(3);
+    next.close();
+  });
+});
+
+/** A counter standing in for a mock function. */
+function counter(): { fn: () => void; calls: number } {
+  const counter = { calls: 0, fn: () => {} };
+  counter.fn = () => {
+    counter.calls += 1;
+  };
+  return counter;
+}

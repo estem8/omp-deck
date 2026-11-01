@@ -57,8 +57,23 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('message', (event) => {
   const data: unknown = event.data;
-  if (typeof data === 'object' && data !== null && 'type' in data && data.type === 'SKIP_WAITING') {
-    void self.skipWaiting();
+  if (typeof data !== 'object' || data === null || !('type' in data)) return;
+  if (data.type === 'SKIP_WAITING') void self.skipWaiting();
+  // A window of the new version is waiting for the key store upgrade, which another window still
+  // on the old version blocks (it keeps its database connection for its whole life and cannot be
+  // told to let go). Reloading those windows runs the new code there, which releases the connection.
+  if (data.type === 'RELOAD_OTHERS' && IS_SHELL) {
+    const sender = event.source;
+    const senderId = sender !== null && 'id' in sender ? sender.id : null;
+    event.waitUntil(
+      (async () => {
+        for (const client of await self.clients.matchAll({ type: 'window' })) {
+          if (client.id === senderId) continue;
+          // A window that cannot be navigated is left to the user (the sender says so on screen).
+          await client.navigate(client.url).catch(() => null);
+        }
+      })(),
+    );
   }
 });
 

@@ -10,59 +10,9 @@
 // - `gw=v1` selects the gateway that announces no `s4` (a cookie the WebSocket upgrade carries).
 // The remaining hash (`route=…`, `s=…`, `d=…`, `pair=…`) is left for the app.
 
-import { KeyStore, type StoredPairing, pairingId } from '../../src/app/keystore.ts';
+import { KeyStore, pairingId } from '../../src/app/keystore.ts';
 import { isThemeId, saveTheme } from '../../src/app/theme.ts';
-import { fromBase64Url } from '../../src/remote/index.ts';
-
-interface SeedPairing {
-  secret: string;
-  gatewayPublic: string;
-  url: string;
-  room: string;
-  token: string;
-  device: string;
-  gateway: string;
-  name: string;
-}
-
-interface Seed {
-  main: string;
-  pairing: SeedPairing;
-  second: SeedPairing;
-}
-
-function bytes(text: string): Uint8Array {
-  const out = fromBase64Url(text);
-  if (out === null) throw new Error('bad seed');
-  return out;
-}
-
-function stored(p: SeedPairing, now: number): StoredPairing {
-  return {
-    secret: bytes(p.secret),
-    gatewayPublic: bytes(p.gatewayPublic),
-    url: p.url,
-    room: bytes(p.room),
-    token: bytes(p.token),
-    device: p.device,
-    gateway: p.gateway,
-    name: p.name,
-    last: now - 1,
-    pairedUnixMs: now - 3 * 24 * 3_600_000,
-  };
-}
-
-/** Writes the single pairing as version 1 did: database version 1, store `pairing`, key `current`. */
-async function seedLegacy(record: StoredPairing): Promise<void> {
-  if ((await indexedDB.databases()).some((db) => db.name === 'ompdeck')) return;
-  const request = indexedDB.open('ompdeck', 1);
-  request.onupgradeneeded = () => request.result.createObjectStore('pairing').put(record, 'current');
-  const db = await new Promise<IDBDatabase>((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-  db.close();
-}
+import { type Seed, seedLegacy, stored } from './legacy.ts';
 
 async function boot(): Promise<void> {
   const params = new URLSearchParams(location.hash.slice(1));

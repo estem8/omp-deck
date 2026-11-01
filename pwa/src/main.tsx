@@ -12,7 +12,7 @@ import { dialRelay, pairWithInvite } from './app/link.ts';
 import { type Link, inviteFromHash, linkFromHash } from './app/nav.ts';
 import { type ThemeId, applyTheme, loadTheme, saveTheme } from './app/theme.ts';
 import { DesktopsContext } from './app/ui/hooks.ts';
-import { registerServiceWorker } from './app/update.ts';
+import { askOthersToReload, registerServiceWorker } from './app/update.ts';
 import './styles/app.css';
 import './styles/themes.css';
 
@@ -119,10 +119,36 @@ function Fatal({ message }: { message: string }) {
   );
 }
 
+/** Shown while another window still on the old version holds the key store: the upgrade waits for it. */
+function Updating() {
+  return (
+    <div className="screen">
+      <div className="body">
+        <div className="pair-hero">
+          <div className="mark">↻</div>
+          <h2>Finishing the update…</h2>
+          <p className="muted">
+            Another OmpDeck window still runs the old version; it is being reloaded. If this stays, close the other OmpDeck tabs and windows.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 async function boot(): Promise<void> {
+  // First: the worker reloads the windows that block the key store's upgrade (below).
+  registerServiceWorker({ navigate: openDeepLink });
   let store: KeyStore;
   try {
-    store = await KeyStore.open();
+    store = await KeyStore.open(indexedDB, {
+      onBlocked: () => {
+        root.render(<Updating />);
+        void askOthersToReload().catch(() => undefined);
+      },
+      // A later upgrade by another window: let it through, and come back as the new version.
+      onVersionChange: () => location.reload(),
+    });
   } catch (error) {
     root.render(
       <Fatal message={`This browser cannot keep the pairing key (IndexedDB: ${error instanceof Error ? error.message : String(error)}). Leave private browsing or use another browser.`} />,
@@ -153,7 +179,6 @@ async function boot(): Promise<void> {
       <Root desktops={desktops} />
     </StrictMode>,
   );
-  registerServiceWorker({ navigate: openDeepLink });
   // The worker names the desktop on each notification while several are paired.
   watchPushLabels(desktops);
   window.addEventListener('online', () => desktops.getState().client?.wake());

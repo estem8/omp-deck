@@ -107,6 +107,9 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
   const boot = await Bun.build({ entrypoints: [join(import.meta.dir, 'boot.ts')], target: 'browser', minify: false });
   if (!boot.success || boot.outputs[0] === undefined) throw new Error(`boot.ts failed to build: ${boot.logs.join('\n')}`);
   const bootJs = await boot.outputs[0].text();
+  const holder = await Bun.build({ entrypoints: [join(import.meta.dir, 'holder.ts')], target: 'browser', minify: false });
+  if (!holder.success || holder.outputs[0] === undefined) throw new Error(`holder.ts failed to build: ${holder.logs.join('\n')}`);
+  const holderJs = await holder.outputs[0].text();
 
   const html = readFileSync(join(outdir, 'index.html'), 'utf8');
   const script = /<script type="module"[^>]*src="([^"]+)"[^>]*><\/script>/.exec(html);
@@ -149,6 +152,12 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
         return srv.upgrade(request, { data }) ? undefined : new Response('upgrade failed', { status: 400 });
       }
       if (url.pathname === '/__smoke/boot.js') return new Response(bootJs, { headers: { 'content-type': 'text/javascript' } });
+      if (url.pathname === '/__smoke/holder.js') return new Response(holderJs, { headers: { 'content-type': 'text/javascript' } });
+      if (url.pathname === '/__smoke/holder') {
+        return new Response('<!doctype html><meta charset="utf-8"><title>old app</title><link rel="icon" href="data:,"><body><script type="module" src="/__smoke/holder.js"></script>', {
+          headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
       if (url.pathname === '/__smoke/seed.json') {
         const seed = (d: Desktop) => ({
           secret: toBase64Url(d.deviceKey.secretBytes()),

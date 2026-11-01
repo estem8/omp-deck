@@ -82,6 +82,20 @@ export function registerServiceWorker(messages: WorkerMessages): void {
 }
 
 /**
+ * Asks the service worker to reload this app's other windows. A window of an older version keeps
+ * its key store connection open and blocks this version's upgrade of it; reloading it runs the new
+ * code there, which lets go. Best effort: without a worker nothing happens, and the caller's screen
+ * tells the user to close the other windows.
+ */
+export async function askOthersToReload(): Promise<void> {
+  const container: ServiceWorkerContainer | undefined = navigator.serviceWorker;
+  if (container === undefined) return;
+  // The controller is absent right after a forced reload or the first install: the registration's active worker stands in.
+  const worker = container.controller ?? (await container.ready).active;
+  worker?.postMessage({ type: 'RELOAD_OTHERS' });
+}
+
+/**
  * Activates the waiting version once `openRequests()` is zero (or at once with `force`); the
  * `controllerchange` that follows reloads the page.
  */
