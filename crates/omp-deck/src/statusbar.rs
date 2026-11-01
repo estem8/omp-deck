@@ -12,7 +12,7 @@ use crate::icons::{
     ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY,
     ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
     ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE,
-    ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE,
+    ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_VIBRATE,
 };
 use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -35,7 +35,9 @@ use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerSt
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, menu_item, paint_icon};
 use deck_service::gateway::protocol::SwitchInfo;
-use deck_service::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
+use deck_service::session_actions::{
+    self, Action, ActionCtx, Availability, CompactMode, Kind, ShakeMode,
+};
 use deck_service::statusfmt::{
     self, Activity, ContextLevel, context_label, context_level, context_percent, fmt_cost,
     fmt_tokens, thinking_fill, thinking_short,
@@ -1459,7 +1461,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     agents_chip(ui, &input.agents, out);
     ui.add_space(6.0);
 
-    // Added right → left, so this reads: Stop/Retry · Plan · Handoff · Compact ▾ · Fork · Tree · ⋯
+    // Added right → left, so this reads: Stop/Retry · Plan · Handoff · Compact ▾ · Shake ▾ · Fork · Tree · ⋯
     let more = bar_button(ui, ICON_ELLIPSIS, "More actions", true, None, false);
     theme::dropup_menu(&more, 220.0, |ui| overflow_menu(ui, c, out));
 
@@ -1489,6 +1491,28 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     .clicked()
     {
         out.push(BarAction::Run(Action::Fork));
+    }
+
+    let shake = bar_button(
+        ui,
+        ICON_VIBRATE,
+        "Shake heavy content out of the context…",
+        session_actions::availability(Kind::Shake, c).is_enabled(),
+        reason(Kind::Shake, c),
+        false,
+    );
+    if session_actions::availability(Kind::Shake, c).is_enabled() {
+        theme::dropup_menu(&shake, 250.0, |ui| {
+            for (text, mode) in [
+                ("Shake tool results + large blocks", ShakeMode::Elide),
+                ("Shake images", ShakeMode::Images),
+                ("Shake thinking", ShakeMode::Thinking),
+            ] {
+                if menu_item(ui, ICON_VIBRATE, text, None, true, false).clicked() {
+                    out.push(BarAction::Run(Action::Shake(mode)));
+                }
+            }
+        });
     }
 
     let compact = bar_button(

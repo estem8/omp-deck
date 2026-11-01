@@ -142,5 +142,6 @@ pub const ICON_TRASH_2: Icon = Icon::new("\u{e18e}");
 pub const ICON_TRIANGLE_ALERT: Icon = Icon::new("\u{e193}");
 pub const ICON_UNDO_2: Icon = Icon::new("\u{e2a1}");
 pub const ICON_USER: Icon = Icon::new("\u{e19f}");
+pub const ICON_VIBRATE: Icon = Icon::new("\u{e223}");
 pub const ICON_WRENCH: Icon = Icon::new("\u{e1b1}");
 pub const ICON_X: Icon = Icon::new("\u{e1b2}");

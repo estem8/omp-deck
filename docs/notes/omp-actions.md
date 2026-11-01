@@ -265,6 +265,7 @@ Notation: `INJ(x)` = injector of §3.7 with command text `x`; `IDLE` = require i
 | Model picker (omp UI) | hotkey | any | `ESC p` (Alt+P, temp) / `ESC m` (Alt+M, roles) |
 | **Plan mode** | hotkey (cycles on/pause/off) | any | `ESC P` (Alt+Shift+P) — or `INJ("/plan")` |
 | **Compact** | slash injection | IDLE (mid-stream aborts the turn) | `INJ("/compact")`, variants `/compact soft`, `/compact snapcompact`, `/compact <focus>` |
+| **Shake** | slash injection | IDLE (omp's `shake` has no streaming guard) | `INJ("/shake")` (= elide), `/shake images`, `/shake thinking`; verified 18.15.0 in a sandbox copy: `/shake images` printed `Dropped 9 images from this session.` |
 | **Handoff** | slash injection | IDLE, ≥2 messages | `INJ("/handoff [focus]")` (progress loader; same file) |
 | **Fork (new tab)** | CLI in new OmpDeck tab | source may be live | argv `omp --fork <abs jsonl> --cwd <dir>` (omp-cli.md §C4) — preferred over `/fork window` |
 | Fork in place | slash | IDLE | `INJ("/fork")` then re-read breadcrumb |

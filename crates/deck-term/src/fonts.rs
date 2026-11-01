@@ -217,8 +217,8 @@ fn append_ui_fallbacks(defs: &mut FontDefinitions, family: FontFamily, loaded: &
 /// Installs the terminal font families into egui (call once, from the eframe creator).
 /// Starts from `FontDefinitions::default()`; egui's UI families keep their default faces first
 /// and only gain [`UI_FALLBACKS`] at the end (emoji/symbols/CJK in titles). Glyphs the curated
-/// chain lacks come on demand from a system font provider that skips `term-primary`. Also disables
-/// sub-pixel binning (glyphs are placed on whole pixels anyway; binning only blurs).
+/// chain lacks come on demand from a system font provider that skips `term-primary`. Also sets
+/// the text smoothing, see [`smooth_text`].
 pub fn install_fonts(ctx: &egui::Context) -> FontReport {
     let mut defs = FontDefinitions::default();
     let mut report = FontReport {
@@ -319,8 +319,23 @@ pub fn install_fonts(ctx: &egui::Context) -> FontReport {
     ctx.set_fonts(defs);
     // Replaces (never appends), so repeated installs keep exactly one provider.
     ctx.set_font_providers(vec![Arc::new(UiSystemFonts(SystemFontProvider::new()))]);
-    ctx.all_styles_mut(|s| s.visuals.text_options.subpixel_binning = false);
+    smooth_text(ctx);
     report
+}
+
+/// Softer text than egui's defaults (user-picked from a rendered comparison): unhinted outlines,
+/// sub-pixel positioned UI glyphs (terminal cells sit on whole pixels, so they stay unblurred), and
+/// on dark styles a lighter coverage curve than egui's heavy `2c − c²`. Light styles keep egui's
+/// linear coverage, which is already the light end for dark-on-light text.
+fn smooth_text(ctx: &egui::Context) {
+    ctx.all_styles_mut(|s| {
+        s.visuals.text_options.font_hinting = false;
+        s.visuals.text_options.subpixel_binning = true;
+    });
+    ctx.style_mut_of(egui::Theme::Dark, |s| {
+        s.visuals.text_options.color_transfer_function =
+            egui::epaint::FontColorTransferFunction::Gamma(0.75);
+    });
 }
 
 /// The Windows installed-fonts registry format (`HKLM`/`HKCU\SOFTWARE\Microsoft\Windows NT\

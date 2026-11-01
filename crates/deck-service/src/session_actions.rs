@@ -12,6 +12,7 @@ use crate::inject::{Job, Requires, sanitize_line};
 pub enum Kind {
     Handoff,
     Compact,
+    Shake,
     Fork,
     Tree,
     Rename,
@@ -31,11 +32,21 @@ pub enum CompactMode {
     Focus(String),
 }
 
+/// omp's `/shake` modes (`builtin-lifecycle.ts` `parseShakeMode`; a bare `/shake` is `elide`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ShakeMode {
+    /// Tool results + large blocks.
+    Elide,
+    Images,
+    Thinking,
+}
+
 /// A fully specified action ready to run.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     Handoff(Option<String>),
     Compact(CompactMode),
+    Shake(ShakeMode),
     Fork,
     Rename(String),
     AutoName,
@@ -100,7 +111,7 @@ pub fn availability(kind: Kind, c: &ActionCtx) -> Availability {
         return Disabled("omp has exited in this tab");
     }
     match kind {
-        Kind::Handoff | Kind::Compact => {
+        Kind::Handoff | Kind::Compact | Kind::Shake => {
             if !c.idle {
                 Disabled(BUSY)
             } else if !c.has_session_file {
@@ -160,6 +171,15 @@ pub fn compact_label(mode: &CompactMode) -> &'static str {
     }
 }
 
+/// What the user clicked, for messages ("Shake (images)").
+pub fn shake_label(mode: ShakeMode) -> &'static str {
+    match mode {
+        ShakeMode::Elide => "Shake",
+        ShakeMode::Images => "Shake (images)",
+        ShakeMode::Thinking => "Shake (thinking)",
+    }
+}
+
 /// omp's plan-mode hotkey is Alt+Shift+P.
 const ALT_SHIFT: Mods = Mods::new(true, true, false);
 
@@ -189,6 +209,14 @@ pub fn job(action: &Action) -> Option<Job> {
                 }
             };
             Job::slash(compact_label(mode), &text, Requires::Idle)
+        }
+        Action::Shake(mode) => {
+            let text = match mode {
+                ShakeMode::Elide => "/shake",
+                ShakeMode::Images => "/shake images",
+                ShakeMode::Thinking => "/shake thinking",
+            };
+            Job::slash(shake_label(*mode), text, Requires::Idle)
         }
         Action::Rename(title) => {
             let t = one_line(title);
@@ -278,6 +306,7 @@ mod tests {
         };
         assert!(!availability(Kind::Handoff, &busy).is_enabled());
         assert!(!availability(Kind::Compact, &busy).is_enabled());
+        assert!(!availability(Kind::Shake, &busy).is_enabled());
         assert!(availability(Kind::PlanMode, &busy).is_enabled());
         assert!(availability(Kind::Fork, &busy).is_enabled());
         assert!(availability(Kind::Handoff, &ctx()).is_enabled());
@@ -291,6 +320,7 @@ mod tests {
             ..ctx()
         };
         assert!(!availability(Kind::Compact, &attention).is_enabled());
+        assert!(!availability(Kind::Shake, &attention).is_enabled());
         assert!(!availability(Kind::Handoff, &attention).is_enabled());
     }
 
@@ -304,6 +334,7 @@ mod tests {
         for k in [
             Kind::Handoff,
             Kind::Compact,
+            Kind::Shake,
             Kind::Fork,
             Kind::Export,
             Kind::CopyLast,
@@ -369,6 +400,15 @@ mod tests {
         assert_eq!(
             slash_text(&Action::Compact(CompactMode::Focus("auth flow".into()))),
             "/compact auth flow"
+        );
+        assert_eq!(slash_text(&Action::Shake(ShakeMode::Elide)), "/shake");
+        assert_eq!(
+            slash_text(&Action::Shake(ShakeMode::Images)),
+            "/shake images"
+        );
+        assert_eq!(
+            slash_text(&Action::Shake(ShakeMode::Thinking)),
+            "/shake thinking"
         );
         assert_eq!(
             slash_text(&Action::Rename("New  title".into())),

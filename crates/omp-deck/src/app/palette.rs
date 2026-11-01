@@ -25,7 +25,9 @@ use crate::sync_view::SyncAction;
 use crate::tabs::{self, Tab, TabRole};
 use crate::transfer::TransferKind;
 use crate::update::Channel;
-use deck_service::session_actions::{self, Action, ActionCtx, Availability, CompactMode, Kind};
+use deck_service::session_actions::{
+    self, Action, ActionCtx, Availability, CompactMode, Kind, ShakeMode,
+};
 
 const NEED_SESSION: &str = "Open an omp session tab first";
 const NEED_OMP: &str = "omp was not found";
@@ -425,6 +427,27 @@ impl App {
             None,
             ICON_FOLD_VERTICAL,
             session_why(Kind::Compact),
+        );
+        add(
+            "session.shake",
+            "Session: Shake (tool results + large blocks)",
+            None,
+            ICON_VIBRATE,
+            session_why(Kind::Shake),
+        );
+        add(
+            "session.shake_images",
+            "Session: Shake images",
+            None,
+            ICON_VIBRATE,
+            session_why(Kind::Shake),
+        );
+        add(
+            "session.shake_thinking",
+            "Session: Shake thinking",
+            None,
+            ICON_VIBRATE,
+            session_why(Kind::Shake),
         );
         add(
             "session.handoff",
@@ -1211,6 +1234,9 @@ impl App {
                     first: true,
                 });
             }
+            "session.shake" => self.run_action(Action::Shake(ShakeMode::Elide)),
+            "session.shake_images" => self.run_action(Action::Shake(ShakeMode::Images)),
+            "session.shake_thinking" => self.run_action(Action::Shake(ShakeMode::Thinking)),
             "session.handoff" => self.run_action(Action::Handoff(None)),
             "session.handoff_focus" => {
                 self.open_action_dialog(ActionDialog::Handoff {
