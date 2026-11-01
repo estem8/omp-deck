@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState, useSyncExternalStore } from 'react';
 import type { api } from '../../remote/index.ts';
 import { type Client, type ClientState, type TranscriptState, feedKey } from '../client.ts';
+import type { Desktops, DesktopsState } from '../desktops.ts';
 
 export const ClientContext = createContext<Client | null>(null);
 
@@ -16,6 +17,20 @@ export function useClient(): Client {
 export function useClientState<T>(select: (state: ClientState) => T): T {
   const client = useClient();
   return useSyncExternalStore(client.subscribeState, () => select(client.getState()));
+}
+
+export const DesktopsContext = createContext<Desktops | null>(null);
+
+export function useDesktops(): Desktops {
+  const desktops = useContext(DesktopsContext);
+  if (desktops === null) throw new Error('useDesktops outside DesktopsContext');
+  return desktops;
+}
+
+/** A slice of the desktops state; `select` must return a stored reference or a primitive. */
+export function useDesktopsState<T>(select: (state: DesktopsState) => T): T {
+  const desktops = useDesktops();
+  return useSyncExternalStore(desktops.subscribe, () => select(desktops.getState()));
 }
 
 /** Whether mutations can be sent now (online with a Welcome). */

@@ -46,6 +46,8 @@ const CLOSE_POLL: Duration = Duration::from_millis(50);
 const LIVE_CWD_EVERY: Duration = Duration::from_secs(3);
 /// A breadcrumb written this long before the pane started still belongs to its process.
 const CRUMB_SLACK: Duration = Duration::from_secs(2);
+/// How often a fresh session's reported (not yet written) file is looked for.
+const FILE_RECHECK: Duration = Duration::from_secs(1);
 
 /// One request to open a session.
 pub(super) struct LaunchJob {
@@ -1117,9 +1119,22 @@ impl Engine {
             .collect();
         let mut finished: Vec<(RequestKey, Result<Done, GatewayError>)> = Vec::new();
         let mut changed: Vec<SessionKey> = Vec::new();
+        let mut resolved = false;
         for i in 0..self.sess.managed.len() {
             let key = self.sess.managed[i].ctl.target().key.clone();
-            if wanted.contains(&key) {
+            // A session whose file is still unknown is followed over live control until omp
+            // reports a written one: omp holds its jsonl open only between appends and drops the
+            // handle on every atomic rewrite (the title, in the first turn), so the open-file poll
+            // in `follow_session_files` can miss a fresh session for good — and its pushes and
+            // live entries would carry no session.
+            let unresolved = {
+                let m = &self.sess.managed[i];
+                m.role == SessionRole::Session
+                    && m.copy.is_none()
+                    && !m.exited()
+                    && m.ctl.session_path().is_none()
+            };
+            if wanted.contains(&key) || unresolved {
                 self.ensure_live(i);
             }
             let m = &mut self.sess.managed[i];
@@ -1127,7 +1142,7 @@ impl Engine {
                 .live
                 .as_ref()
                 .is_some_and(|l| !l.queued.is_empty() || !l.pending.is_empty());
-            if !wanted.contains(&key) && !busy {
+            if !wanted.contains(&key) && !busy && !unresolved {
                 if m.live.take().is_some() {
                     changed.push(key);
                 }
@@ -1165,6 +1180,21 @@ impl Engine {
                 }
             }
             let latest = link.client.latest();
+            // omp writes a fresh session's file only when its first reply lands; until then
+            // the reported path is checked again shortly (the snapshot may not change).
+            let reported = unresolved
+                .then(|| latest.as_ref().and_then(|s| s.session_file.as_ref()))
+                .flatten();
+            if let Some(path) = reported {
+                if path.is_file() {
+                    // The first file of a fresh session: never a generation change.
+                    m.ctl.set_session_path(Some(path.clone()));
+                    resolved = true;
+                } else {
+                    let d = now + FILE_RECHECK;
+                    self.soon = Some(self.soon.map_or(d, |s| s.min(d)));
+                }
+            }
             let same = link.seen.0 == connected
                 && match (&link.seen.1, &latest) {
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -1184,6 +1214,10 @@ impl Engine {
                 result
             };
             self.job_finished(key, result);
+        }
+        if resolved {
+            self.sess.manifest_dirty = true;
+            self.dirty.controllers = true;
         }
         for key in changed {
             self.changed(crate::gateway::protocol::Topic::Live(key));

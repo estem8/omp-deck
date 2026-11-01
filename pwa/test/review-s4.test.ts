@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { ClientError } from '../src/app/client.ts';
 import { deepLinkEntries, historyEntry, isBaseEntry, routeFromHistory, startRoute, syncedEntry } from '../src/app/nav.ts';
-import { INITIAL_TRACKER, observePairing } from '../src/app/pairing-gate.ts';
 import { type Attachment, attachmentsReducer } from '../src/app/screens/conversation/compose.ts';
 import { LoadQueue } from '../src/app/screens/conversation/images.ts';
 import { UNOBSERVED_TEXT, describeResult, succeeded } from '../src/app/ui/format.ts';
@@ -22,30 +21,6 @@ describe('#3 a send clears only what it submitted', () => {
     state = attachmentsReducer(state, { type: 'done', id: 2, upload: 'up-2' });
     state = attachmentsReducer(state, { type: 'remove_sent', uploads: submitted });
     expect(state.map((entry) => entry.upload)).toEqual(['up-2']);
-  });
-});
-
-describe('#10 invite consumption', () => {
-  const stored = { name: 'stored' };
-  const fresh = { name: 'fresh' };
-
-  test('adopting the stored pairing does not consume the invite', () => {
-    let seen = observePairing(INITIAL_TRACKER, null, false);
-    seen = observePairing(seen.tracker, stored, false);
-    expect(seen.consumed).toBe(false);
-  });
-
-  test('a flow that stores a new pairing consumes it, a dismissed failure does not', () => {
-    let seen = observePairing(INITIAL_TRACKER, stored, false);
-    seen = observePairing(seen.tracker, stored, true);
-    seen = observePairing(seen.tracker, fresh, true);
-    expect(seen.consumed).toBe(false);
-    seen = observePairing(seen.tracker, fresh, false);
-    expect(seen.consumed).toBe(true);
-
-    let failed = observePairing(INITIAL_TRACKER, stored, true);
-    failed = observePairing(failed.tracker, stored, false);
-    expect(failed.consumed).toBe(false);
   });
 });
 

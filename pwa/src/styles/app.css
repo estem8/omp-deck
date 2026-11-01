@@ -1557,3 +1557,79 @@ button.files:active {
     outline-offset: 2px;
   }
 }
+
+/* ---- desktop switcher: the active desktop's name beside its connection status ---- */
+.conn-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  min-width: 0;
+}
+.conn-row .pill {
+  margin-top: 0;
+}
+/* In a title line (Settings) the row sits beside the title and never wraps. */
+.line > .conn-row {
+  margin-top: 0;
+  flex-wrap: nowrap;
+  flex: none;
+  max-width: 70%;
+}
+.desktop-chip {
+  color: var(--strong, var(--text));
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--border));
+  background: color-mix(in oklab, var(--accent) 10%, var(--raised));
+  box-shadow: 0 2px 0 #0007, inset 0 1px #ffffff10;
+  font-weight: 600;
+}
+.desktop-chip:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: none;
+}
+.desktop-chip:disabled {
+  opacity: 0.6;
+}
+@media (hover: hover) {
+  .desktop-chip:hover:not(:disabled) {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+.desk-mark {
+  color: var(--accent);
+  font-size: 9px;
+}
+.desk-name {
+  min-width: 0;
+  max-width: 13em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.desk-caret {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  margin: -3px 1px 0 2px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(45deg);
+}
+.desktop-option b {
+  color: var(--strong, var(--text));
+  font-weight: 600;
+  font-size: 12px;
+}
+.desk-go {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-right: 3px;
+  border-top: 1.6px solid var(--muted);
+  border-right: 1.6px solid var(--muted);
+  transform: rotate(45deg);
+}
+.desktop-add {
+  margin-top: 12px;
+}

@@ -21,6 +21,8 @@ export interface Stack {
   control: string;
   /** The fixture project as the phone shows it. */
   project: string;
+  /** Two-desktop runs: the key of a second relay room, for the second gateway (null otherwise). */
+  second_room_key?: string | null;
 }
 
 interface Message {

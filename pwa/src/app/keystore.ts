@@ -1,15 +1,26 @@
-// The device's pairing, kept in IndexedDB (mobile-pwa.md "Keys"): the static secret, the gateway
-// key, the relay URL, the room and admission token, and the `last` handshake timestamp. Everything
-// lives in one record, so `last` is always persisted atomically with the key it belongs to, and it
-// is persisted before the handshake that uses it is sent (a lost `last` would lock the device out
-// until its clock passed the gateway's floor; mobile-relay.md R5).
+// The device's pairings, kept in IndexedDB (mobile-pwa.md "Keys"), one per desktop: the static
+// secret, the gateway key, the relay URL, the room and admission token, and the `last` handshake
+// timestamp. Each pairing is one record keyed by its id (the hex of the gateway's static key), so
+// `last` is always persisted atomically with the key it belongs to, and it is persisted before the
+// handshake that uses it is sent (a lost `last` would lock the device out until its clock passed
+// the gateway's floor; mobile-relay.md R5). A small meta store holds which desktop is active.
+//
+// Version 1 kept the single pairing at `pairing/current`; opening migrates it (see `migrate`).
 
+import { toHex } from '../remote/bytes.ts';
 import { nextTimestamp } from '../remote/index.ts';
+import type { PairingStore } from './client.ts';
 
 const DB_NAME = 'ompdeck';
-const DB_VERSION = 1;
-const STORE = 'pairing';
-const KEY = 'current';
+const DB_VERSION = 2;
+const PAIRINGS = 'pairings';
+const META = 'meta';
+/** The version 1 store and key; dropped by the migration. */
+const LEGACY_STORE = 'pairing';
+const LEGACY_KEY = 'current';
+/** Meta keys. */
+const ACTIVE = 'active';
+const LEGACY_PUSH = 'legacy-push';
 
 /** One paired desktop. Byte fields are copies owned by the caller. */
 export interface StoredPairing {
@@ -35,6 +46,11 @@ export interface StoredPairing {
 
 export class KeyStoreError extends Error {
   override name = 'KeyStoreError';
+}
+
+/** A pairing's id: the lowercase hex of the gateway's static key (one pairing per desktop). */
+export function pairingId(gatewayPublic: Uint8Array): string {
+  return toHex(gatewayPublic);
 }
 
 function promised<T>(request: IDBRequest<T>): Promise<T> {
@@ -92,6 +108,26 @@ function encode(pairing: StoredPairing): StoredPairing {
   };
 }
 
+/**
+ * Moves the version 1 pairing into the version 2 layout inside the upgrade transaction: it becomes
+ * the active desktop (no re-pairing after the upgrade), and is remembered as the owner of the
+ * browser's old root-scope push subscription (`legacyPush`). A damaged or foreign version 1 record
+ * counts as "not paired", as it always did. The old store is deleted either way.
+ */
+function migrate(db: IDBDatabase, tx: IDBTransaction): void {
+  const read = tx.objectStore(LEGACY_STORE).get(LEGACY_KEY);
+  read.onsuccess = () => {
+    const record = decode(read.result);
+    if (record !== null) {
+      const id = pairingId(record.gatewayPublic);
+      tx.objectStore(PAIRINGS).put(encode(record), id);
+      tx.objectStore(META).put(id, ACTIVE);
+      tx.objectStore(META).put(id, LEGACY_PUSH);
+    }
+    db.deleteObjectStore(LEGACY_STORE);
+  };
+}
+
 export class KeyStore {
   readonly #db: IDBDatabase;
 
@@ -101,35 +137,55 @@ export class KeyStore {
 
   static async open(factory: IDBFactory = indexedDB): Promise<KeyStore> {
     const request = factory.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(STORE)) request.result.createObjectStore(STORE);
+    request.onupgradeneeded = (event) => {
+      const db = request.result;
+      const tx = request.transaction;
+      if (!db.objectStoreNames.contains(PAIRINGS)) db.createObjectStore(PAIRINGS);
+      if (!db.objectStoreNames.contains(META)) db.createObjectStore(META);
+      if (tx !== null && event.oldVersion >= 1 && db.objectStoreNames.contains(LEGACY_STORE)) migrate(db, tx);
     };
     return new KeyStore(await promised(request));
   }
 
-  /** The current pairing, or null (never paired, forgotten, or evicted: re-pair). */
-  async load(): Promise<StoredPairing | null> {
-    const tx = this.#db.transaction(STORE, 'readonly');
-    const value = await promised(tx.objectStore(STORE).get(KEY));
-    return decode(value);
+  /** Every readable pairing, oldest first (a damaged record is skipped: not paired). */
+  async list(): Promise<StoredPairing[]> {
+    const tx = this.#db.transaction(PAIRINGS, 'readonly');
+    const values = await promised(tx.objectStore(PAIRINGS).getAll());
+    const found: StoredPairing[] = [];
+    for (const value of values) {
+      const pairing = decode(value);
+      if (pairing !== null) found.push(pairing);
+    }
+    return found.sort((a, b) => a.pairedUnixMs - b.pairedUnixMs || (pairingId(a.gatewayPublic) < pairingId(b.gatewayPublic) ? -1 : 1));
   }
 
-  /** Replaces the pairing (a new pairing always brings a fresh key). */
-  async save(pairing: StoredPairing): Promise<void> {
-    const tx = this.#db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put(encode(pairing), KEY);
-    await finished(tx);
+  /** The pairing `id`, or null (never paired, forgotten, or evicted: re-pair). */
+  async load(id: string): Promise<StoredPairing | null> {
+    const tx = this.#db.transaction(PAIRINGS, 'readonly');
+    return decode(await promised(tx.objectStore(PAIRINGS).get(id)));
   }
 
   /**
-   * Reserves the next handshake timestamp for the stored key: max(now, last + 1), written in the
+   * Stores a pairing under its own id: pairing again with the same desktop replaces that record
+   * (a new pairing always brings a fresh key); another desktop adds one. Returns the id.
+   */
+  async save(pairing: StoredPairing): Promise<string> {
+    const id = pairingId(pairing.gatewayPublic);
+    const tx = this.#db.transaction(PAIRINGS, 'readwrite');
+    tx.objectStore(PAIRINGS).put(encode(pairing), id);
+    await finished(tx);
+    return id;
+  }
+
+  /**
+   * Reserves the next handshake timestamp for pairing `id`'s key: max(now, last + 1), written in the
    * same transaction that read `last`. Resolves only after it is durable, so it is safe to send.
    */
-  async reserveTimestamp(nowMs: number): Promise<number> {
-    const tx = this.#db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
+  async reserveTimestamp(id: string, nowMs: number): Promise<number> {
+    const tx = this.#db.transaction(PAIRINGS, 'readwrite');
+    const store = tx.objectStore(PAIRINGS);
     let ts: number | null = null;
-    const read = store.get(KEY);
+    const read = store.get(id);
     read.onsuccess = () => {
       const current = decode(read.result);
       if (current === null) {
@@ -137,7 +193,7 @@ export class KeyStore {
         return;
       }
       ts = nextTimestamp(current.last, nowMs);
-      store.put(encode({ ...current, last: ts }), KEY);
+      store.put(encode({ ...current, last: ts }), id);
     };
     try {
       await finished(tx);
@@ -149,10 +205,57 @@ export class KeyStore {
     return ts;
   }
 
-  /** Forgets the pairing on this device (user action only; never because of a close code). */
-  async clear(): Promise<void> {
-    const tx = this.#db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).delete(KEY);
+  /** Forgets one desktop's pairing on this device (user action only; never because of a close code). */
+  async remove(id: string): Promise<void> {
+    const tx = this.#db.transaction(PAIRINGS, 'readwrite');
+    tx.objectStore(PAIRINGS).delete(id);
+    await finished(tx);
+  }
+
+  /** The active desktop's id, or null (none chosen yet). It may name a pairing that is gone: see `resolveActive`. */
+  async active(): Promise<string | null> {
+    return this.#meta(ACTIVE);
+  }
+
+  async setActive(id: string | null): Promise<void> {
+    await this.#setMeta(ACTIVE, id);
+  }
+
+  /**
+   * The desktop whose version 1 push subscription may still sit on the app's root service worker
+   * registration (set by the migration; cleared once it moved or was dropped).
+   */
+  async legacyPush(): Promise<string | null> {
+    return this.#meta(LEGACY_PUSH);
+  }
+
+  async clearLegacyPush(): Promise<void> {
+    await this.#setMeta(LEGACY_PUSH, null);
+  }
+
+  /** A `PairingStore` bound to pairing `id`: what a `Client` for that desktop talks to. */
+  scoped(id: string): PairingStore {
+    return {
+      load: () => this.load(id),
+      save: async (pairing) => {
+        if (pairingId(pairing.gatewayPublic) !== id) throw new KeyStoreError('the pairing belongs to another desktop');
+        await this.save(pairing);
+      },
+      reserveTimestamp: (nowMs) => this.reserveTimestamp(id, nowMs),
+      clear: () => this.remove(id),
+    };
+  }
+
+  async #meta(key: string): Promise<string | null> {
+    const tx = this.#db.transaction(META, 'readonly');
+    const value: unknown = await promised(tx.objectStore(META).get(key));
+    return typeof value === 'string' ? value : null;
+  }
+
+  async #setMeta(key: string, value: string | null): Promise<void> {
+    const tx = this.#db.transaction(META, 'readwrite');
+    if (value === null) tx.objectStore(META).delete(key);
+    else tx.objectStore(META).put(value, key);
     await finished(tx);
   }
 

@@ -3,10 +3,11 @@
 //
 // Kept outside `bun test` (no `.test.ts` name): it needs Chromium and takes ~30 s.
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrowserContext, Page } from 'playwright-core';
-import { launch, phone } from '../test/smoke/browser.ts';
+import { launch, persistentPhone, phone } from '../test/smoke/browser.ts';
 import { startSmoke } from '../test/smoke/server.ts';
 import type { api } from '../src/remote/index.ts';
 import * as fixtures from '../test/smoke/fixtures.ts';
@@ -28,8 +29,11 @@ async function scenario(
   hash: string,
   body: (page: Page, context: BrowserContext) => Promise<void>,
   blockWorkers = false,
+  /** A real (non-incognito) profile: the Push API exists there, as on a phone. */
+  realProfile = false,
 ): Promise<void> {
-  const context = await phone(browser, blockWorkers);
+  const profile = realProfile ? mkdtempSync(join(tmpdir(), 'pwa-e2e-profile-')) : null;
+  const context = profile === null ? await phone(browser, blockWorkers) : await persistentPhone(profile);
   context.setDefaultTimeout(TIMEOUT);
   const page = await context.newPage();
   const errors: string[] = [];
@@ -50,6 +54,7 @@ async function scenario(
     console.error(`✗ ${name}: ${error instanceof Error ? error.message : String(error)}\n  screenshot: ${shot}`);
   } finally {
     await context.close();
+    if (profile !== null) rmSync(profile, { recursive: true, force: true });
   }
 }
 
@@ -66,6 +71,234 @@ try {
     await page.getByText('Refactor tmux launcher').first().waitFor();
     await page.getByText(/Connected/).first().waitFor();
   });
+
+  // -- several desktops: one pairing each, one live connection (the active desktop's) --
+  const chip = (page: Page, name: string) => page.locator('.desktop-chip', { hasText: name }).first();
+  const gatewayConnections = async (page: Page, expected: { first: number; second: number }): Promise<void> => {
+    const deadline = Date.now() + TIMEOUT;
+    while (smoke.first.gateway.connections !== expected.first || smoke.second.gateway.connections !== expected.second) {
+      if (Date.now() > deadline) {
+        throw new Error(`device connections: ${smoke.first.label} ${smoke.first.gateway.connections}, ${smoke.second.label} ${smoke.second.gateway.connections}; wanted ${JSON.stringify(expected)}`);
+      }
+      await page.waitForTimeout(100);
+    }
+  };
+  const openSwitcher = async (page: Page): Promise<void> => {
+    await page.locator('.desktop-chip').first().click();
+    await page.getByRole('dialog').getByText('Pair another desktop').waitFor();
+  };
+
+  await scenario('pair a second desktop, switch between both', 'route=sessions', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    await gatewayConnections(page, { first: 1, second: 0 });
+    await openSwitcher(page);
+    await page.getByRole('dialog').getByRole('button', { name: 'Pair another desktop' }).click();
+    await page.getByRole('heading', { name: 'Pair with your desktop' }).waitFor({ state: 'detached' }).catch(() => undefined);
+    await page.getByRole('heading', { name: 'Pair another desktop' }).waitFor();
+    await page.getByLabel('Pairing link').fill(smoke.second.invite);
+    await page.getByText(/Workstation stays paired/).waitFor();
+    await page.getByRole('button', { name: 'Pair this desktop' }).click();
+    await page.getByText('Approve on your desktop').waitFor();
+    await chip(page, 'Laptop').waitFor();
+    await page.getByText('Refactor tmux launcher').first().waitFor();
+    // The Workstation's connection closed when the Laptop's opened.
+    await gatewayConnections(page, { first: 0, second: 1 });
+
+    // Both are listed, the Laptop marked; a tap switches back, with a fresh session list from the Workstation.
+    await openSwitcher(page);
+    const dialog = page.getByRole('dialog');
+    await dialog.locator('button.desktop-option[aria-pressed="true"]', { hasText: 'Laptop' }).waitFor();
+    await dialog.locator('button.desktop-option[aria-pressed="false"]', { hasText: 'Workstation' }).click();
+    await chip(page, 'Workstation').waitFor();
+    await page.getByText('Refactor tmux launcher').first().waitFor();
+    await gatewayConnections(page, { first: 1, second: 0 });
+
+    // Settings lists the desktops too.
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Settings/ }).click();
+    await page.locator('button.desktop-row', { hasText: 'Laptop' }).click();
+    await chip(page, 'Laptop').waitFor();
+    await gatewayConnections(page, { first: 0, second: 1 });
+  });
+
+  await scenario('a screen is not carried over to the other desktop', 'route=sessions&desktops=2', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    await openSession(page, 'Refactor tmux launcher');
+    await page.getByLabel('Message').fill('draft for the workstation');
+    // A conversation is a pushed screen without the desktop chip: go back, then switch from Settings.
+    await page.getByRole('button', { name: 'Back' }).click();
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Settings/ }).click();
+    await page.locator('button.desktop-row', { hasText: 'Laptop' }).click();
+    await chip(page, 'Laptop').waitFor();
+    if ((await page.locator('.composer').count()) !== 0) throw new Error('the other desktop opened with the previous conversation');
+    if ((await page.getByText('draft for the workstation').count()) !== 0) throw new Error('a draft followed the switch');
+  });
+
+  await scenario('re-pairing a paired desktop from an invite link replaces it, others stay', 'route=sessions&desktops=2', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    await page.evaluate((invite) => {
+      location.hash = `#pair=${invite}`;
+    }, smoke.first.invite);
+    await page.getByRole('heading', { name: 'Pair again with Workstation' }).waitFor();
+    await page.getByText(/replaces this phone’s pairing with Workstation/).waitFor();
+    // Nothing dropped yet: the live connection is still the Workstation's.
+    await gatewayConnections(page, { first: 1, second: 0 });
+    await page.getByRole('button', { name: 'Replace pairing' }).click();
+    await page.getByText('Approve on your desktop').waitFor();
+    await chip(page, 'Workstation').waitFor();
+    await openSwitcher(page);
+    const options = page.getByRole('dialog').locator('button.desktop-option');
+    const names = await options.allInnerTexts();
+    if (names.length !== 2 || names.filter((text) => text.includes('Workstation')).length !== 1 || names.filter((text) => text.includes('Laptop')).length !== 1) {
+      throw new Error(`desktops after re-pairing: ${JSON.stringify(names)}`);
+    }
+  });
+
+  await scenario('an invite link for a new desktop opened while the app runs keeps the others', 'route=sessions', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    await page.evaluate((invite) => {
+      location.hash = `#pair=${invite}`;
+    }, smoke.second.invite);
+    await page.getByRole('heading', { name: 'Pair another desktop' }).waitFor();
+    await page.getByText(/Workstation stays paired/).waitFor();
+    await gatewayConnections(page, { first: 1, second: 0 });
+    // Cancel: back to the Workstation, still connected.
+    await page.getByRole('button', { name: 'Cancel' }).click();
+    await chip(page, 'Workstation').waitFor();
+    await gatewayConnections(page, { first: 1, second: 0 });
+  });
+
+  await scenario('forget one desktop: the next one becomes active; forget the last: pairing screen', 'route=sessions&desktops=2', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    const forgetHere = async (): Promise<void> => {
+      await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Settings/ }).click();
+      await page.locator('button.hub-row', { hasText: 'This device' }).click();
+      await page.getByRole('button', { name: 'Forget on this phone only' }).click();
+      await page.getByRole('button', { name: 'Forget', exact: true }).click();
+    };
+    await forgetHere();
+    await chip(page, 'Laptop').waitFor();
+    await gatewayConnections(page, { first: 0, second: 1 });
+    await page.getByText('Refactor tmux launcher').first().waitFor().catch(() => undefined);
+    await forgetHere();
+    await page.getByRole('heading', { name: 'Pair with your desktop' }).waitFor();
+    await gatewayConnections(page, { first: 0, second: 0 });
+  });
+
+  await scenario('a notification tap for the other desktop switches to it and opens its session', 'route=sessions&desktops=2', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    // What the service worker opens (or posts) for a push from the Laptop: its id first, then the route.
+    await page.evaluate((id) => {
+      location.hash = `#d=${id}&s=s-convo`;
+    }, smoke.second.id);
+    await page.locator('.composer').waitFor();
+    await gatewayConnections(page, { first: 0, second: 1 });
+    await page.getByRole('button', { name: 'Back' }).click();
+    await chip(page, 'Laptop').waitFor();
+    // A link naming a desktop this phone is not paired with is ignored: still on the Laptop, nothing opened.
+    await page.evaluate(() => {
+      location.hash = `#d=${'ee'.repeat(32)}&s=s-idle`;
+    });
+    await page.waitForTimeout(300);
+    await chip(page, 'Laptop').waitFor();
+    if ((await page.locator('.composer').count()) !== 0) throw new Error('a link for an unpaired desktop opened a conversation');
+    await gatewayConnections(page, { first: 0, second: 1 });
+  });
+
+  await scenario('a version 1 pairing migrates without pairing again', 'route=sessions&legacy=1', async (page) => {
+    await chip(page, 'Workstation').waitFor();
+    await page.getByText('Refactor tmux launcher').first().waitFor();
+    await gatewayConnections(page, { first: 1, second: 0 });
+  });
+
+  // -- Web Push per desktop: each desktop's subscription is on its own registration (/d/<id>/) --
+  await scenario(
+    'push: each desktop subscribes on its own service-worker registration; forgetting one removes only its own',
+    'route=settings&desktops=2',
+    async (page, context) => {
+      await context.grantPermissions(['notifications'], { origin: smoke.origin });
+      // The real push service is out of reach of headless Chromium: one fake subscription per registration's PushManager.
+      await page.evaluate(() => {
+        const subs = new WeakMap<object, PushSubscription>();
+        const make = (n: number, key: ArrayBuffer): PushSubscription =>
+          ({
+            endpoint: `https://push.example/${n}`,
+            expirationTime: null,
+            options: { userVisibleOnly: true, applicationServerKey: key },
+            getKey: () => new Uint8Array([1, 2, 3]).buffer,
+            unsubscribe: async function (this: PushSubscription) {
+              for (const manager of [...registry]) if (subs.get(manager) === this) subs.delete(manager);
+              return true;
+            },
+            toJSON: () => ({ endpoint: `https://push.example/${n}`, expirationTime: null, keys: { p256dh: 'AQID', auth: 'AQID' } }),
+          }) as unknown as PushSubscription;
+        const registry = new Set<object>();
+        let count = 0;
+        PushManager.prototype.subscribe = async function (options?: PushSubscriptionOptionsInit): Promise<PushSubscription> {
+          registry.add(this);
+          const key = options?.applicationServerKey;
+          const buffer = key instanceof ArrayBuffer ? key : key !== null && key !== undefined && typeof key !== 'string' ? (key as ArrayBufferView).buffer.slice(0) as ArrayBuffer : new ArrayBuffer(0);
+          const made = make(++count, buffer);
+          subs.set(this, made);
+          return made;
+        };
+        PushManager.prototype.getSubscription = async function (): Promise<PushSubscription | null> {
+          return subs.get(this) ?? null;
+        };
+      });
+      const scopes = () =>
+        page.evaluate(async () => {
+          const found: { scope: string; subscribed: boolean }[] = [];
+          for (const registration of await navigator.serviceWorker.getRegistrations()) {
+            found.push({ scope: new URL(registration.scope).pathname, subscribed: (await registration.pushManager.getSubscription()) !== null });
+          }
+          return found.sort((a, b) => a.scope.localeCompare(b.scope));
+        });
+      const notifications = async (): Promise<void> => {
+        await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Settings/ }).click();
+        await page.locator('button.hub-row', { hasText: 'Notifications' }).click();
+        await page.getByRole('switch', { name: 'Push notifications' }).waitFor();
+      };
+
+      await chip(page, 'Workstation').waitFor();
+      await page.evaluate(() => navigator.serviceWorker.ready);
+      await notifications();
+      await page.getByRole('switch', { name: 'Push notifications' }).click();
+      await page.getByText('subscribed', { exact: true }).waitFor();
+      let found = await scopes();
+      const subscribed = found.filter((entry) => entry.subscribed).map((entry) => entry.scope);
+      if (subscribed.length !== 1 || subscribed[0] !== `/d/${smoke.first.id}/`) throw new Error(`after enabling push for the Workstation: ${JSON.stringify(found)}`);
+
+      // The Laptop is its own desktop: not subscribed until its own switch is turned on.
+      await page.getByRole('button', { name: 'Back' }).click();
+      await page.locator('button.desktop-row', { hasText: 'Laptop' }).click();
+      await chip(page, 'Laptop').waitFor();
+      await notifications();
+      await page.getByText('not subscribed', { exact: true }).waitFor();
+      await page.getByRole('switch', { name: 'Push notifications' }).click();
+      await page.getByText('subscribed', { exact: true }).waitFor();
+      found = await scopes();
+      const both = found.filter((entry) => entry.subscribed).map((entry) => entry.scope).sort();
+      if (JSON.stringify(both) !== JSON.stringify([`/d/${smoke.first.id}/`, `/d/${smoke.second.id}/`].sort())) throw new Error(`after enabling push for both: ${JSON.stringify(found)}`);
+
+      // Forget the Laptop: its registration goes, the Workstation's stays subscribed.
+      await page.getByRole('button', { name: 'Back' }).click();
+      await page.locator('button.hub-row', { hasText: 'This device' }).click();
+      await page.getByRole('button', { name: 'Forget on this phone only' }).click();
+      await page.getByRole('button', { name: 'Forget', exact: true }).click();
+      await chip(page, 'Workstation').waitFor();
+      const deadline = Date.now() + TIMEOUT;
+      for (;;) {
+        found = await scopes();
+        if (!found.some((entry) => entry.scope === `/d/${smoke.second.id}/`)) break;
+        if (Date.now() > deadline) throw new Error(`the Laptop's registration survived forgetting it: ${JSON.stringify(found)}`);
+        await page.waitForTimeout(100);
+      }
+      const left = found.filter((entry) => entry.subscribed).map((entry) => entry.scope);
+      if (left.length !== 1 || left[0] !== `/d/${smoke.first.id}/`) throw new Error(`after forgetting the Laptop: ${JSON.stringify(found)}`);
+    },
+    false,
+    true,
+  );
 
   await scenario('send a prompt and see the reply', 'route=sessions', async (page) => {
     await openSession(page, 'Refactor tmux launcher');

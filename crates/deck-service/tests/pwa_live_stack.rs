@@ -19,6 +19,15 @@
 //!
 //! `$OMPDECK_LIVE_RELAY_PORT` fixes the relay's port (the app origin); default any free port.
 //!
+//! A phone paired with two desktops needs a second gateway on the same relay. That is a second
+//! process of this test (its own sandbox, namespace, omp and scripted model):
+//! - the first one, started with `OMPDECK_LIVE_SECOND_ROOM=1`, also enrolls a second relay room
+//!   and publishes its key as `second_room_key` in the URL file;
+//! - the second one, started with `OMPDECK_LIVE_JOIN_RELAY=<relay url>` and
+//!   `OMPDECK_LIVE_JOIN_KEY=<that room key>`, starts no relay: its gateway links to the first
+//!   one's relay in that room, and its URL file carries its own pairing link and control endpoint
+//!   (the `origin` and `relay` are the first one's).
+//!
 //! `#[ignore]`d: run by `bun run live` and `bun run phone` with `--ignored`; skipped when omp is
 //! not installed.
 
@@ -32,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use deck_remote::relay::RoomKey;
 use deck_service::gateway::client::Link;
 use deck_service::gateway::protocol::{
     Done, Mutation, PairingState, Permissions, RelayLink, SecretText,
@@ -46,6 +56,8 @@ use web_push_native::{Auth, p256};
 const SLOW_TURN: Duration = Duration::from_millis(4500);
 /// Long enough for the phone gate to leave the conversation and background the app by taps.
 const LONG_TURN: Duration = Duration::from_secs(20);
+/// Long enough for the phone gate to switch to the other desktop by taps before the turn ends.
+const SWITCH_TURN: Duration = Duration::from_secs(30);
 /// How long the steered turn's tool call streams (time to steer while busy).
 const STEER_STREAM: Duration = Duration::from_secs(8);
 /// The stack never outlives a runner that died without writing the stop file.
@@ -99,6 +111,9 @@ fn script(notes: PathBuf) -> impl FnMut(&Value) -> Reply + Send + 'static {
         }
         if user.contains("PUSH-LONG-MARK") {
             return Reply::slow_text("PUSH-REPLY finished after a long while", LONG_TURN);
+        }
+        if user.contains("PUSH-SWITCH-MARK") {
+            return Reply::slow_text("SWITCH-REPLY finished on the other desktop", SWITCH_TURN);
         }
         if user.contains("IMG-MARK") {
             let n = fm::last_user(req).map_or(0, |m| fm::images(m).len());
@@ -456,16 +471,26 @@ fn pwa_live_stack() {
     }
     let url_file = env_path("OMPDECK_LIVE_URL_FILE");
     let stop_file = env_path("OMPDECK_LIVE_STOP_FILE");
+    // The second desktop of a two-desktop run joins the first one's relay instead of serving one.
+    let joined = std::env::var("OMPDECK_LIVE_JOIN_RELAY").ok().map(|url| {
+        let key = std::env::var("OMPDECK_LIVE_JOIN_KEY").expect("set OMPDECK_LIVE_JOIN_KEY");
+        (
+            url,
+            RoomKey::parse(&key).expect("OMPDECK_LIVE_JOIN_KEY is a room key"),
+        )
+    });
     let web_dir = std::env::var_os("OMPDECK_LIVE_WEB_DIR").map_or_else(
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pwa/dist"),
         PathBuf::from,
     );
-    let web_dir = web_dir.canonicalize().expect("the built app (pwa/dist)");
-    assert!(
-        web_dir.join("index.html").is_file(),
-        "{} has no index.html: build the app first",
-        web_dir.display()
-    );
+    if joined.is_none() {
+        let web_dir = web_dir.canonicalize().expect("the built app (pwa/dist)");
+        assert!(
+            web_dir.join("index.html").is_file(),
+            "{} has no index.html: build the app first",
+            web_dir.display()
+        );
+    }
 
     let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
     let sb = Sandbox::new("pwa", &config);
@@ -487,7 +512,28 @@ fn pwa_live_stack() {
     let port = std::env::var("OMPDECK_LIVE_RELAY_PORT")
         .ok()
         .map_or(0, |p| p.parse().expect("OMPDECK_LIVE_RELAY_PORT is a port"));
-    let mut relay = Relay::start_serving(sb.root.join("relay"), web_dir, port);
+    // Enrolled before the relay starts: it loads its rooms once at startup and only reloads on a
+    // hello for a room it does not know.
+    let second_room = (joined.is_none() && std::env::var_os("OMPDECK_LIVE_SECOND_ROOM").is_some())
+        .then(|| {
+            deck_relay::rooms::enroll(&sb.root.join("relay"), "second desktop")
+                .expect("enroll the second room")
+                .0
+        });
+    let mut relay = match &joined {
+        Some(_) => None,
+        None => Some(Relay::start_serving(
+            sb.root.join("relay"),
+            web_dir.canonicalize().expect("the built app (pwa/dist)"),
+            port,
+        )),
+    };
+    let (relay_url, room_key) = match (&relay, &joined) {
+        (Some(r), _) => (r.url(), r.key.encode()),
+        (None, Some((url, key))) => (url.clone(), key.encode()),
+        (None, None) => unreachable!("a stack either serves a relay or joins one"),
+    };
+    let origin = relay_url.replacen("ws", "http", 1);
 
     let client = sb.client();
     wait_for("the gateway link", Duration::from_secs(30), || {
@@ -496,8 +542,8 @@ fn pwa_live_stack() {
     run(
         &client,
         Mutation::RelaySet {
-            url: relay.url(),
-            room_key: SecretText::new(relay.key.encode()),
+            url: relay_url.clone(),
+            room_key: SecretText::new(room_key),
         },
     )
     .expect("relay set");
@@ -525,10 +571,11 @@ fn pwa_live_stack() {
         &url_file,
         &json!({
             "link": link.expose(),
-            "origin": format!("http://127.0.0.1:{}", relay.port),
-            "relay": relay.url(),
+            "origin": origin,
+            "relay": relay_url,
             "control": format!("http://127.0.0.1:{control}"),
             "project": "~/proj",
+            "second_room_key": second_room.as_ref().map(RoomKey::encode),
         })
         .to_string(),
     );
@@ -595,9 +642,17 @@ fn pwa_live_stack() {
             let _ = answer.send(result);
         }
         while let Ok(answer) = restarts.try_recv() {
-            relay.restart();
-            eprintln!("pwa live stack: relay restarted on port {}", relay.port);
-            let _ = answer.send(());
+            match relay.as_mut() {
+                Some(relay) => {
+                    relay.restart();
+                    eprintln!("pwa live stack: relay restarted on port {}", relay.port);
+                    let _ = answer.send(());
+                }
+                // Not answered: the caller gets a gateway timeout, the relay is the other stack's.
+                None => {
+                    eprintln!("pwa live stack: relay-restart refused (this stack joined a relay)")
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }

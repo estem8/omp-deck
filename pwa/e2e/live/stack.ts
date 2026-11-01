@@ -46,7 +46,29 @@ export function build(gate: string): void {
 }
 
 /** Starts the stack (`env` adds launcher variables) and waits until it is up. */
-export async function startStack(env: Record<string, string> = {}): Promise<Running> {
+export function startStack(env: Record<string, string> = {}): Promise<Running> {
+  return launch(env);
+}
+
+/**
+ * A first stack for a run with two desktops: the same stack, plus a second relay room whose key is
+ * published as `info.second_room_key` (`startSecondDesktop` hands it to the second gateway).
+ */
+export function startFirstOfTwo(env: Record<string, string> = {}): Promise<Running> {
+  return launch({ ...env, OMPDECK_LIVE_SECOND_ROOM: '1' });
+}
+
+/**
+ * The second desktop of a two-desktop run: another gateway in its own sandbox, namespace and room, with
+ * its own real omp on its own scripted model, linked to `first`'s relay (it serves no relay of its own).
+ * Its `info` has its own pairing link and control endpoint; `origin` and `relay` are the first's.
+ */
+export async function startSecondDesktop(first: Stack, env: Record<string, string> = {}): Promise<Running> {
+  if (first.second_room_key === null || first.second_room_key === undefined) throw new Error('the first stack has no second room (start it with startFirstOfTwo)');
+  return launch({ ...env, OMPDECK_LIVE_JOIN_RELAY: first.relay, OMPDECK_LIVE_JOIN_KEY: first.second_room_key });
+}
+
+async function launch(env: Record<string, string>): Promise<Running> {
   const dir = mkdtempSync(join(tmpdir(), 'pwa-live-'));
   const urlFile = join(dir, 'stack.json');
   const stopFile = join(dir, 'stop');

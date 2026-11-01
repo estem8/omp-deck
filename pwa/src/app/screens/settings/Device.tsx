@@ -1,6 +1,7 @@
 // This device: its name (renamable, validated as at pairing), its permissions (read-only, changed
 // on the desktop), the gateway it talks to, and unpairing (the desktop revokes it, then this
-// phone's keys are deleted).
+// phone's keys are deleted). Everything here is about the active desktop; this phone's pairings
+// with other desktops are untouched, and one of them becomes active afterwards.
 
 import { type ReactNode, useEffect, useState } from 'react';
 import { useClient, useClientState, useFeed, useOnline } from '../../ui/hooks.ts';
@@ -18,7 +19,7 @@ export function DeviceSection(): ReactNode {
   const [forget, setForget] = useState(false);
   const [busy, setBusy] = useState(false);
   const permissions = device?.permissions ?? welcome?.permissions ?? null;
-  const desktop = welcome?.name ?? pairing?.name ?? '—';
+  const desktop = pairing?.gateway ?? '—';
 
   const doUnpair = async () => {
     setBusy(true);
@@ -68,7 +69,7 @@ export function DeviceSection(): ReactNode {
       {unpair && (
         <ConfirmSheet
           title="Unpair this phone?"
-          message="The desktop revokes this phone, deletes its push subscription and attachments, and this phone deletes its keys. Connecting again needs a new pairing link."
+          message="The desktop revokes this phone, deletes its push subscription and attachments, and this phone deletes its keys for this desktop only. Connecting to it again needs a new pairing link. Other desktops stay paired."
           facts={[
             ['Desktop', desktop],
             ['This phone', device?.name ?? pairing?.device ?? '—'],
@@ -83,7 +84,7 @@ export function DeviceSection(): ReactNode {
       {forget && (
         <ConfirmSheet
           title="Forget this desktop?"
-          message="Only this phone’s keys are deleted; the desktop still lists the device until you revoke it there. Use this when the desktop is unreachable."
+          message="Only this phone’s keys for this desktop are deleted; the desktop still lists the device until you revoke it there. Use this when the desktop is unreachable. Other desktops stay paired."
           facts={[
             ['Desktop', desktop],
             ['Device', pairing?.device ?? '—'],

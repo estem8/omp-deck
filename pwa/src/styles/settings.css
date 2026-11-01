@@ -1010,3 +1010,26 @@
   color: var(--danger-text);
   border-color: var(--danger-text);
 }
+
+/* ---- desktops card ---- */
+.desktop-row[aria-pressed='true'] {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 var(--accent), 0 3px 0 #0008;
+}
+.desk-info {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.desk-info b,
+.desk-info small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desk-info small {
+  font-size: 10px;
+}
+.add-desktop {
+  margin-top: 10px;
+}

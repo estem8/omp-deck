@@ -1,11 +1,11 @@
 // Shared building blocks: sheets (styled header + body), destructive confirmations, key/value
-// rows, the connection pill, toasts, the bottom nav and the app banners.
+// rows, the connection pill with the desktop switcher, toasts, the bottom nav and the app banners.
 
-import { type ReactNode, useEffect, useId, useSyncExternalStore } from 'react';
+import { type ReactNode, createContext, useContext, useEffect, useId, useSyncExternalStore } from 'react';
 import { applyUpdate, cancelUpdate, updates } from '../update.ts';
 import type { Tab } from '../nav.ts';
 import { hasS4 } from '../client.ts';
-import { useClient, useClientState, useNow } from './hooks.ts';
+import { useClient, useClientState, useDesktops, useDesktopsState, useNow } from './hooks.ts';
 
 // ---- sheets ---------------------------------------------------------------------------------------
 
@@ -182,22 +182,101 @@ export function NeedsS4({ what, children }: { what: string; children?: ReactNode
   );
 }
 
+// ---- desktops -------------------------------------------------------------------------------------
+
+/** Opens the desktop switcher (the app shell provides it; absent where there is no shell). */
+export const SwitcherContext = createContext<(() => void) | null>(null);
+
+export function useOpenSwitcher(): (() => void) | null {
+  return useContext(SwitcherContext);
+}
+
+/** The active desktop's name, as a chip that opens the switcher. */
+export function DesktopChip(): ReactNode {
+  const open = useOpenSwitcher();
+  const desktops = useDesktopsState((state) => state.desktops);
+  const activeId = useDesktopsState((state) => state.activeId);
+  const name = desktops.find((desktop) => desktop.id === activeId)?.gateway ?? 'Desktop';
+  return (
+    <button type="button" className="pill desktop-chip" disabled={open === null} onClick={() => open?.()} aria-haspopup="dialog" aria-label={`Desktop ${name}. Switch desktop`}>
+      <span className="desk-mark" aria-hidden="true">
+        ◆
+      </span>
+      <span className="desk-name">{name}</span>
+      <span className="desk-caret" aria-hidden="true" />
+    </button>
+  );
+}
+
+/** Every paired desktop, the active one marked; a tap switches, and one more can be paired. */
+export function DesktopSheet({ onClose }: { onClose: () => void }): ReactNode {
+  const desktops = useDesktops();
+  const list = useDesktopsState((state) => state.desktops);
+  const activeId = useDesktopsState((state) => state.activeId);
+  return (
+    <Sheet title="Desktops" icon="◆" onClose={onClose}>
+      <p>This phone stays paired with each desktop below and talks to one at a time. The others still reach it with notifications.</p>
+      <div className="option-list">
+        {list.map((desktop) => (
+          <button
+            key={desktop.id}
+            type="button"
+            className="option desktop-option"
+            aria-pressed={desktop.id === activeId}
+            onClick={() => {
+              onClose();
+              void desktops.switchTo(desktop.id);
+            }}
+          >
+            <span className="grow">
+              <b>{desktop.gateway}</b>
+              <small>This phone: {desktop.name}</small>
+            </span>
+            {desktop.id === activeId ? <span className="chip ok">active</span> : <span className="desk-go" aria-hidden="true" />}
+          </button>
+        ))}
+      </div>
+      <div className="buttons desktop-add">
+        <button
+          type="button"
+          className="button block"
+          onClick={() => {
+            onClose();
+            desktops.beginAdd();
+          }}
+        >
+          Pair another desktop
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
 // ---- connection -----------------------------------------------------------------------------------
 
-/** The header pill: connected, reconnecting (with countdown), or stopped (with the reason). */
+/**
+ * The header row: the active desktop's name (opens the switcher) and its connection status:
+ * connected, reconnecting (with countdown), or stopped (with the reason).
+ */
 export function ConnectionPill(): ReactNode {
+  return (
+    <div className="conn-row">
+      <DesktopChip />
+      <StatusPill />
+    </div>
+  );
+}
+
+function StatusPill(): ReactNode {
   const client = useClient();
   const conn = useClientState((state) => state.conn);
-  const pairing = useClientState((state) => state.pairing);
-  const welcome = useClientState((state) => state.welcome);
   const now = useNow(1000);
-  const desktop = welcome?.name ?? pairing?.name ?? 'desktop';
   switch (conn.phase) {
     case 'online':
       return (
         <span className="pill connected" role="status">
           <span className="dot" />
-          Connected · {desktop}
+          Connected
         </span>
       );
     case 'loading':

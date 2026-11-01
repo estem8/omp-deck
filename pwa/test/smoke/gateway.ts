@@ -22,6 +22,8 @@ export interface GatewayOptions {
   uploadDelayMs: number;
   /** Delay before a journaled op's outcome, ms. */
   outcomeDelayMs: number;
+  /** The version the gateway announces (null: the default for its variant). */
+  version: string | null;
 }
 
 export const DEFAULT_OPTIONS: GatewayOptions = {
@@ -30,6 +32,7 @@ export const DEFAULT_OPTIONS: GatewayOptions = {
   pushKey: null,
   uploadDelayMs: 700,
   outcomeDelayMs: 450,
+  version: null,
 };
 
 /** What a connection sends to its device. */
@@ -51,6 +54,11 @@ export class SmokeGateway {
   readonly t0 = Date.now();
   readonly epoch = '0badc0ffee0ddba11fee1dead5eed000';
   readonly #conns = new Set<SmokeConnection>();
+
+  /** Device connections open right now (the e2e run checks that only the active desktop has one). */
+  get connections(): number {
+    return this.#conns.size;
+  }
 
   nextSeq = 100;
   readonly outcomes = new Map<number, api.OutcomeView>();
@@ -89,7 +97,7 @@ export class SmokeGateway {
     if (name.length > 0) this.deviceName = name;
     const welcome: api.Welcome = {
       protocol: api.PROTOCOL,
-      gateway_version: this.opts.s4 ? '0.10.0' : '0.9.2',
+      gateway_version: this.opts.version ?? (this.opts.s4 ? '0.10.0' : '0.9.2'),
       epoch: this.epoch,
       device,
       name: this.deviceName,
@@ -202,7 +210,7 @@ export class SmokeGateway {
           name: this.deviceName,
           permissions: { control: true, manage: true },
           push: this.push,
-          gateway_version: this.opts.s4 ? '0.10.0' : '0.9.2',
+          gateway_version: this.opts.version ?? (this.opts.s4 ? '0.10.0' : '0.9.2'),
           mode: 'background',
         };
     }

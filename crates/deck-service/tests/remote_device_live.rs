@@ -98,6 +98,10 @@ fn gradient_png(side: u32) -> Vec<u8> {
 const PNG_SIDE: u32 = 200;
 /// Longer than the turn-finished threshold (`notifications::tracker::MIN_BUSY`, 3 s).
 const SLOW_TURN: Duration = Duration::from_millis(4500);
+/// The session's first turn: long enough for omp to drop its file handle (title rewrite) mid-turn.
+const FIRST_TURN: Duration = Duration::from_secs(15);
+/// How soon after a turn the session id must be known (the sidebar scan runs every few seconds).
+const ID_AFTER_TURN: Duration = Duration::from_secs(12);
 /// How long the steered turn's tool call streams (time to steer and follow up while busy).
 const STEER_STREAM: Duration = Duration::from_secs(8);
 /// How long a model request or a turn may take.
@@ -139,6 +143,9 @@ fn script(notes: PathBuf) -> impl FnMut(&Value) -> Reply + Send + 'static {
                 &json!({ "path": notes.to_string_lossy() }),
                 STEER_STREAM,
             );
+        }
+        if user.contains("FIRST-LONG-MARK") {
+            return Reply::slow_text("first turn finished", FIRST_TURN);
         }
         if user.contains("PUSH-MARK") || user.contains("QUIET-MARK") {
             return Reply::slow_text("finished after a while", SLOW_TURN);
@@ -662,6 +669,36 @@ fn interactive_paths_with_a_real_omp() {
         }
     }
     w.absorb(&mut a);
+
+    // -- (g) a fresh session's id is known right after a long first turn --
+    // omp writes the file only when the first reply lands and drops its handle when it rewrites
+    // the file (the title), so the open-file poll alone may never learn it; the gateway asks live
+    // control instead.
+    compose(
+        &mut a,
+        &mut w,
+        &mut seq,
+        "FIRST-LONG-MARK take your time",
+        Vec::new(),
+        api::ComposeMode::Send,
+    );
+    w.working(&mut a, "the long first turn");
+    w.until(&mut a, "the long first turn's end", TURN, |s| {
+        s.activity == Activity::Idle
+    });
+    let ended = Instant::now();
+    let s = w.until(
+        &mut a,
+        "the session id after the first turn",
+        ID_AFTER_TURN,
+        |s| s.session.is_some(),
+    );
+    eprintln!(
+        "(g) session {:?} known {:.1} s after the long first turn",
+        s.session,
+        ended.elapsed().as_secs_f32()
+    );
+    w.idle(&mut a);
 
     // -- (c) compose with an image attachment --
     let png = gradient_png(PNG_SIDE);

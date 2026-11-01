@@ -108,10 +108,32 @@ export async function tapNode(what: string, match: (node: Node) => boolean, time
   return node;
 }
 
+/**
+ * Taps the node once it is clear of the floating bottom bar, scrolling the page up first when it
+ * sits behind it (a tap there would hit the bar's own buttons).
+ */
+export async function tapNodeAboveBar(what: string, match: (node: Node) => boolean, timeout?: number): Promise<Node> {
+  for (let attempt = 0; ; attempt++) {
+    const all = nodes();
+    const node = all.find(match) ?? (await waitNode(what, match, timeout));
+    const screen = Math.max(...all.map((n) => n.bounds[3]), node.bounds[3]);
+    const width = Math.max(...all.map((n) => n.bounds[2]), node.bounds[2]);
+    const centre = (node.bounds[1] + node.bounds[3]) / 2;
+    if (centre < screen * 0.82 || attempt === 4) {
+      tap(node);
+      return node;
+    }
+    const x = String(Math.round(width / 2));
+    adb('shell', 'input', 'swipe', x, String(Math.round(screen * 0.7)), x, String(Math.round(screen * 0.35)), '300');
+    await Bun.sleep(400);
+  }
+}
+
 /** Types through the device's input stack (key events into the focused field). */
 export function typeText(text: string): void {
-  if (!/^[A-Za-z0-9 .,:-]+$/.test(text)) throw new Error(`typeText takes letters, digits, spaces and .,:- only: ${text}`);
-  adb('shell', 'input', 'text', text.replaceAll(' ', '%s'));
+  if (!/^[A-Za-z0-9 .,:_-]+$/.test(text)) throw new Error(`typeText takes letters, digits, spaces and .,:_- only: ${text}`);
+  // In pieces: one long argument makes `input text` drop or reorder keys on some phones.
+  for (let at = 0; at < text.length; at += 48) adb('shell', 'input', 'text', text.slice(at, at + 48).replaceAll(' ', '%s'));
 }
 
 export function key(code: string): void {

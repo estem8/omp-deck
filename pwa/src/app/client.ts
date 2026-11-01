@@ -425,6 +425,8 @@ export class Client {
   /** Bumped per dial; events of an older link are ignored. */
   #linkId = 0;
   #sessionOpened = false;
+  /** Set by `stop`: no link is opened any more (a connect already waiting on the key store gives up). */
+  #stopped = false;
   #retryTimer: number | null = null;
   #rateLimitedSince: number | null = null;
 
@@ -596,6 +598,17 @@ export class Client {
     this.#setConn({ phase: 'unpaired', attempt: 0, retryAt: null, stop: null, lastClose: null });
   }
 
+  /**
+   * Ends this client for good (the app switched to another desktop): closes the link cleanly and
+   * never dials again. The stored pairing stays; a new `Client` serves the desktop when it is
+   * chosen again.
+   */
+  stop(): void {
+    this.#stopped = true;
+    this.#disconnect();
+    this.#failOpenRequests();
+  }
+
   /** Closes the current link on purpose: its late events are ignored. */
   #disconnect(): void {
     this.#clearRetry();
@@ -613,7 +626,7 @@ export class Client {
 
   async #connect(): Promise<void> {
     const stored = this.#stored;
-    if (stored === null) return;
+    if (stored === null || this.#stopped) return;
     this.#setConn({ phase: 'connecting', retryAt: null, stop: null });
     let ts: number;
     try {
@@ -624,6 +637,7 @@ export class Client {
       this.#setConn({ phase: 'unpaired' });
       return;
     }
+    if (this.#stopped) return;
     const id = ++this.#linkId;
     this.#sessionOpened = false;
     this.#ack = new AckPolicy();

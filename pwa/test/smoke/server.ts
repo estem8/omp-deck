@@ -1,9 +1,10 @@
 // The smoke harness server: one Bun HTTP + WebSocket server on 127.0.0.1 that is
 // - the static host of a fresh PWA build (built into a temp dir, never into dist/), whose
-//   index.html is rewritten to boot through `boot.ts` (pairing seed, theme, gateway variant);
-// - the relay (`/v1/device`: the device hello, answered `HELLO_OK`);
-// - the gateway behind it: the real Noise responder (`respond`), the real record codec, and the
-//   fixture-backed application side (`gateway.ts`).
+//   index.html is rewritten to boot through `boot.ts` (pairing seeds, theme, gateway variant);
+// - the relay (`/v1/device`: the device hello, answered `HELLO_OK`, routed to a desktop by its room);
+// - the gateways behind it, two desktops ("Workstation" and "Laptop", each with its own key, room and
+//   tokens): the real Noise responder (`respond`), the real record codec, and the fixture-backed
+//   application side (`gateway.ts`).
 // Nothing here is in the production bundle: build.test.ts asserts it.
 
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -28,8 +29,6 @@ import {
 import { type SmokeConnection, SmokeGateway } from './gateway.ts';
 
 const PWA = join(import.meta.dir, '..', '..');
-const SEEDED_DEVICE = 'd-0123456789abcdef';
-const GATEWAY_LABEL = 'Workstation';
 
 /** Fixed bytes from a label (deterministic keys and tokens). */
 function fixed(label: string, length: number): Uint8Array<ArrayBuffer> {
@@ -39,14 +38,29 @@ function fixed(label: string, length: number): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+/** One fake desktop: its own gateway key, room, tokens and application state. */
+export interface SmokeDesktop {
+  /** The gateway's label (the desktop's name). */
+  label: string;
+  /** The pairing id the phone derives: the lowercase hex of the gateway's static key. */
+  id: string;
+  /** A `v1.…` pairing invite this desktop auto-approves. */
+  invite: string;
+  gateway: SmokeGateway;
+}
+
 export interface SmokeServer {
   /** `http://127.0.0.1:<port>` */
   origin: string;
-  /** The relay URL in invites and the seeded pairing (`ws://127.0.0.1:<port>`). */
+  /** The relay URL in invites and the seeded pairings (`ws://127.0.0.1:<port>`). */
   relay: string;
-  /** A `v1.…` pairing invite this gateway auto-approves. */
+  /** A `v1.…` pairing invite the first desktop (Workstation) auto-approves. */
   invite: string;
   gateway: SmokeGateway;
+  /** The first desktop ("Workstation": the seeded pairing, `invite`, `gateway`). */
+  first: SmokeDesktop;
+  /** A second desktop ("Laptop") on the same relay, with its own key, room, tokens and gateway. */
+  second: SmokeDesktop;
   /** `origin/#route=…&theme=…` */
   url(hash: string): string;
   stop(): Promise<void>;
@@ -59,8 +73,25 @@ export interface SmokeOptions {
   log?: (line: string) => void;
 }
 
+/** The desktop behind a room: the secrets the relay and its gateway use. */
+interface Desktop {
+  label: string;
+  gatewayKey: Keypair;
+  deviceKey: Keypair;
+  room: Uint8Array<ArrayBuffer>;
+  pairingToken: Uint8Array<ArrayBuffer>;
+  deviceToken: Uint8Array<ArrayBuffer>;
+  psk: Uint8Array<ArrayBuffer>;
+  seededDevice: string;
+  /** Device public key (hex) → registry id. */
+  devices: Map<string, string>;
+  gateways: { s4: SmokeGateway; v1: SmokeGateway };
+  invite: string;
+}
+
 interface SocketData {
   stage: 'hello' | 'handshake' | 'session';
+  desktop: Desktop | null;
   pairing: boolean;
   pending: Pending | null;
   session: Session | null;
@@ -83,19 +114,29 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
   const main = script[1].startsWith('/') ? script[1] : `/${script[1].replace(/^\.\//, '')}`;
   const indexHtml = html.replace(script[0], '<script type="module" src="/__smoke/boot.js"></script>');
 
-  const gatewayKey = Keypair.fromSecret(fixed('ompdeck-smoke-gateway', 32));
-  const deviceKey = Keypair.fromSecret(fixed('ompdeck-smoke-device', 32));
-  const room = fixed('ompdeck-smoke-room', 16);
-  const pairingToken = fixed('ompdeck-smoke-pairing-token', 32);
-  const deviceToken = fixed('ompdeck-smoke-device-token', 32);
-  const psk = fixed('ompdeck-smoke-psk', 32);
-  /** Device public key (hex) → registry id. */
-  const devices = new Map<string, string>([[Buffer.from(deviceKey.public).toString('hex'), SEEDED_DEVICE]]);
-
   const vapid = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign'])) as CryptoKeyPair;
   const pushKey = toBase64Url(new Uint8Array(await crypto.subtle.exportKey('raw', vapid.publicKey)));
   const png = new Uint8Array(readFileSync(join(PWA, 'public', 'icon-512.png')));
-  const gateways = { s4: new SmokeGateway({ s4: true, png, pushKey }), v1: new SmokeGateway({ s4: false, png, pushKey: null }) };
+  /** `tag` keeps the first desktop's fixed bytes as they always were; the second gets its own. */
+  const desktop = (tag: string, label: string, seededDevice: string, version: string | null): Desktop => {
+    const at = (name: string) => `ompdeck-smoke-${name}${tag}`;
+    const deviceKey = Keypair.fromSecret(fixed(at('device'), 32));
+    return {
+      label,
+      gatewayKey: Keypair.fromSecret(fixed(at('gateway'), 32)),
+      deviceKey,
+      room: fixed(at('room'), 16),
+      pairingToken: fixed(at('pairing-token'), 32),
+      deviceToken: fixed(at('device-token'), 32),
+      psk: fixed(at('psk'), 32),
+      seededDevice,
+      devices: new Map([[Buffer.from(deviceKey.public).toString('hex'), seededDevice]]),
+      gateways: { s4: new SmokeGateway({ s4: true, png, pushKey, version }), v1: new SmokeGateway({ s4: false, png, pushKey: null }) },
+      invite: '',
+    };
+  };
+  const desktops = [desktop('', 'Workstation', 'd-0123456789abcdef', null), desktop('-laptop', 'Laptop', 'd-fedcba9876543210', '0.11.0')] as const;
+  const [workstation, laptop] = desktops;
 
   const server = Bun.serve<SocketData, never>({
     hostname: '127.0.0.1',
@@ -104,24 +145,22 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
       const url = new URL(request.url);
       if (url.pathname === DEVICE_PATH) {
         const v1 = /(?:^|;\s*)smoke_gw=v1(?:;|$)/.test(request.headers.get('cookie') ?? '');
-        const data: SocketData = { stage: 'hello', pairing: false, pending: null, session: null, conn: null, v1 };
+        const data: SocketData = { stage: 'hello', desktop: null, pairing: false, pending: null, session: null, conn: null, v1 };
         return srv.upgrade(request, { data }) ? undefined : new Response('upgrade failed', { status: 400 });
       }
       if (url.pathname === '/__smoke/boot.js') return new Response(bootJs, { headers: { 'content-type': 'text/javascript' } });
       if (url.pathname === '/__smoke/seed.json') {
-        return Response.json({
-          main,
-          pairing: {
-            secret: toBase64Url(deviceKey.secretBytes()),
-            gatewayPublic: toBase64Url(gatewayKey.public),
-            url: relay,
-            room: toBase64Url(room),
-            token: toBase64Url(deviceToken),
-            device: SEEDED_DEVICE,
-            gateway: GATEWAY_LABEL,
-            name: 'Pixel 9',
-          },
+        const seed = (d: Desktop) => ({
+          secret: toBase64Url(d.deviceKey.secretBytes()),
+          gatewayPublic: toBase64Url(d.gatewayKey.public),
+          url: relay,
+          room: toBase64Url(d.room),
+          token: toBase64Url(d.deviceToken),
+          device: d.seededDevice,
+          gateway: d.label,
+          name: 'Pixel 9',
         });
+        return Response.json({ main, pairing: seed(workstation), second: seed(laptop) });
       }
       if (url.pathname === '/' || url.pathname === '/index.html') {
         return new Response(indexHtml, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
@@ -142,38 +181,41 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
         const data = ws.data;
         try {
           if (data.stage === 'hello') {
-            if (bytes.length !== 50 || bytes[0] !== 0x44 || bytes[1] !== 1 || !equal(bytes.subarray(2, 18), room)) {
+            const found = bytes.length === 50 && bytes[0] === 0x44 && bytes[1] === 1 ? desktops.find((d) => equal(bytes.subarray(2, 18), d.room)) : undefined;
+            if (found === undefined) {
               ws.close(CLOSE.UNAUTHORIZED, 'bad hello');
               return;
             }
-            data.pairing = equal(bytes.subarray(18, 50), pairingToken);
+            data.desktop = found;
+            data.pairing = equal(bytes.subarray(18, 50), found.pairingToken);
             data.stage = 'handshake';
             ws.send(HELLO_OK);
             return;
           }
-          if (data.stage === 'handshake') {
-            const pending = respond(data.pairing ? { kind: 'pairing', psk } : { kind: 'reconnect' }, gatewayKey, bytes);
+          if (data.stage === 'handshake' && data.desktop !== null) {
+            const d = data.desktop;
+            const pending = respond(data.pairing ? { kind: 'pairing', psk: d.psk } : { kind: 'reconnect' }, d.gatewayKey, bytes);
             const key = Buffer.from(pending.devicePublic).toString('hex');
             if (data.pairing) {
               // The desktop "approves" after a moment, so the approval stage is visible.
               const device = `d-${key.slice(0, 16)}`;
-              devices.set(key, device);
-              log(`pairing ${pending.hello.name} → ${device}`);
+              d.devices.set(key, device);
+              log(`pairing ${pending.hello.name} → ${device} at ${d.label}`);
               setTimeout(() => {
-                const { msg2 } = pending.accept({ device, gateway: GATEWAY_LABEL, token: deviceToken });
+                const { msg2 } = pending.accept({ device, gateway: d.label, token: d.deviceToken });
                 ws.send(msg2);
               }, 900);
               data.stage = 'session';
               return;
             }
-            const device = devices.get(key) ?? `d-${key.slice(0, 16)}`;
-            const { session, msg2 } = pending.accept({ device, gateway: GATEWAY_LABEL });
+            const device = d.devices.get(key) ?? `d-${key.slice(0, 16)}`;
+            const { session, msg2 } = pending.accept({ device, gateway: d.label });
             session.config.maxMessage = MAX_APP_MESSAGE;
             data.session = session;
             data.stage = 'session';
             ws.send(msg2);
-            const gateway = data.v1 ? gateways.v1 : gateways.s4;
-            log(`device ${device} connected (${data.v1 ? 'v1' : 's4'} gateway, features ${pending.hello.features.join(',') || 'none'})`);
+            const gateway = data.v1 ? d.gateways.v1 : d.gateways.s4;
+            log(`device ${device} connected to ${d.label} (${data.v1 ? 'v1' : 's4'} gateway, features ${pending.hello.features.join(',') || 'none'})`);
             data.conn = gateway.connect(
               (records) => {
                 if (ws.readyState !== 1 || data.session === null) return;
@@ -202,12 +244,15 @@ export async function startSmoke(options: SmokeOptions = {}): Promise<SmokeServe
   const port: number = server.port ?? 0;
   const origin = `http://127.0.0.1:${port}`;
   const relay: string = `ws://127.0.0.1:${port}`;
-  const invite = encodePairingInvite({ url: relay, room, token: pairingToken, gatewayPublic: gatewayKey.public, psk });
+  for (const d of desktops) d.invite = encodePairingInvite({ url: relay, room: d.room, token: d.pairingToken, gatewayPublic: d.gatewayKey.public, psk: d.psk });
+  const view = (d: Desktop): SmokeDesktop => ({ label: d.label, id: Buffer.from(d.gatewayKey.public).toString('hex'), invite: d.invite, gateway: d.gateways.s4 });
   return {
     origin,
     relay,
-    invite,
-    gateway: gateways.s4,
+    invite: workstation.invite,
+    gateway: workstation.gateways.s4,
+    first: view(workstation),
+    second: view(laptop),
     url: (hash) => `${origin}/${hash.length === 0 || hash.startsWith('#') ? hash : `#${hash}`}`,
     async stop() {
       await server.stop(true);

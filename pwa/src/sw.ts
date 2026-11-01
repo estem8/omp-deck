@@ -2,8 +2,24 @@
 // The service worker: precaches the hashed app shell (cache-first, navigations fall back to the
 // cached index.html), never caches `/v1/*`, shows push notifications, and routes notification
 // taps. Updates are user-confirmed: the app posts SKIP_WAITING.
+//
+// The same script runs in several registrations: the root one (scope `/`) is the app shell; each
+// paired desktop has one at `/d/<id>/` that only holds that desktop's push subscription (one
+// subscription and one VAPID key per registration). Only the root worker touches the shell caches:
+// a desktop's worker updating first must not delete the cache the root worker still serves from.
 
-import { GENERIC_PUSH, PUSH_CHANGED_MESSAGE, PUSH_KEY_URL, PUSH_STATE_CACHE, parsePush, safeNavigate } from './push.ts';
+import {
+  GENERIC_PUSH,
+  LEGACY_PUSH_KEY_URL,
+  PUSH_CHANGED_MESSAGE,
+  PUSH_STATE_CACHE,
+  desktopIdFromScope,
+  notificationFor,
+  parsePush,
+  pushKeyUrl,
+  pushLabelUrl,
+  safeNavigate,
+} from './push.ts';
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -13,8 +29,12 @@ declare const __VERSION__: string;
 
 const CACHE = `ompdeck-${__VERSION__}`;
 const SHELL = '/index.html';
+/** The desktop this registration serves pushes for; null for the root (app shell) registration. */
+const DESKTOP = desktopIdFromScope(self.registration.scope);
+const IS_SHELL = DESKTOP === null;
 
 self.addEventListener('install', (event) => {
+  if (!IS_SHELL) return;
   event.waitUntil(
     (async () => {
       const cache = await caches.open(CACHE);
@@ -24,6 +44,7 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
+  if (!IS_SHELL) return;
   event.waitUntil(
     (async () => {
       for (const name of await caches.keys()) {
@@ -43,7 +64,7 @@ self.addEventListener('message', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const request = event.request;
-  if (request.method !== 'GET') return;
+  if (!IS_SHELL || request.method !== 'GET') return;
   const url = new URL(request.url);
   // Only this origin's app files: never the relay endpoints or anything cross-origin.
   if (url.origin !== self.location.origin || url.pathname.startsWith('/v1/') || url.pathname === '/healthz') return;
@@ -68,20 +89,27 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
+/** The label the app keeps for this registration's desktop (only while 2+ desktops are paired); null when unset or unreadable. */
+async function desktopLabel(): Promise<string | null> {
+  if (DESKTOP === null) return null;
+  try {
+    const stored = await (await caches.open(PUSH_STATE_CACHE)).match(pushLabelUrl(self.registration.scope));
+    return stored === undefined ? null : await stored.text();
+  } catch {
+    return null;
+  }
+}
+
 self.addEventListener('push', (event) => {
   // Every push shows a notification (browsers penalise silent pushes); bad JSON gets a generic one.
   const payload = event.data === null ? null : parsePush(event.data.text(), self.location.origin);
   const shown = payload ?? GENERIC_PUSH;
-  const options: NotificationOptions = {
-    body: shown.body,
-    icon: '/icon-192.png',
-    // Android draws the status-bar badge from the alpha channel only: a white silhouette.
-    badge: '/badge-96.png',
-    data: { navigate: shown.navigate },
-    silent: shown.silent,
-  };
-  if (shown.tag !== null) options.tag = shown.tag;
-  event.waitUntil(self.registration.showNotification(shown.title, options));
+  event.waitUntil(
+    (async () => {
+      const { title, options } = notificationFor(shown, DESKTOP, await desktopLabel());
+      await self.registration.showNotification(title, options);
+    })(),
+  );
 });
 
 self.addEventListener('notificationclick', (event) => {
@@ -111,12 +139,14 @@ self.addEventListener('pushsubscriptionchange', (event) => {
   const change = event as Event & { oldSubscription?: PushSubscription | null; waitUntil(promise: Promise<unknown>): void };
   change.waitUntil(
     (async () => {
-      const stored = await (await caches.open(PUSH_STATE_CACHE)).match(PUSH_KEY_URL);
+      const cache = await caches.open(PUSH_STATE_CACHE);
+      // The root registration's entry is version 1's single key until the app migrates it.
+      const stored = (await cache.match(pushKeyUrl(self.registration.scope))) ?? (IS_SHELL ? await cache.match(LEGACY_PUSH_KEY_URL) : undefined);
       const key = change.oldSubscription?.options.applicationServerKey ?? (stored === undefined ? null : await stored.arrayBuffer());
       if (key === null) return;
       await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
       for (const client of await self.clients.matchAll({ type: 'window', includeUncontrolled: true })) {
-        client.postMessage({ type: PUSH_CHANGED_MESSAGE });
+        client.postMessage({ type: PUSH_CHANGED_MESSAGE, desktop: DESKTOP });
       }
     })(),
   );

@@ -341,6 +341,51 @@ The terminal path (attach `input`/`control`) keeps working for every kind.
   - prefs and presence gating;
   - no push for an event the canonical tracker de-duplicated.
 
+## Web Push per desktop (PWA)
+
+The phone keeps one pairing per desktop (see "Keys" and "Several desktops"), and every gateway has its own VAPID key.
+A browser allows one `PushSubscription` per service-worker registration, bound to one `applicationServerKey`, so:
+
+- **One registration per desktop.** Desktop `<id>`'s subscription lives on the registration of the same `/sw.js`
+  script at scope `/d/<id>/` (`desktopScope`, `src/push.ts`; the script is at `/`, so the narrower scope needs no
+  `Service-Worker-Allowed` header). The root `/` registration (`app/update.ts`) stays the
+  app-shell/update worker and holds no subscription any more.
+- **Active desktop only in the UI.** `usePushSync` and `PushController` act on the active desktop's registration:
+  enabling push for one desktop never touches another. The registration is created when push is turned on (or
+  migrated, below); `sync` never creates one. The app re-sends `push_subscribe` on every reconnect, as before.
+- **The desktop replaces its old subscription.** `push_subscribe` from a device overwrites that device's stored
+  subscription (`push::subscribe` sets `d.push = Some(sub)`, keeping its prefs; `since_unix_ms` is kept when the
+  endpoint is unchanged). Device ids are per desktop, so desktops never overwrite each other's.
+- **The kept VAPID key is per registration.** The Cache `push-state` entry is `/__push-key?scope=<registration scope>`
+  (`pushKeyUrl`), so `pushsubscriptionchange` in a desktop's worker resubscribes with that desktop's key. The old
+  single `/__push-key` entry is read only by the root worker, until the migration (`legacyDone`) deletes it.
+- **A tap switches desktops.** The worker's `navigate` is `/#d=<id>&…` (`navigateForDesktop`: the id first, the
+  gateway's own hash parameters kept). The click posts it to an open window or opens it cold; the app reads the desktop
+  first (`linkFromHash`), switches to it, then opens the route. At a cold start the link's desktop replaces the stored
+  active one. Tags are `<id>:<gateway tag>`, so two desktops' notifications for the same session never replace each
+  other.
+- **A notification names its desktop once several are paired.** With 2+ desktops each notification's title is
+  `OmpDeck — <label>` (`notificationFor`/`titleWithLabel`), where the label is what the switcher shows (the
+  gateway's label, with the key-fingerprint head appended when labels collide, `summaries()`) minus a leading
+  "OmpDeck on " (the gateway's default label; the title already says OmpDeck). The title, not a body
+  line: Android shows it bold on its own line in the shade, and the body stays the gateway's text. With one desktop
+  the notification is unchanged (`OmpDeck`). The worker has no names and cannot cheaply read IndexedDB, so the app
+  keeps the label in the Cache `push-state` entry `/__push-label?scope=<registration scope>` (`pushLabelUrl`),
+  written by `syncPushLabels` (`watchPushLabels` in `main.tsx` re-runs it whenever the list or a label changes:
+  pairing added or replaced, forgotten, a collision appearing or going away). It deletes the entries while only one
+  desktop remains, and forgetting a desktop deletes its entry with its key. A missing or unreadable entry means an
+  unlabelled title. The root registration never carries one. Migration from version 1 needs nothing (one desktop).
+- **Migration from version 1.** The v1 subscription is on the root registration. The keystore migration marks the
+  migrated desktop (`meta['legacy-push']`). When that desktop's app syncs with notifications permitted, it registers
+  `/d/<id>/`, subscribes there with the desktop's `push_key`, re-sends `push_subscribe` (how a changed endpoint
+  reaches the desktop), then unsubscribes the root subscription and clears the marker. Subscribing comes first: if it
+  fails, the root subscription is kept and delivery continues. Turning push on or off also retires the root one.
+- **Forgetting a desktop** unsubscribes and unregisters its scope registration and deletes its kept key (plus the
+  root subscription and the old key entry when it was the migrated one). Other desktops' registrations are untouched;
+  every step runs, and the first failure is reported.
+- **Not covered:** a phone that is paired with several desktops receives a push from each, but only the active
+  desktop's app sees its live state; the tap switches to the pushing desktop.
+
 ## Relay serves the PWA (`deck-relay`)
 
 - **`--web-dir <dir>`:** if absent, the relay uses `<exe dir>/web`, then `/usr/share/omp-deck-relay/web`, else it
@@ -415,13 +460,45 @@ The terminal path (attach `input`/`control`) keeps working for every kind.
   - A small external store (`useSyncExternalStore`) holds it.
   - Offline: the last known state shows as stale and every mutation is disabled. Nothing is queued for later.
 - **Keys:**
-  - IndexedDB holds the static secret, the gateway key, the relay URL, the room/token material and the per-key `last`
+  - IndexedDB `ompdeck` (version 2) holds one record per paired desktop in the `pairings` store, keyed by the pairing id,
+    plus a `meta` store with the active id (`active`) and the migration marker (`legacy-push`, below). Each record has
+    the static secret, the gateway key, the relay URL, the room/token material and that pairing's own `last`
     timestamp, persisted atomically with the key.
+  - **Pairing id** = lowercase hex of the gateway's static key from the invite. Pairing again with the same desktop
+    replaces that one record; a different key adds one. All desktops share one relay URL; each has its own room,
+    token, gateway key and VAPID key.
+  - `last` is kept per pairing and persisted before use (a lost `last` locks the device out, `mobile-relay.md` R5).
+  - The `Client` still talks to a `PairingStore` bound to one pairing (`KeyStore.scoped(id)`: load, save, reserve a
+    timestamp, clear), so the Noise, relay and `Client` logic is unchanged. A scoped store refuses to save another
+    desktop's key.
+  - **Migration from version 1:** the old `pairing/current` record moves into `pairings` in the `onupgradeneeded` of
+    the version bump, becomes active and carries its `last` over; no re-pairing. The old store is deleted. A damaged or
+    foreign record counts as "not paired" for its slot (a damaged v1 record leaves the app unpaired; a damaged v2
+    record is skipped).
   - A fresh static key is generated for every pairing (R5 A4).
   - `navigator.storage.persist()` is requested after pairing.
-  - A missing key means "re-pair".
+  - A missing key means "re-pair" (for that desktop).
   - The app shows "Add to Home Screen to keep your pairing and get notifications" when not standalone.
-- **Pairing:** read `#pair=`, then `history.replaceState` to remove it at once. Show the fingerprint to compare with
+- **Several desktops** (`src/app/desktops.ts`, `Desktops`):
+  - **One live connection: the active desktop.** Switching stops the current `Client` (its link closes with a normal
+    close) and starts one for the chosen pairing. The whole app remounts by pairing id, so screens, inbox, drafts and
+    navigation reset for the new desktop. Inactive desktops are never connected; they reach the phone through Web Push
+    only. The active id is remembered across launches.
+  - **Switcher:** the active desktop's name is a chip in the header row of Sessions, Agents, Inbox and Settings
+    (next to the connection status); it opens a sheet listing every paired desktop (gateway name, this phone's name
+    there, the active one marked) and "Pair another desktop". Pushed screens (a conversation, a diff) show no chip;
+    Back reaches it. Settings has a "Desktops" card with the same list.
+  - **Same labels:** two desktops whose gateways report the same label (two gateways on one host, e.g. WSL
+    instances) get ` · <first 4 characters of the key fingerprint>` appended, only while the labels collide.
+  - **Pairing a desktop** runs on its own client scoped to the invite's id, so the active desktop stays connected
+    until the new pairing is stored; on success the new desktop becomes active. With no pairings the screen reads as
+    before; with some, an invite for a new desktop says "Pair another desktop" (the others stay paired), and an
+    invite for an already paired desktop says it replaces this phone's pairing with it.
+  - **Forget/unpair** (Settings → This device) applies to the active desktop only (its keys, its push subscription and
+    its service-worker registration). The next remaining desktop becomes active, or the pairing screen shows when none
+    is left.
+- **Pairing:** read `#pair=`, then `history.replaceState` to remove it at once; an invite opened while the app runs
+  (`hashchange`) goes to the pairing flow without dropping any desktop. Show the fingerprint to compare with
   the desktop, retry a pairing admission briefly on `UNAUTHORIZED` (`mobile-relay.md:115`), then reconnect.
 - **Navigation** (bottom nav as in the mockups): Sessions, Agents, Inbox, Settings. The screens cover every
   coverage-matrix row:
@@ -453,9 +530,15 @@ The terminal path (attach `input`/`control`) keeps working for every kind.
   restore apply (with the overwrite warning) and backup delete. The confirmation is a PWA step (the gateway does not
   enforce it, R4).
 - **Service worker:**
+  - The same `/sw.js` runs in several registrations: the root `/` one is the app-shell and update worker, and each
+    desktop's push subscription lives on its own registration at `/d/<pairing id>/` (below). Only the root worker
+    installs, activates and serves the shell cache, so a desktop-scope worker that updates first never deletes the
+    cache the root worker serves from.
   - Precaches the hashed app shell, cache-first; navigation falls back to the cached `index.html`.
   - Never caches transcripts, `/v1/*` or secrets.
   - On `push`, it shows the declarative payload (always `showNotification`, with a generic fallback on bad JSON).
+    The desktop is read from `self.registration.scope`; the notification's tag is namespaced per desktop and its
+    `navigate` carries `d=<id>`; with 2+ desktops the title carries the desktop's label (kept per scope by the app).
   - `notificationclick` focuses or opens the app at `navigate`.
   - `pushsubscriptionchange` resubscribes, and the app re-checks `getSubscription()` at every start.
   - Updates are user-confirmed ("Update available → Reload" posts `SKIP_WAITING`), and the reload waits for open
@@ -583,11 +666,14 @@ PWA (`pwa/`):
   - Fonts are emitted as hashed files under `assets/`, never `data:` URLs, which the CSP blocks.
   - The manifest and icon links are injected by `build.ts`.
   - Typecheck runs in two tiers: strict for plain `.ts`, upstream's flags for TSX/vendored code, plus a WebWorker config.
-- **Deep links:** `#route=<tab|screen>&session=&agent=&live=&project=&section=` and `#s=<session id>`. They work at
-  boot, from service-worker navigate messages and on `hashchange`. A link's `title`/`display` is never honoured (S4-3):
-  screens and confirmations take names from feeds by id. Push `navigate` must be same-origin; only path + hash are kept.
-- **Push:** the push key is mirrored into Cache `push-state` (`/__push-key`), so the service worker can resubscribe on
-  `pushsubscriptionchange`. The app re-sends its subscription on every reconnect.
+- **Deep links:** `#route=<tab|screen>&session=&agent=&live=&project=&section=` and `#s=<session id>`, optionally
+  with `d=<pairing id>` first (`#d=<id>&s=…`): the link then opens on that desktop, switching to it first when it is
+  not active. A `d` that is not a paired desktop drops the whole link. They work at boot (the stored active desktop
+  is replaced by the link's), from service-worker navigate messages and on `hashchange`. A link's `title`/`display`
+  is never honoured (S4-3): screens and confirmations take names from feeds by id. Push `navigate` must be
+  same-origin; only path + hash are kept. History entries record their desktop, so Back entries written for another
+  desktop read as "no route" after a switch.
+- **Push (per desktop):** see "Web Push per desktop" below.
 - **Interaction choices:**
   - A multi-select UI request is answered one choice per tap, because omp toggles one option per call.
   - Fork from a conversation needs the session to be live (it needs its project).
@@ -664,6 +750,21 @@ Proven on a Motorola Edge+ 2023 (Android 14, Chrome 156) over USB, by hand first
   8. relay restarted (`POST /relay-restart`; same port, room and enrolment): the phone reconnects on its own (~3 s)
      and the next prompt goes through;
   9. 0 CSP violations, 0 console errors.
+  10. **Two desktops** (a second real gateway in its own sandbox and room on the same relay; `startFirstOfTwo` /
+      `startSecondDesktop` in `stack.ts`, test launcher env `OMPDECK_LIVE_SECOND_ROOM`, `OMPDECK_LIVE_JOIN_RELAY`,
+      `OMPDECK_LIVE_JOIN_KEY`): desktop B paired through the phone; switcher lists both and A → B → A works with only
+      the active gateway online; notifications enabled on both → `/d/<idA>/` and `/d/<idB>/` each hold a
+      `fcm.googleapis.com` subscription, the root registration none; a 30 s turn on B (`PUSH-SWITCH-MARK`), switch to
+      A while it runs → one notification shown by B's registration (`data.desktop` = B, tag `<idB>:…`, title
+      `OmpDeck — <B's label>`, also what the shade shows), none by A's;
+      tapping it switches the app to B on that session; forgetting B removes its pairing and registration, A keeps
+      its subscription and answers a prompt. Whole gate ≈ 281 s.
+- **Fixed (found here):** a live session's id came only from an open handle on its jsonl (`follow_session_files`);
+  omp writes a fresh session's file when the first reply lands and drops the handle when it rewrites the file (the
+  title), so after a long *first* turn the gateway never learned the file: the push carried only the live key and the
+  app stayed on "Starting the session…". Now `drive_live` follows a session with no known file over live control and
+  adopts the snapshot's `sessionFile` once it exists on disk (rechecked every second). Gate: step 10's push turn is
+  the session's first; `remote_device_live.rs` (g).
 - **Hygiene:** before and after a run the gate clears the origin's site data (pairing, service worker, push
   subscription) with `Storage.clearDataForOrigin` on a **tab's** CDP session (Android Chrome answers the
   browser session with "Internal error"), closes the origin's tabs, removes the pushed image, collapses the shade

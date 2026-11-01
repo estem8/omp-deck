@@ -1,9 +1,12 @@
 // Pairing: name this phone, compare fingerprints with the desktop's approval dialog, and wait
-// for approval. Reached by opening the desktop's pairing link (`#pair=`) or pasting it.
+// for approval. Reached by opening the desktop's pairing link (`#pair=`), pasting it, or "Pair
+// another desktop" in the desktop switcher. A new desktop is added next to the paired ones; an
+// invite for a desktop that is already paired replaces only that pairing.
 
-import { type ReactNode, useState } from 'react';
+import { type ReactNode, useMemo, useState } from 'react';
+import { inspectInvite } from '../desktops.ts';
 import { inviteFromText } from '../nav.ts';
-import { useClient, useClientState } from '../ui/hooks.ts';
+import { useClientState, useDesktops, useDesktopsState } from '../ui/hooks.ts';
 import { Card, InstallHint, KeyValues } from '../ui/kit.tsx';
 
 function defaultName(): string {
@@ -24,70 +27,86 @@ export function PairingScreen({
   onInvite: (invite: string | null) => void;
   standalone: boolean;
 }): ReactNode {
-  const client = useClient();
+  const attempt = useDesktopsState((state) => state.attempt);
+  // A pairing in flight runs on its own client: the progress view reads that one (the context).
+  if (attempt !== null) return <PairingProgress invite={attempt.invite} onInvite={onInvite} />;
+  return <PairingForm invite={invite} onInvite={onInvite} standalone={standalone} />;
+}
+
+function PairingProgress({ invite, onInvite }: { invite: string; onInvite: (invite: string | null) => void }): ReactNode {
+  const desktops = useDesktops();
   const flow = useClientState((state) => state.pairingFlow);
-  const paired = useClientState((state) => state.pairing);
+  if (flow === null) return null;
+  const waiting = flow.stage !== 'failed';
+  return (
+    <div className="screen pushed">
+      <header className="top">
+        <div className="eyebrow">Pairing</div>
+        <h2>{flow.stage === 'approval' ? 'Approve on your desktop' : flow.stage === 'failed' ? 'Pairing failed' : 'Connecting…'}</h2>
+      </header>
+      <div className="body">
+        <div className="pair-hero">
+          <div className="mark">{waiting ? <span className="busy" style={{ width: 28, height: 28, borderWidth: 3, borderColor: 'currentColor', borderRightColor: 'transparent' }} /> : '!'}</div>
+          <p className="muted" style={{ margin: 0 }}>
+            {flow.stage === 'approval'
+              ? 'OmpDeck on your desktop asks whether to allow this phone. Check that it shows this fingerprint:'
+              : flow.stage === 'failed'
+                ? (flow.error ?? 'The desktop did not accept this phone.')
+                : 'Reaching your desktop through the relay…'}
+          </p>
+        </div>
+        <div className="fingerprint" aria-label="This phone’s fingerprint">
+          {flow.fingerprint}
+        </div>
+        <Card title="Details">
+          <KeyValues
+            rows={[
+              ['Phone name', flow.name],
+              ['Desktop key', <span className="mono">{flow.gatewayFingerprint}</span>],
+              ['Relay', <span className="mono">{flow.relay}</span>],
+            ]}
+          />
+        </Card>
+        {flow.stage === 'failed' && (
+          <div className="buttons pair" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
+            <button
+              type="button"
+              className="button"
+              onClick={() => {
+                desktops.dismissPairing();
+                onInvite(invite);
+              }}
+            >
+              Back
+            </button>
+            <button type="button" className="button primary" onClick={() => void desktops.pair(invite, flow.name)}>
+              Try again
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PairingForm({ invite, onInvite, standalone }: { invite: string | null; onInvite: (invite: string | null) => void; standalone: boolean }): ReactNode {
+  const desktops = useDesktops();
+  const paired = useDesktopsState((state) => state.desktops);
   const [name, setName] = useState(defaultName);
   const [pasted, setPasted] = useState('');
-  const pastedInvite = inviteFromText(pasted);
-
-  if (flow !== null) {
-    const waiting = flow.stage !== 'failed';
-    return (
-      <div className="screen pushed">
-        <header className="top">
-          <div className="eyebrow">Pairing</div>
-          <h2>{flow.stage === 'approval' ? 'Approve on your desktop' : flow.stage === 'failed' ? 'Pairing failed' : 'Connecting…'}</h2>
-        </header>
-        <div className="body">
-          <div className="pair-hero">
-            <div className="mark">{waiting ? <span className="busy" style={{ width: 28, height: 28, borderWidth: 3, borderColor: 'currentColor', borderRightColor: 'transparent' }} /> : '!'}</div>
-            <p className="muted" style={{ margin: 0 }}>
-              {flow.stage === 'approval'
-                ? 'OmpDeck on your desktop asks whether to allow this phone. Check that it shows this fingerprint:'
-                : flow.stage === 'failed'
-                  ? (flow.error ?? 'The desktop did not accept this phone.')
-                  : 'Reaching your desktop through the relay…'}
-            </p>
-          </div>
-          <div className="fingerprint" aria-label="This phone’s fingerprint">
-            {flow.fingerprint}
-          </div>
-          <Card title="Details">
-            <KeyValues
-              rows={[
-                ['Phone name', flow.name],
-                ['Desktop key', <span className="mono">{flow.gatewayFingerprint}</span>],
-                ['Relay', <span className="mono">{flow.relay}</span>],
-              ]}
-            />
-          </Card>
-          {flow.stage === 'failed' && (
-            <div className="buttons pair" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
-              <button type="button" className="button" onClick={() => client.dismissPairing()}>
-                Back
-              </button>
-              <button
-                type="button"
-                className="button primary"
-                disabled={invite === null}
-                onClick={() => invite !== null && void client.pair(invite, flow.name)}
-              >
-                Try again
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  const active = invite ?? pastedInvite;
+  const active = invite ?? inviteFromText(pasted);
+  const info = useMemo(() => (active === null ? null : inspectInvite(active)), [active]);
+  // The invite names a desktop that is already paired: pairing replaces that pairing only.
+  const known = info?.ok === true ? paired.find((desktop) => desktop.id === info.id) : undefined;
+  const others = known === undefined ? paired : paired.filter((desktop) => desktop.id !== known.id);
+  const invalid = info !== null && !info.ok;
+  const title = paired.length === 0 ? 'Pair with your desktop' : known !== undefined ? `Pair again with ${known.gateway}` : 'Pair another desktop';
+  const action = paired.length === 0 ? 'Pair this phone' : known !== undefined ? 'Replace pairing' : 'Pair this desktop';
   return (
     <div className="screen pushed">
       <header className="top">
         <div className="eyebrow">OmpDeck</div>
-        <h2>{paired === null ? 'Pair with your desktop' : 'Pair with another desktop'}</h2>
+        <h2>{title}</h2>
       </header>
       <div className="body">
         <div className="pair-hero">
@@ -99,13 +118,31 @@ export function PairingScreen({
           </p>
         </div>
         <InstallHint standalone={standalone} />
-        {paired !== null && (
+        {known !== undefined && (
           <div className="banner warn">
             <span>⚠</span>
-            <span className="grow">This phone is paired with {paired.name}. Pairing again replaces that pairing.</span>
+            <span className="grow">
+              This phone is already paired with {known.gateway} as {known.name}. Pairing again replaces this phone’s pairing with {known.gateway}.
+              {others.length > 0 && ` ${others.map((desktop) => desktop.gateway).join(', ')} stay${others.length === 1 ? 's' : ''} paired.`}
+            </span>
           </div>
         )}
-        {active === null && (
+        {known === undefined && !invalid && paired.length > 0 && (
+          <div className="banner" role="note">
+            <span>◆</span>
+            <span className="grow">
+              {paired.map((desktop) => desktop.gateway).join(', ')} {paired.length === 1 ? 'stays' : 'stay'} paired. This adds another desktop; switch between them from the desktop name at the top of the app.
+            </span>
+          </div>
+        )}
+        {info?.ok === false && (
+          <div className="banner danger" role="alert">
+            <span>⚠</span>
+            <span className="grow">This pairing link is not valid: {info.error}</span>
+          </div>
+        )}
+        {/* Stays while typing: a half-typed link is not an invite yet, and a field that vanishes at the first valid prefix loses focus. */}
+        {invite === null && (
           <label className="field">
             <span>Pairing link</span>
             <input
@@ -123,14 +160,15 @@ export function PairingScreen({
           <span>Phone name</span>
           <input className="input" value={name} maxLength={64} onChange={(event) => setName(event.target.value)} />
         </label>
-        <div className="buttons pair" style={{ display: 'grid', gridTemplateColumns: paired !== null || invite !== null ? '1fr 1fr' : '1fr' }}>
-          {(paired !== null || invite !== null) && (
+        <div className="buttons pair" style={{ display: 'grid', gridTemplateColumns: paired.length > 0 || invite !== null ? '1fr 1fr' : '1fr' }}>
+          {(paired.length > 0 || invite !== null) && (
             <button
               type="button"
               className="button"
               onClick={() => {
                 setPasted('');
                 onInvite(null);
+                desktops.cancelAdd();
               }}
             >
               Cancel
@@ -139,14 +177,15 @@ export function PairingScreen({
           <button
             type="button"
             className="button primary block"
-            disabled={active === null || name.trim().length === 0}
+            disabled={active === null || invalid || name.trim().length === 0}
             onClick={() => {
               if (active === null) return;
-              onInvite(active);
-              void client.pair(active, name.trim());
+              // The pairing in flight (the desktops' `attempt`) carries the invite from here: Back after a failure restores it.
+              onInvite(null);
+              void desktops.pair(active, name.trim());
             }}
           >
-            Pair this phone
+            {action}
           </button>
         </div>
       </div>

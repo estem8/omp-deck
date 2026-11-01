@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 import { type SettingsSection, useNav } from '../nav.ts';
 import { DEFAULT_THEME, THEMES, type ThemeId } from '../theme.ts';
 import { age } from '../ui/format.ts';
-import { useClient, useClientState, useFeed, useNow } from '../ui/hooks.ts';
+import { useClient, useClientState, useDesktops, useDesktopsState, useFeed, useNow } from '../ui/hooks.ts';
 import { Card, ConnectionPill, InstallHint, KeyValues, UpdateBanner, useS4 } from '../ui/kit.tsx';
 import '../../styles/settings.css';
 import { MODE_LABEL, percent, remainingTone, backupDestinationLabel } from './settings/logic.ts';
@@ -20,6 +20,9 @@ export function SettingsScreen({
   standalone: boolean;
 }): ReactNode {
   const client = useClient();
+  const desktops = useDesktops();
+  const paired = useDesktopsState((state) => state.desktops);
+  const activeId = useDesktopsState((state) => state.activeId);
   const nav = useNav();
   const now = useNow();
   const s4 = useS4();
@@ -81,6 +84,23 @@ export function SettingsScreen({
             </span>
           </div>
         )}
+
+        <Card title="Desktops" aside={<span className="count">{paired.length} paired</span>}>
+          <div className="hub-list">
+            {paired.map((desktop) => (
+              <DesktopRow
+                key={desktop.id}
+                name={desktop.gateway}
+                phone={desktop.name}
+                active={desktop.id === activeId}
+                onClick={() => void desktops.switchTo(desktop.id)}
+              />
+            ))}
+          </div>
+          <button type="button" className="button block add-desktop" onClick={() => desktops.beginAdd()}>
+            Pair another desktop
+          </button>
+        </Card>
 
         <Card title="This phone">
           <div className="hub-list">
@@ -153,7 +173,7 @@ export function SettingsScreen({
         >
           <KeyValues
             rows={[
-              ['Desktop', welcome?.name ?? pairing?.name ?? '—'],
+              ['Desktop', pairing?.gateway ?? '—'],
               ['Status', <span className={`chip ${conn.phase === 'online' ? 'ok' : conn.phase === 'stopped' ? 'danger' : 'warn'}`}>{conn.phase}</span>],
               welcome !== null ? ['Gateway', <span className="chip accent">{welcome.gateway_version}</span>] : null,
               device !== undefined ? ['Mode', <span className="chip">{MODE_LABEL[device.mode]}</span>] : null,
@@ -176,6 +196,22 @@ function PhoneIcon(): ReactNode {
       <rect x="4" y="1.5" width="8" height="13" rx="1.8" />
       <path d="M7 12h2" />
     </svg>
+  );
+}
+
+/** One paired desktop: its name, the name this phone has there, and which one is live. */
+function DesktopRow({ name, phone, active, onClick }: { name: string; phone: string; active: boolean; onClick: () => void }): ReactNode {
+  return (
+    <button type="button" className="hub-row desktop-row" aria-pressed={active} onClick={onClick}>
+      <span className="hub-icon" aria-hidden="true">
+        ◆
+      </span>
+      <span className="grow desk-info">
+        <b>{name}</b>
+        <small className="muted">This phone: {phone}</small>
+      </span>
+      {active ? <span className="chip ok">active</span> : <span className="chip">switch</span>}
+    </button>
   );
 }
 

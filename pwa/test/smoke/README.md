@@ -5,9 +5,12 @@ A deterministic fake desktop for the phone app. One Bun server on `127.0.0.1` is
 - **Static host.** It serves a fresh build of the app in a temp dir, never `dist/`. The served `index.html` boots through
   `boot.ts`, which seeds the pairing into IndexedDB, applies the theme and picks the gateway variant, then loads the real
   bundle.
-- **Relay.** It answers the device hello on `/v1/device`.
-- **Gateway.** It runs the real Noise responder (`src/remote` `respond`) and the real record codec. The application
-  side, `gateway.ts`, answers every v1 and slice-4 feed and op from `fixtures.ts`.
+- **Relay.** It answers the device hello on `/v1/device` and routes the connection to a desktop by the hello's room.
+- **Gateways.** There are two desktops on this one relay, each with its own key, room, tokens and state: **Workstation**
+  (`smoke.first`, also `smoke.invite`/`smoke.gateway`; the seeded pairing) and **Laptop** (`smoke.second`, version
+  `0.11.0`). Each runs the real Noise responder (`src/remote` `respond`) and the real record codec. The application
+  side, `gateway.ts`, answers every v1 and slice-4 feed and op from `fixtures.ts`. `gateway.connections` counts a
+  desktop's open device connections, which is how the e2e run proves that only the active desktop is connected.
 
 Mutations are journaled like the real gateway. They answer `accepted` at once. Long ops (backups, updates, restores,
 worktree finish) then send `progress` events, and every op finishes with its outcome event. A prompt, compose or review
@@ -51,11 +54,14 @@ Console errors from the page are printed next to each file.
 
 | Parameter | Meaning |
 | --- | --- |
-| `route=` | A tab (`sessions`, `agents`, `inbox`, `settings`) or a screen (`conversation`, `subagent`, `terminal`, `changes`, `manager`, `tree`, `browse`, `worktrees`, `running`). With `settings`, `section=` opens a settings section. `route=pair` (smoke only) starts unpaired. |
+| `route=` | A tab (`sessions`, `agents`, `inbox`, `settings`) or a screen (`conversation`, `subagent`, `terminal`, `changes`, `manager`, `tree`, `browse`, `worktrees`, `running`). With `settings`, `section=` opens a settings section. `route=pair` (smoke only) starts unpaired (no pairing at all). |
 | `session=`, `agent=`, `live=`, `project=`, `display=`, `title=`, `section=` | The screen's parameters. |
 | `s=<session id>` | The notification deep link: opens that conversation. |
+| `d=<pairing id>` | The desktop a link is for (the hex of its gateway key; `smoke.second.id`): the app switches to it first. A desktop that is not paired drops the link. |
 | `pair=v1.…` | A pairing invite. The harness approves it after about 1 s. |
 | `theme=` | `aurora` (default), `blueprint`, `signal`, `margin`, `tidal`, `field`. Smoke only. |
+| `desktops=2` | Also seeds the Laptop's pairing; the Workstation stays active. Smoke only. |
+| `legacy=1` | Seeds the Workstation as version 1 stored it (database version 1, `pairing/current`) on a fresh profile, so the app's own upgrade migrates it. Smoke only. |
 | `gw=v1` | An old desktop: `Welcome.features` lacks `s4`, and s4 ops answer `unsupported`. Smoke only. |
 
 `route` and `s` are real app deep links (`src/app/nav.ts` `routeFromHash`). `theme`, `gw` and `route=pair` are read by

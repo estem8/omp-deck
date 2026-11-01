@@ -2,6 +2,7 @@
 // pops the stack (each push adds a history entry).
 
 import { createContext, useContext } from 'react';
+import { isDesktopId } from '../push.ts';
 
 export type Tab = 'sessions' | 'agents' | 'inbox' | 'settings';
 
@@ -64,6 +65,27 @@ export function sessionFromHash(hash: string): string | null {
   return session === null || session.length === 0 || session.length > 200 ? null : session;
 }
 
+/** Reads the desktop a link is for (`#d=<id>`, added to notification links) from a URL hash. */
+export function desktopFromHash(hash: string): string | null {
+  const desktop = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash).get('d');
+  return isDesktopId(desktop) ? desktop : null;
+}
+
+/**
+ * A deep link: the desktop it is for (null: whichever is active) and the screen to open (null: just
+ * the desktop, e.g. a notification that opens no session). Null when the hash names neither.
+ */
+export interface Link {
+  desktop: string | null;
+  route: Route | null;
+}
+
+export function linkFromHash(hash: string): Link | null {
+  const desktop = desktopFromHash(hash);
+  const route = routeFromHash(hash);
+  return desktop === null && route === null ? null : { desktop, route };
+}
+
 /** Where the app opens: a tab and the screens pushed on it. */
 export interface Route {
   tab: Tab;
@@ -73,38 +95,47 @@ export interface Route {
 /**
  * What each browser history entry carries: the whole route, so Back restores the screen that was
  * there. `base` marks the entry the app started on: Back from it leaves the app, so the app's own
- * navigation there rewrites the entry (`replaceState`) instead of pushing.
+ * navigation there rewrites the entry (`replaceState`) instead of pushing. `desktop` names the
+ * desktop whose screens the route holds: another desktop's entries are not this one's routes
+ * (session ids and feeds mean nothing there), so they read as entries without a route.
  */
 export interface HistoryEntry {
   depth: number;
   tab: Tab;
   stack: Screen[];
   base?: true;
+  desktop?: string;
 }
 
-export function historyEntry(tab: Tab, stack: readonly Screen[], base = false): HistoryEntry {
+export function historyEntry(tab: Tab, stack: readonly Screen[], base = false, desktop: string | null = null): HistoryEntry {
   const entry: HistoryEntry = { depth: stack.length, tab, stack: [...stack] };
   if (base) entry.base = true;
+  if (desktop !== null) entry.desktop = desktop;
   return entry;
 }
 
 /** The entries a deep link pushes: one per screen on its stack (or one for a bare tab), each with its prefix of the route. */
-export function deepLinkEntries(route: Route): HistoryEntry[] {
-  if (route.stack.length === 0) return [historyEntry(route.tab, [])];
-  return route.stack.map((_, index) => historyEntry(route.tab, route.stack.slice(0, index + 1)));
+export function deepLinkEntries(route: Route, desktop: string | null = null): HistoryEntry[] {
+  if (route.stack.length === 0) return [historyEntry(route.tab, [], false, desktop)];
+  return route.stack.map((_, index) => historyEntry(route.tab, route.stack.slice(0, index + 1), false, desktop));
 }
 
-/** The route a history entry's state holds, or null for an entry without one (the initial page). */
-export function routeFromHistory(state: unknown): Route | null {
+/**
+ * The route a history entry's state holds, or null for an entry without one (the initial page, or
+ * one that belongs to a different desktop than `desktop`).
+ */
+export function routeFromHistory(state: unknown, desktop: string | null = null): Route | null {
   if (typeof state !== 'object' || state === null || !('tab' in state) || !('stack' in state)) return null;
   const { tab, stack } = state;
   if (typeof tab !== 'string' || !TABS.includes(tab as Tab) || !Array.isArray(stack)) return null;
+  const owner = 'desktop' in state && typeof state.desktop === 'string' ? state.desktop : null;
+  if (owner !== null && desktop !== null && owner !== desktop) return null;
   return { tab: tab as Tab, stack: stack as Screen[] };
 }
 
 /** Whether the entry is the app's starting entry (marked, or never written by the app). */
-export function isBaseEntry(state: unknown): boolean {
-  if (routeFromHistory(state) === null) return true;
+export function isBaseEntry(state: unknown, desktop: string | null = null): boolean {
+  if (routeFromHistory(state, desktop) === null) return true;
   return typeof state === 'object' && state !== null && 'base' in state && state.base === true;
 }
 
@@ -112,8 +143,8 @@ export function isBaseEntry(state: unknown): boolean {
  * Where the app starts: an incoming link wins; otherwise the route the current history entry holds
  * (a reload keeps `history.state`, while the link's hash is long stripped); otherwise the sessions tab.
  */
-export function startRoute(incoming: Route | null, state: unknown): Route {
-  return incoming ?? routeFromHistory(state) ?? { tab: 'sessions', stack: [] };
+export function startRoute(incoming: Route | null, state: unknown, desktop: string | null = null): Route {
+  return incoming ?? routeFromHistory(state, desktop) ?? { tab: 'sessions', stack: [] };
 }
 
 /**
@@ -121,8 +152,8 @@ export function startRoute(incoming: Route | null, state: unknown): Route {
  * shows: the entry is kept in step so Back/reload restores what it showed last, not what it
  * started with. Its base flag is preserved.
  */
-export function syncedEntry(state: unknown, tab: Tab, stack: readonly Screen[]): HistoryEntry {
-  return historyEntry(tab, stack, isBaseEntry(state));
+export function syncedEntry(state: unknown, tab: Tab, stack: readonly Screen[], desktop: string | null = null): HistoryEntry {
+  return historyEntry(tab, stack, isBaseEntry(state, desktop), desktop);
 }
 
 /**
