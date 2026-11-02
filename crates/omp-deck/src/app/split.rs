@@ -11,7 +11,7 @@ use egui::{
     StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 
-use super::{App, TermMenu, terminal_menu};
+use super::{App, TermMenu, paste_from_menu, terminal_menu};
 use crate::icons::{ICON_TERMINAL, ICON_X};
 use crate::panes::{self, Dir, Side};
 use crate::tabs::{Tab, paint_status};
@@ -440,7 +440,7 @@ impl App {
                         Some(TermMenu::Copy) => {
                             t.terminal().copy_selection();
                         }
-                        Some(TermMenu::Paste) => t.terminal_mut().paste_clipboard(),
+                        Some(TermMenu::Paste) => paste_from_menu(t.terminal_mut()),
                         Some(TermMenu::OpenLink(url)) => frame.open_url = Some(url),
                         Some(TermMenu::CopyLink(url)) => frame.copy_link = Some(url),
                         None => {}

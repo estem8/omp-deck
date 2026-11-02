@@ -2147,7 +2147,7 @@ impl App {
                 Some(TermMenu::Copy) => {
                     tab.terminal().copy_selection();
                 }
-                Some(TermMenu::Paste) => tab.terminal_mut().paste_clipboard(),
+                Some(TermMenu::Paste) => paste_from_menu(tab.terminal_mut()),
                 Some(TermMenu::OpenLink(url)) => open_url = Some(url),
                 Some(TermMenu::CopyLink(url)) => copy_link = Some(url),
                 None => {}
@@ -3404,6 +3404,15 @@ fn terminal_menu(resp: &egui::Response, term: &deck_term::Terminal) -> Option<Te
         }
     });
     pick
+}
+
+/// The menu's Paste is a deliberate click, yet it lands while the menu is still up, so the hold
+/// that keeps keys meant for an open menu or dialog away from omp (`hold_input_during_modals`,
+/// renewed every frame this menu showed) would drop it. That hold ends first; a hold the gateway
+/// publishes for an injected command still drops the paste (`Terminal::input_held`).
+fn paste_from_menu(term: &mut deck_term::Terminal) {
+    term.hold_input_until(Instant::now());
+    term.paste_clipboard();
 }
 
 /// Only `http`, `https`, `mailto` (scheme matched case-insensitively) may reach the desktop's
