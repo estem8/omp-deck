@@ -24,6 +24,7 @@
 //! cursor row; it is separated from the cursor by a run of blanks.
 
 use deck_term::ScreenText;
+use deck_tsp::document::{Document, NodeRef};
 
 /// What the composer holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,6 +388,117 @@ fn pi(s: &ScreenText, r: usize) -> Option<Region> {
     })
 }
 
+/// What omp's TSP document says of its composer: the same three-way answer as [`inspect`] gives
+/// for the grid, plus what a `send` event needs. A chat session (a live TSP mirror) has no
+/// composer on its grid at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TspComposer {
+    /// [`Composer::Missing`] when no sendable `editor` stands in the dock or the cursor is not
+    /// in it: an `omp.editor.ask*` (ask, approval) replaces the composer, and any other dialog
+    /// takes the surface's focus away from the editor. Otherwise the editor's text.
+    pub state: Composer,
+    /// `(surface id, editor id)` of the sendable editor.
+    pub target: Option<(String, String)>,
+    /// The program's hello advertised `send`: an event may submit text atomically.
+    pub can_send: bool,
+    /// Attachment chips the composer carries (a pasted file drop shows up as one).
+    pub chips: usize,
+    /// omp's autocomplete popup (an `omp.autocomplete` overlay) is open over the editor: Enter
+    /// would pick its entry instead of submitting.
+    pub popup: bool,
+}
+
+impl TspComposer {
+    /// Reads the inline surface's dock. Ids are not stable across omp runs, so the editor is
+    /// found by kind and `sendable`, never by id.
+    pub fn of(document: &Document) -> TspComposer {
+        let can_send = document.program().is_some_and(|p| p.supports("send"));
+        let missing = |chips, popup| TspComposer {
+            state: Composer::Missing,
+            target: None,
+            can_send,
+            chips,
+            popup,
+        };
+        let Some(surface) = document.inline() else {
+            return missing(0, false);
+        };
+        let mut scan = DockScan::default();
+        if let Some(dock) = surface.node("dock") {
+            scan.visit(dock);
+        }
+        let mut layer = DockScan::default();
+        if let Some(node) = surface.node("layer") {
+            layer.visit(node);
+        }
+        let popup = layer.popup;
+        let Some((editor, text)) = scan.editor else {
+            return missing(scan.chips, popup);
+        };
+        if scan.asking || surface.focus() != Some(editor) {
+            return missing(scan.chips, popup);
+        }
+        TspComposer {
+            state: draft_of(text),
+            target: Some((surface.id().to_owned(), editor.to_owned())),
+            can_send,
+            chips: scan.chips,
+            popup,
+        }
+    }
+
+    /// Changes whenever the composer shows something new (text or attachments).
+    pub fn fingerprint(&self) -> String {
+        match &self.state {
+            Composer::Draft(d) => format!("{}\u{0}{d}", self.chips),
+            _ => format!("{}\u{0}", self.chips),
+        }
+    }
+}
+
+/// The editor's text as [`inspect`] reports a draft: non-blank rows joined by ` ↵ `.
+fn draft_of(text: &str) -> Composer {
+    let mut rows = text.lines().map(str::trim).filter(|r| !r.is_empty());
+    let Some(first) = rows.next() else {
+        return Composer::Empty;
+    };
+    let mut draft = first.to_owned();
+    for row in rows {
+        draft.push_str(" ↵ ");
+        draft.push_str(row);
+    }
+    Composer::Draft(draft)
+}
+
+#[derive(Default)]
+struct DockScan<'a> {
+    /// The first sendable editor: its id and text.
+    editor: Option<(&'a str, &'a str)>,
+    asking: bool,
+    popup: bool,
+    chips: usize,
+}
+
+impl<'a> DockScan<'a> {
+    fn visit(&mut self, node: NodeRef<'a>) {
+        let role = node.str_prop("role").unwrap_or_default();
+        self.asking |= role.starts_with("omp.editor.ask");
+        self.popup |= role == "omp.autocomplete";
+        if role == "omp.composer.chip" {
+            self.chips += 1;
+        }
+        if self.editor.is_none()
+            && node.kind() == "editor"
+            && node.prop("sendable") == Some(&serde_json::Value::Bool(true))
+        {
+            self.editor = Some((node.id(), node.str_prop("text").unwrap_or_default()));
+        }
+        for child in node.children() {
+            self.visit(child);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +800,118 @@ mod tests {
             inspect(&screen(&["$ ls", "foo bar"], 1, 3)),
             Composer::Missing
         );
+    }
+
+    /// An open inline surface with `dock` and `layer` children (JSON node objects), `focus` on
+    /// the given node, and a program that advertises `features`.
+    fn tsp_document(
+        dock: serde_json::Value,
+        layer: serde_json::Value,
+        focus: Option<&str>,
+        features: &[&str],
+    ) -> Document {
+        use deck_tsp::document::Program;
+        use deck_tsp::stream::{Message, Verb};
+        let msg = |verb, body: serde_json::Value| Message {
+            verb,
+            params: Vec::new(),
+            body: serde_json::to_vec(&body).expect("json"),
+        };
+        let mut doc = Document::new();
+        doc.set_program(Program {
+            app: Some("omp".to_owned()),
+            ver: None,
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+        });
+        let now = std::time::Instant::now();
+        let open = serde_json::json!({"id": "s", "mode": "inline", "role": "omp.session"});
+        doc.apply(&msg(Verb::Open, open), now);
+        let mut ops = vec![
+            serde_json::json!(["add", "dock", "s", null, {"id": "dock", "k": "col"}]),
+            serde_json::json!(["add", "layer", "s", null, {"id": "layer", "k": "col"}]),
+        ];
+        for (region, nodes) in [("dock", dock), ("layer", layer)] {
+            for node in nodes.as_array().expect("array") {
+                ops.push(serde_json::json!(["add", node["id"], region, null, node]));
+            }
+        }
+        ops.push(serde_json::json!(["focus", focus]));
+        let frame = serde_json::json!({"sf": "s", "s": 1, "ops": ops});
+        let applied = doc.apply(&msg(Verb::Frame, frame), now);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        doc
+    }
+
+    fn editor(text: &str, sendable: bool) -> serde_json::Value {
+        serde_json::json!({"id": "ed", "k": "editor", "p": {"text": text, "sendable": sendable}})
+    }
+
+    #[test]
+    fn the_tsp_composer_is_the_docks_sendable_editor_in_focus() {
+        let of = |dock, layer, focus: Option<&str>| {
+            TspComposer::of(&tsp_document(dock, layer, focus, &["edit", "send"]))
+        };
+        let none = serde_json::json!([]);
+        let target = Some(("s".to_owned(), "ed".to_owned()));
+
+        let empty = of(
+            serde_json::json!([editor("", true)]),
+            none.clone(),
+            Some("ed"),
+        );
+        assert_eq!(empty.state, Composer::Empty);
+        assert_eq!(empty.target, target);
+        assert!(empty.can_send && !empty.popup && empty.chips == 0);
+
+        // Blank rows are no draft; a draft reads like the grid's: rows joined by ` ↵ `.
+        let blank = of(
+            serde_json::json!([editor("  \n ", true)]),
+            none.clone(),
+            Some("ed"),
+        );
+        assert_eq!(blank.state, Composer::Empty);
+        let draft = of(
+            serde_json::json!([editor("first\n\n second ", true)]),
+            none.clone(),
+            Some("ed"),
+        );
+        assert_eq!(draft.state, Composer::Draft("first ↵ second".to_owned()));
+
+        // An editor that cannot send (omp is not wired yet) is no composer; nor is one that does
+        // not hold the cursor (an overlay took the focus).
+        for (ed, focus) in [(editor("", false), Some("ed")), (editor("", true), None)] {
+            let c = of(serde_json::json!([ed]), none.clone(), focus);
+            assert_eq!((c.state, c.target), (Composer::Missing, None));
+        }
+        // An ask dialog replaces the composer, whatever else the dock holds.
+        let ask = serde_json::json!({"id": "ask", "k": "col", "p": {"role": "omp.editor.ask"}});
+        let c = of(
+            serde_json::json!([editor("", true), ask]),
+            none.clone(),
+            Some("ed"),
+        );
+        assert_eq!(c.state, Composer::Missing);
+
+        // Attachment chips and the autocomplete popup are seen wherever they sit in their region.
+        let chip = serde_json::json!({"id": "c1", "k": "card", "p": {"role": "omp.composer.chip"}});
+        let chips = serde_json::json!({"id": "m", "k": "row", "c": [chip]});
+        let popup =
+            serde_json::json!({"id": "pop", "k": "overlay", "p": {"role": "omp.autocomplete"}});
+        let c = of(
+            serde_json::json!([editor("/ef", true), chips]),
+            serde_json::json!([popup]),
+            Some("ed"),
+        );
+        assert_eq!((c.chips, c.popup), (1, true));
+        assert_ne!(c.fingerprint(), empty.fingerprint());
+
+        // `send` must be in the hello.
+        let doc = tsp_document(
+            serde_json::json!([editor("", true)]),
+            none,
+            Some("ed"),
+            &["edit"],
+        );
+        assert!(!TspComposer::of(&doc).can_send);
     }
 }

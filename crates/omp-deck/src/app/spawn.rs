@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use deck_core::config::SessionView;
 use deck_core::omp::UpdateKind;
 use deck_service::controller::SessionTarget;
 use deck_service::gateway::protocol::{Done, LaunchSpec, Mutation, SessionRole, Tool, ViewRole};
@@ -55,6 +56,8 @@ pub(super) struct SpawnReq {
     pub tool: Option<Tool>,
     /// `omp --fork` copy of the session with this id.
     pub copy_of: Option<String>,
+    /// The view the session opens in (what the gateway uses when it has to create it).
+    pub view: SessionView,
     pub post: Post,
     pub focus: Focus,
 }
@@ -66,6 +69,7 @@ impl SpawnReq {
         cwd: PathBuf,
         session_path: Option<PathBuf>,
         title: String,
+        view: SessionView,
         post: Post,
         focus: Focus,
     ) -> SpawnReq {
@@ -78,6 +82,7 @@ impl SpawnReq {
             argv,
             tool: None,
             copy_of: None,
+            view,
             post,
             focus,
         }
@@ -93,6 +98,7 @@ impl SpawnReq {
             argv: Vec::new(),
             tool: Some(tool),
             copy_of: None,
+            view: SessionView::Terminal,
             post: Post::None,
             focus: Focus::Claim,
         }
@@ -117,6 +123,7 @@ impl SpawnReq {
                 argv: self.argv.clone(),
                 role: SessionRole::Session,
                 copy_of: self.copy_of.clone(),
+                view: self.view,
             }),
         }
     }
@@ -277,7 +284,7 @@ impl App {
     fn on_spawned(&mut self, req: SpawnReq, claim: Option<u64>, result: Result<Done, String>) {
         self.spawn.finish();
         match result {
-            Ok(Done::Session(target)) => self.finish_spawn(req, claim, target),
+            Ok(Done::Session(target, view)) => self.finish_spawn(req, claim, target, view),
             Ok(other) => {
                 log::error!("launch answered with {other:?}");
                 self.toasts.error(
@@ -293,7 +300,16 @@ impl App {
         self.pump_spawns();
     }
 
-    fn finish_spawn(&mut self, req: SpawnReq, claim: Option<u64>, target: SessionTarget) {
+    fn finish_spawn(
+        &mut self,
+        req: SpawnReq,
+        claim: Option<u64>,
+        target: SessionTarget,
+        view: SessionView,
+    ) {
+        if req.view == SessionView::Chat && view == SessionView::Terminal {
+            self.toasts.info(&self.ctx, "Opened in terminal view: this session is already running in a terminal, or the OmpDeck session host is unavailable");
+        }
         let role = req.role();
         let SpawnReq {
             mux_name,
@@ -326,6 +342,7 @@ impl App {
                 session_path,
                 title,
                 role,
+                view,
             },
         );
         if let Some(info) = self.gw.controller(&target) {
@@ -459,7 +476,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{Focus, Job, PathBuf, Post, Pump, SpawnReq};
+    use super::{Focus, Job, Mutation, PathBuf, Post, Pump, SessionView, SpawnReq, Tool};
 
     #[test]
     fn a_queued_launch_focuses_only_while_the_active_tab_is_unchanged() {
@@ -481,6 +498,7 @@ mod tests {
                 PathBuf::from("/"),
                 Some(PathBuf::from(path)),
                 String::new(),
+                SessionView::Terminal,
                 Post::None,
                 Focus::Claim,
             )),
@@ -543,5 +561,26 @@ mod tests {
         assert!(pump.queued_for(None, Some("omp-s")));
         pump.release(&slot);
         assert!(!pump.queued_for(Some(std::path::Path::new("/s")), None));
+    }
+
+    #[test]
+    fn a_launch_asks_the_gateway_for_the_view_the_request_names() {
+        for view in [SessionView::Terminal, SessionView::Chat] {
+            let req = SpawnReq::session(
+                Some("omp-v".into()),
+                PathBuf::from("/p"),
+                None,
+                String::new(),
+                view,
+                Post::None,
+                Focus::Never,
+            );
+            let Mutation::Launch(spec) = req.mutation() else {
+                panic!("a session tab launches a session");
+            };
+            assert_eq!(spec.view, view);
+        }
+        let tool = SpawnReq::tool(Tool::Install, PathBuf::from("/p"));
+        assert!(matches!(tool.mutation(), Mutation::RunTool(_)));
     }
 }

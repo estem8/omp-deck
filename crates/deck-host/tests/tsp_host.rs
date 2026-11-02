@@ -185,3 +185,257 @@ fn resize_and_theme_changes_reach_the_program_only_once_live_and_when_changed() 
         ]
     );
 }
+
+// ---- snapshots carry the document ---------------------------------------------------------------
+
+use deck_host::HostEvent;
+use deck_tsp::mirror::Mirror;
+use std::time::{Duration, Instant};
+
+/// A child with a hand-written script (raw tty, then `body`, then it records its input).
+fn scripted(name: &str, rec: &std::path::Path, body: &str) -> SessionSpec {
+    let mut spec = child(name, true, rec, &[]);
+    spec.args = vec![
+        "-c".into(),
+        format!(
+            "stty raw -echo\nprintf '{HELLO_QUERY}\\033[c'\n{body}\nexec cat > '{}'\n",
+            rec.display()
+        ),
+    ];
+    spec
+}
+
+fn mirror_of(snapshot: &[u8]) -> Mirror {
+    let mut m = Mirror::new();
+    m.feed(snapshot, Instant::now());
+    m
+}
+
+fn doc_json(m: &Mirror) -> Value {
+    serde_json::to_value(m.document()).unwrap()
+}
+
+#[test]
+fn attach_observe_and_peek_snapshots_rebuild_the_document_a_late_client_missed() {
+    let ns = TestNs::new();
+    let rec = scratch("tsp-snap.rec");
+    let _ = std::fs::remove_file(&rec);
+    // The program speaks before any client exists.
+    deck_host::start(
+        &ns.0,
+        &child("snap", true, &rec, &[OPEN, FRAME, FRAME2]),
+        100,
+        30,
+    )
+    .unwrap();
+    let mut host_doc = Value::Null;
+    wait_until("the document", || {
+        host_doc = deck_host::tsp_peek(&ns.0, "snap").unwrap();
+        host_doc["surfaces"][0]["seq"] == 2
+    });
+
+    // attach
+    let attached = deck_host::attach(&ns.0, "snap", common::params(100, 30)).unwrap();
+    let mut c = Client::new(attached, 100, 30);
+    let HostEvent::Snapshot(bytes) = c.next() else {
+        panic!("the first event is the snapshot")
+    };
+    let m = mirror_of(&bytes);
+    assert!(m.is_idle() && m.live());
+    assert_eq!(doc_json(&m), host_doc, "attach snapshot");
+    // The hello travels first so a mirror knows what the program supports; APC strings sit
+    // after the VT replay.
+    let hello = find(&bytes, b"\x1b_tsp;q;{\"q\":\"hello\"").expect("hello query");
+    let open = find(&bytes, b"\x1b_tsp;o;").expect("open");
+    assert!(hello < open);
+    assert_eq!(
+        m.document().program().map(|p| p.features.clone()),
+        Some(vec!["send".to_owned()])
+    );
+
+    // peek and observe (the controller stays attached)
+    let (_, peeked) = deck_host::peek(&ns.0, "snap", 100).unwrap();
+    assert_eq!(doc_json(&mirror_of(&peeked)), host_doc, "peek snapshot");
+    let (_, observed) = deck_host::observe(&ns.0, "snap", 100).unwrap();
+    let (mut rx, _tx) = observed.split();
+    let deck_host::ObserverEvent::Snapshot { bytes, .. } = rx.recv().unwrap() else {
+        panic!("the first observer event is the snapshot")
+    };
+    assert_eq!(doc_json(&mirror_of(&bytes)), host_doc, "observe snapshot");
+
+    // The screen replay is untouched by the APC strings: a plain terminal fed the same
+    // snapshot shows the same grid as one fed only its VT part.
+    let vt_only = &bytes[..find(&bytes, b"\x1b_tsp;q;").unwrap()];
+    let mut with = common::fresh_term(100, 30);
+    let mut without = common::fresh_term(100, 30);
+    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+    parser.advance(&mut with, &bytes);
+    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+    parser.advance(&mut without, vt_only);
+    assert_eq!(common::screen_text(&with), common::screen_text(&without));
+}
+
+/// Two retained blobs: `pixel-a`, which an image node refers to, and `pixel-b`, which no node does.
+const BLOB_A: &str = "6fe2d5846e515bc9f48577f0d0a5c72e8935655af5e138b26face383b3d2174b";
+const BLOB_B: &str = "442c3c38a30e1025e4c4fde760ac50c6cbb55147cdbb9497c3e706ee6dbaf13e";
+
+#[test]
+fn attach_and_observe_carry_only_referenced_blobs_and_peek_carries_none() {
+    let ns = TestNs::new();
+    let rec = scratch("tsp-blobs.rec");
+    let _ = std::fs::remove_file(&rec);
+    let body = format!(
+        "printf '{OPEN}'\n\
+         printf '\\033_tsp;b;mime=image/png;cGl4ZWwtYQ==\\033\\\\'\n\
+         printf '\\033_tsp;b;cGl4ZWwtYg==\\033\\\\'\n\
+         printf '\\033_tsp;f;{{\"sf\":\"s1\",\"s\":1,\"ops\":[[\"add\",\"main\",\"s1\",null,{{\"id\":\"main\",\"k\":\"col\",\"c\":[{{\"id\":\"img\",\"k\":\"image\",\"p\":{{\"blob\":\"{BLOB_A}\"}}}}]}}]]}}\\033\\\\'"
+    );
+    deck_host::start(&ns.0, &scripted("blobs", &rec, &body), 100, 30).unwrap();
+    let mut host_doc = Value::Null;
+    wait_until("the frame and both blobs", || {
+        host_doc = deck_host::tsp_peek(&ns.0, "blobs").unwrap();
+        host_doc["surfaces"][0]["seq"] == 1
+            && host_doc["blobs"].as_array().is_some_and(|b| b.len() == 2)
+    });
+    let has = |m: &Mirror, id: &str| m.document().blob(id).is_some();
+    let has_node = |m: &Mirror| {
+        m.document()
+            .surface("s1")
+            .and_then(|s| s.node("img"))
+            .is_some()
+    };
+
+    let attached = deck_host::attach(&ns.0, "blobs", common::params(100, 30)).unwrap();
+    let mut c = Client::new(attached, 100, 30);
+    let HostEvent::Snapshot(bytes) = c.next() else {
+        panic!("the first event is the snapshot")
+    };
+    let m = mirror_of(&bytes);
+    assert!(
+        has_node(&m) && has(&m, BLOB_A),
+        "the referenced blob comes with its node"
+    );
+    assert!(!has(&m, BLOB_B), "an unreferenced blob is not replayed");
+
+    let (_, observed) = deck_host::observe(&ns.0, "blobs", 100).unwrap();
+    let (mut rx, _tx) = observed.split();
+    let deck_host::ObserverEvent::Snapshot { bytes, .. } = rx.recv().unwrap() else {
+        panic!("the first observer event is the snapshot")
+    };
+    let m = mirror_of(&bytes);
+    assert!(has(&m, BLOB_A) && !has(&m, BLOB_B), "observe");
+
+    let (_, peeked) = deck_host::peek(&ns.0, "blobs", 100).unwrap();
+    let m = mirror_of(&peeked);
+    assert!(has_node(&m), "a peek still has the document");
+    assert!(
+        !has(&m, BLOB_A) && !has(&m, BLOB_B),
+        "a peek carries no blobs"
+    );
+    assert!(
+        find(&peeked, b"\x1b_tsp;b;").is_none(),
+        "no blob message at all"
+    );
+    // The host itself keeps both.
+    assert_eq!(host_doc["blobs"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn a_plain_or_not_yet_live_session_snapshot_has_no_tsp_bytes() {
+    let ns = TestNs::new();
+    let rec = scratch("tsp-snap-plain.rec");
+    let _ = std::fs::remove_file(&rec);
+    deck_host::start(
+        &ns.0,
+        &child("plainsnap", false, &rec, &[OPEN, FRAME]),
+        100,
+        30,
+    )
+    .unwrap();
+    wait_until("the DA1 reply", || find(&read(&rec), b"\x1b[?6c").is_some());
+    let (_, bytes) = deck_host::peek(&ns.0, "plainsnap", 100).unwrap();
+    assert!(find(&bytes, b"\x1b_").is_none(), "{bytes:?}");
+
+    // TSP session whose program never said hello: not live, nothing to replay.
+    let quiet = scratch("tsp-snap-quiet.rec");
+    let _ = std::fs::remove_file(&quiet);
+    let mut spec = child("quiet", true, &quiet, &[]);
+    spec.args = vec![
+        "-c".into(),
+        format!(
+            "stty raw -echo\nprintf '{OPEN}'\nexec cat > '{}'\n",
+            quiet.display()
+        ),
+    ];
+    deck_host::start(&ns.0, &spec, 100, 30).unwrap();
+    let mut doc = Value::Null;
+    wait_until("the open", || {
+        doc = deck_host::tsp_peek(&ns.0, "quiet").unwrap();
+        doc["surfaces"][0]["id"] == "s1"
+    });
+    let (_, bytes) = deck_host::peek(&ns.0, "quiet", 100).unwrap();
+    assert!(find(&bytes, b"\x1b_").is_none(), "{bytes:?}");
+}
+
+#[test]
+fn a_client_attaching_between_two_chunks_of_a_frame_still_gets_the_whole_frame() {
+    let ns = TestNs::new();
+    let rec = scratch("tsp-mid.rec");
+    let _ = std::fs::remove_file(&rec);
+    let mid = scratch("tsp-mid.flag");
+    let go = scratch("tsp-mid.go");
+    let _ = std::fs::remove_file(&mid);
+    let _ = std::fs::remove_file(&go);
+    // One frame in two chunks (`c=k1`), the child pausing between them until `go` exists.
+    let first = r#"\033_tsp;f;c=k1;m=1;{"sf":"s1","s":3,"ops":[["text","t","append",", pend"#;
+    let second = r#"\033_tsp;f;c=k1;ing tail"]]}\033\\"#;
+    let first = format!("{first}\\033\\\\");
+    let body = format!(
+        "printf '{OPEN}'\nprintf '{FRAME}'\nprintf '{first}'\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nprintf '{second}'",
+        mid.display(),
+        go.display()
+    );
+    deck_host::start(&ns.0, &scripted("mid", &rec, &body), 100, 30).unwrap();
+    wait_until("the first chunk was sent", || mid.exists());
+    // The daemon reads the chunk right away; a joiner now misses its start.
+    std::thread::sleep(Duration::from_millis(150));
+    let attached = deck_host::attach(&ns.0, "mid", common::params(100, 30)).unwrap();
+    let mut c = Client::new(attached, 100, 30);
+    let HostEvent::Snapshot(bytes) = c.next() else {
+        panic!("the first event is the snapshot")
+    };
+    let mut m = mirror_of(&bytes);
+    assert!(!m.is_idle(), "the half-received frame is resumed, not lost");
+    assert_eq!(
+        m.document()
+            .surface("s1")
+            .unwrap()
+            .node("t")
+            .unwrap()
+            .text(),
+        Some("hello from the child"),
+        "nothing of the half frame applied yet"
+    );
+    std::fs::write(&go, b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while m.document().surface("s1").and_then(|s| s.last_seq()) != Some(3) {
+        assert!(
+            Instant::now() < deadline,
+            "the rest of the frame never arrived"
+        );
+        if let HostEvent::Output(out) = c.next() {
+            m.feed(&out, Instant::now());
+        }
+    }
+    assert!(m.is_idle());
+    let text = m
+        .document()
+        .surface("s1")
+        .unwrap()
+        .node("t")
+        .unwrap()
+        .text();
+    assert_eq!(text, Some("hello from the child, pending tail"));
+    let host_doc = deck_host::tsp_peek(&ns.0, "mid").unwrap();
+    assert_eq!(doc_json(&m), host_doc);
+}

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+use deck_core::config::SessionView;
 use deck_core::ctl::{
     CtlClient, CtlCommand, LiveSnapshot, ctl_dir, ctl_env, prepare_ctl_dir, with_ctl,
 };
@@ -27,6 +28,7 @@ use crate::gateway::protocol::{
 };
 use crate::gateway::server::{SideItem, ViewSide};
 use crate::host_remote::HostRemote;
+use crate::statusfmt::Activity;
 
 /// The managed-session manifest in the identity's state directory.
 pub(super) const MANIFEST: &str = "sessions.json";
@@ -49,6 +51,18 @@ const CRUMB_SLACK: Duration = Duration::from_secs(2);
 /// How often a fresh session's reported (not yet written) file is looked for.
 const FILE_RECHECK: Duration = Duration::from_secs(1);
 
+/// Where a launch learns the backend that already holds its session name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Owner {
+    /// The running snapshot: a live session keeps its backend.
+    Snapshot,
+    /// A startup re-attach keeps the backend recorded in the manifest, even while queued.
+    Restored(MuxKind),
+    /// A restart ended the old session (the snapshot may still list it until it refreshes):
+    /// the session stays on this backend, or takes the ordinary choice for its view (`None`).
+    Restarted(Option<MuxKind>),
+}
+
 /// One request to open a session.
 pub(super) struct LaunchJob {
     pub(super) spec: LaunchSpec,
@@ -56,6 +70,8 @@ pub(super) struct LaunchJob {
     pub(super) key: Option<RequestKey>,
     /// Use `spec.mux_name` as is (restart, re-attach) instead of resolving it.
     pub(super) exact: bool,
+    /// Which backend the launch's name lives on.
+    pub(super) owner: Owner,
     /// Startup re-attach: only if the backend session still exists.
     pub(super) restore: bool,
     pub(super) tool: Option<Tool>,
@@ -71,6 +87,8 @@ pub(crate) struct Prepared {
     created: bool,
     mux: Option<Mux>,
     launch: Result<Launch, String>,
+    /// The view the session runs in: what was asked for only where the backend can carry it.
+    view: SessionView,
     /// A re-attach whose backend session ended meanwhile: dropped quietly.
     gone: bool,
 }
@@ -98,6 +116,8 @@ pub(super) struct Managed {
     pub(super) cwd: PathBuf,
     pub(super) mux: Option<Mux>,
     pub(super) mux_name: Option<String>,
+    /// The view it runs in (see [`ControllerInfo::view`]); what a restart keeps.
+    pub(super) view: SessionView,
     /// argv as requested (`omp` not yet resolved): what a restart runs again.
     argv: Vec<String>,
     pub(super) tool: Option<Tool>,
@@ -114,6 +134,10 @@ pub(super) struct Managed {
     model_at: Option<Instant>,
     /// The folder omp last reported in the session's breadcrumb (see [`read_live_cwd`]).
     live_cwd: Option<PathBuf>,
+    /// The activity the Controllers topic last carried: under TSP omp's state comes from OSC
+    /// 7501 reports and the document, not the title, so a change of it is its own reason to
+    /// republish.
+    published_activity: Activity,
 }
 
 impl Managed {
@@ -167,6 +191,27 @@ struct ManifestEntry {
     cwd: PathBuf,
     session_path: Option<PathBuf>,
     label: String,
+    #[serde(default)]
+    view: SessionView,
+}
+
+impl LaunchJob {
+    fn restore_manifest_entry(&self) -> Option<ManifestEntry> {
+        let Owner::Restored(kind) = self.owner else {
+            return None;
+        };
+        if !self.restore {
+            return None;
+        }
+        Some(ManifestEntry {
+            kind,
+            name: self.spec.mux_name.clone()?,
+            cwd: self.spec.cwd.clone(),
+            session_path: self.spec.session_path.clone(),
+            label: self.spec.label.clone(),
+            view: self.spec.view,
+        })
+    }
 }
 
 pub(super) struct Sessions {
@@ -421,6 +466,7 @@ impl Engine {
                     requests: m.ctl.requests().cloned().collect(),
                     views,
                     controlled: m.controlling.is_some(),
+                    view: m.view,
                     target,
                 }
             })
@@ -735,7 +781,9 @@ impl Engine {
         let mut changed = false;
         for (i, m) in self.sess.managed.iter_mut().enumerate() {
             let tick = m.ctl.tick(now);
-            if tick.terminal.title_changed.is_some() {
+            let activity = m.ctl.activity();
+            if tick.terminal.title_changed.is_some() || activity != m.published_activity {
+                m.published_activity = activity;
                 changed = true;
             }
             if tick.terminal.exited.is_some() {
@@ -994,7 +1042,8 @@ impl Engine {
         }
     }
 
-    pub(super) fn begin_restart(&mut self, i: usize, key: RequestKey) {
+    /// `view`: the view to relaunch in (`None`: the one the session runs in now).
+    pub(super) fn begin_restart(&mut self, i: usize, key: RequestKey, view: Option<SessionView>) {
         let m = &mut self.sess.managed[i];
         let session = m.ctl.target().key.clone();
         match (&m.mux, &m.mux_name) {
@@ -1014,13 +1063,14 @@ impl Engine {
                     Fin::Restarted {
                         key,
                         session,
+                        view,
                         result,
                     }
                 });
             }
             _ => {
                 m.ctl.terminal_mut().kill();
-                self.on_restarted(key, session, Ok(()));
+                self.on_restarted(key, session, view, Ok(()));
             }
         }
     }
@@ -1030,6 +1080,7 @@ impl Engine {
         &mut self,
         key: RequestKey,
         session: SessionKey,
+        view: Option<SessionView>,
         result: Result<(), String>,
     ) {
         if let Err(e) = result {
@@ -1048,6 +1099,10 @@ impl Engine {
             SessionRole::Session => omp_argv(m.ctl.session_path()),
             SessionRole::Tool => m.argv.clone(),
         };
+        let launch_view = match m.role {
+            SessionRole::Session => view.unwrap_or(m.view),
+            SessionRole::Tool => SessionView::Terminal,
+        };
         let job = LaunchJob {
             spec: LaunchSpec {
                 mux_name: m.mux_name.clone(),
@@ -1057,9 +1112,14 @@ impl Engine {
                 argv,
                 role: m.role.clone(),
                 copy_of: None,
+                view: launch_view,
             },
             key: Some(key),
             exact: true,
+            owner: Owner::Restarted(match launch_view {
+                SessionView::Chat => None,
+                SessionView::Terminal => m.mux.as_ref().map(Mux::kind),
+            }),
             restore: false,
             tool: m.tool.clone(),
             confine: None,
@@ -1424,10 +1484,19 @@ impl Engine {
 
     // ---- launches -----------------------------------------------------------------------------
 
-    /// The backend holding live session `name`, else the primary one.
-    fn mux_for(&self, snap: &crate::gateway::running::RunningSnapshot, name: &str) -> Option<Mux> {
-        let owner = snap.owner_of(name).and_then(|k| self.backends.of_kind(k));
-        owner.or_else(|| self.backends.primary()).cloned()
+    /// The backend a launch of `name` in `view` runs on (see [`Backends::for_launch`]).
+    fn mux_for(
+        &self,
+        snap: &crate::gateway::running::RunningSnapshot,
+        job: &LaunchJob,
+        name: &str,
+    ) -> Option<Mux> {
+        let owner = match job.owner {
+            Owner::Snapshot => snap.owner_of(name),
+            Owner::Restored(kind) => Some(kind),
+            Owner::Restarted(kept) => kept,
+        };
+        self.backends.for_launch(owner, job.spec.view).cloned()
     }
 
     /// Removes the exited controllers of session file `path` (or backend session `name`), so a
@@ -1452,7 +1521,11 @@ impl Engine {
         }
     }
 
-    fn existing_for(&self, spec: &LaunchSpec, name: Option<&str>) -> Option<SessionTarget> {
+    fn existing_for(
+        &self,
+        spec: &LaunchSpec,
+        name: Option<&str>,
+    ) -> Option<(SessionTarget, SessionView)> {
         self.sess
             .managed
             .iter()
@@ -1461,7 +1534,7 @@ impl Engine {
                     && m.ctl.session_path() == spec.session_path.as_deref())
                     || (name.is_some() && m.mux_name.as_deref() == name)
             })
-            .map(|m| m.ctl.target().clone())
+            .map(|m| (m.ctl.target().clone(), m.view))
     }
 
     /// Starts the next queued launch once a running snapshot exists (names resolve against it).
@@ -1474,10 +1547,10 @@ impl Engine {
         };
         while let Some(mut job) = self.sess.launches.pop_front() {
             if job.spec.copy_of.is_none()
-                && let Some(t) = self.existing_for(&job.spec, job.spec.mux_name.as_deref())
+                && let Some((t, view)) = self.existing_for(&job.spec, job.spec.mux_name.as_deref())
             {
                 if let Some(key) = job.key.take() {
-                    self.job_finished(key, Ok(Done::Session(t)));
+                    self.job_finished(key, Ok(Done::Session(t, view)));
                 }
                 continue;
             }
@@ -1499,7 +1572,7 @@ impl Engine {
                 // No direct children here: a tool runs in a host session of its own.
                 name = Some(format!("omp-tool-{}", crate::gateway::unix_ms()));
             }
-            let mux = name.as_deref().and_then(|n| self.mux_for(&snap, n));
+            let mux = name.as_deref().and_then(|n| self.mux_for(&snap, &job, n));
             if mux.is_none() {
                 name = None;
             }
@@ -1508,10 +1581,10 @@ impl Engine {
             }
             if job.spec.copy_of.is_none()
                 && let Some(n) = name.as_deref()
-                && let Some(t) = self.existing_for(&job.spec, Some(n))
+                && let Some((t, view)) = self.existing_for(&job.spec, Some(n))
             {
                 if let Some(key) = job.key.take() {
-                    self.job_finished(key, Ok(Done::Session(t)));
+                    self.job_finished(key, Ok(Done::Session(t, view)));
                 }
                 continue;
             }
@@ -1543,6 +1616,7 @@ impl Engine {
             created,
             mux,
             launch,
+            view,
             gone,
         } = p;
         if gone {
@@ -1581,6 +1655,7 @@ impl Engine {
                     _ => SessionKey::direct(),
                 };
                 let ctl = SessionController::new(key, term, job.spec.session_path.clone());
+                let published_activity = ctl.activity();
                 let target = ctl.target().clone();
                 let now = Instant::now();
                 let copy = job.spec.copy_of.clone().map(|src_id| CopyWatch {
@@ -1607,6 +1682,7 @@ impl Engine {
                     mux,
                     mux_name: name,
                     argv,
+                    view,
                     tool: job.tool,
                     // Attaching ignores the argv: only a created session opens the socket.
                     ctl_expect: ctl_key.is_some() && created,
@@ -1619,9 +1695,10 @@ impl Engine {
                     model: None,
                     model_at: None,
                     live_cwd: None,
+                    published_activity,
                 });
                 if let Some(key) = job.key {
-                    self.job_finished(key, Ok(Done::Session(target)));
+                    self.job_finished(key, Ok(Done::Session(target, view)));
                 }
                 self.sess.manifest_dirty = true;
                 self.dirty.controllers = true;
@@ -1685,9 +1762,11 @@ impl Engine {
                     label: e.label,
                     role: SessionRole::Session,
                     copy_of: None,
+                    view: e.view,
                 },
                 key: None,
                 exact: true,
+                owner: Owner::Restored(e.kind),
                 restore: true,
                 tool: None,
                 confine: None,
@@ -1714,6 +1793,7 @@ impl Engine {
                     cwd: m.cwd.clone(),
                     session_path: m.ctl.session_path().map(Path::to_path_buf),
                     label: m.label.clone(),
+                    view: m.view,
                 })
             })
             .collect();
@@ -1722,16 +1802,7 @@ impl Engine {
             self.sess
                 .launches
                 .iter()
-                .filter(|j| j.restore)
-                .filter_map(|j| {
-                    Some(ManifestEntry {
-                        kind: self.backends.primary()?.kind(),
-                        name: j.spec.mux_name.clone()?,
-                        cwd: j.spec.cwd.clone(),
-                        session_path: j.spec.session_path.clone(),
-                        label: j.spec.label.clone(),
-                    })
-                }),
+                .filter_map(LaunchJob::restore_manifest_entry),
         );
         match serde_json::to_vec_pretty(&entries) {
             Ok(bytes) => {
@@ -1786,6 +1857,26 @@ fn read_live_cwd(p: &CwdProbe, agent_dir: &Path) -> Option<PathBuf> {
     (fresh || p.session_path.as_deref() == Some(crumb.session.as_path())).then_some(crumb.cwd)
 }
 
+/// The view a launch really gets. Chat needs TSP, which only the OmpDeck session host carries:
+/// on any other backend (or none) the session is a terminal. A host session that is created now
+/// starts as asked; one that is already alive keeps the mode it was created with (`live_tsp`,
+/// from its daemon; unknown counts as a terminal).
+fn effective_view(
+    wanted: SessionView,
+    backend: Option<MuxKind>,
+    created: bool,
+    live_tsp: Option<bool>,
+) -> SessionView {
+    if backend != Some(MuxKind::Host) {
+        return SessionView::Terminal;
+    }
+    match (created, live_tsp) {
+        (true, _) => wanted,
+        (false, Some(true)) => SessionView::Chat,
+        (false, _) => SessionView::Terminal,
+    }
+}
+
 /// Worker: control dir and environment, the resolved argv and the backend launch.
 fn prepare(
     mut job: LaunchJob,
@@ -1800,6 +1891,16 @@ fn prepare(
         (Some(m), Some(n)) => !m.has_session(n),
         _ => true,
     };
+    // Only an omp session has a chat view; a tool run is always a terminal.
+    let wanted = match job.spec.role {
+        SessionRole::Session => job.spec.view,
+        SessionRole::Tool => SessionView::Terminal,
+    };
+    let live_tsp = match (&mux, &name) {
+        (Some(Mux::Host(h)), Some(n)) if !created => h.namespace().info(n).ok().map(|i| i.tsp),
+        _ => None,
+    };
+    let view = effective_view(wanted, mux.as_ref().map(Mux::kind), created, live_tsp);
     if job.restore && created {
         return Prepared {
             job,
@@ -1808,6 +1909,7 @@ fn prepare(
             created,
             mux,
             launch: Err("the session ended".to_owned()),
+            view,
             gone: true,
         };
     }
@@ -1823,6 +1925,7 @@ fn prepare(
                     created,
                     mux,
                     launch: Err(e.to_string()),
+                    view,
                     gone: false,
                 };
             }
@@ -1862,7 +1965,13 @@ fn prepare(
         _ => argv,
     };
     let launch = match (&mux, &name) {
-        (Some(m), Some(n)) => Ok(m.launch_with_env(n, &job.spec.cwd, &argv, &env)),
+        (Some(m), Some(n)) => {
+            let mut launch = m.launch_with_env(n, &job.spec.cwd, &argv, &env);
+            if let Launch::Host(spec) = &mut launch {
+                spec.tsp = view == SessionView::Chat;
+            }
+            Ok(launch)
+        }
         _ => direct(&job.spec.cwd, &argv, env),
     };
     Prepared {
@@ -1872,6 +1981,7 @@ fn prepare(
         created,
         mux,
         launch,
+        view,
         gone: false,
     }
 }
@@ -1923,12 +2033,14 @@ mod tests {
                 argv: omp_argv(None),
                 role: SessionRole::Session,
                 copy_of: None,
+                view: SessionView::Terminal,
             },
             key: key.map(|(client, seq)| RequestKey {
                 client: client.into(),
                 seq,
             }),
             exact: false,
+            owner: Owner::Snapshot,
             restore: false,
             tool: None,
             confine: None,
@@ -1983,10 +2095,156 @@ mod tests {
             cwd: PathBuf::from("/p"),
             session_path: Some(PathBuf::from("/s/a.jsonl")),
             label: "a".into(),
+            view: SessionView::Chat,
         };
         let text = serde_json::to_string(&e).expect("json");
         assert!(!text.contains("argv") && !text.contains("env"));
         let back: ManifestEntry = serde_json::from_str(&text).expect("parse");
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn a_manifest_written_before_views_restores_as_terminals() {
+        let old = r#"[{"kind":"Tmux","name":"omp-1","cwd":"/p","session_path":null,"label":"a"}]"#;
+        let entries: Vec<ManifestEntry> = serde_json::from_str(old).expect("parse");
+        assert_eq!(entries[0].view, SessionView::Terminal);
+    }
+
+    #[test]
+    fn chat_is_only_ever_effective_on_a_host_that_carries_it() {
+        use SessionView::{Chat, Terminal};
+        let host = Some(MuxKind::Host);
+        // A session created now starts as asked, but only on the host.
+        assert_eq!(effective_view(Chat, host, true, None), Chat);
+        assert_eq!(effective_view(Terminal, host, true, None), Terminal);
+        assert_eq!(
+            effective_view(Chat, Some(MuxKind::Tmux), true, None),
+            Terminal
+        );
+        assert_eq!(effective_view(Chat, None, true, None), Terminal);
+        // One that is alive keeps the mode its daemon was created with.
+        assert_eq!(effective_view(Terminal, host, false, Some(true)), Chat);
+        assert_eq!(effective_view(Chat, host, false, Some(false)), Terminal);
+        assert_eq!(effective_view(Chat, host, false, None), Terminal);
+    }
+
+    #[test]
+    fn queued_restore_manifest_keeps_the_real_backend_across_restarts() {
+        for kind in [MuxKind::Host, MuxKind::Tmux] {
+            let mut job = prepare_job(SessionView::Terminal, SessionRole::Session);
+            job.restore = true;
+            job.owner = Owner::Restored(kind);
+            let entry = job.restore_manifest_entry().expect("queued restore");
+            let bytes = serde_json::to_vec(&entry).expect("serialize");
+            let reloaded: ManifestEntry = serde_json::from_slice(&bytes).expect("reload");
+            assert_eq!(reloaded.kind, kind);
+            assert_eq!(reloaded.view, SessionView::Terminal);
+            assert_eq!(reloaded.name, "omp-prep-chat");
+            job.restore = false;
+            assert_eq!(job.restore_manifest_entry(), None);
+        }
+    }
+
+    fn prepare_job(view: SessionView, role: SessionRole) -> LaunchJob {
+        LaunchJob {
+            spec: LaunchSpec {
+                mux_name: Some("omp-prep-chat".into()),
+                cwd: PathBuf::from("/tmp"),
+                session_path: Some(PathBuf::from("/s/a.jsonl")),
+                label: "a".into(),
+                argv: omp_argv(Some(Path::new("/s/a.jsonl"))),
+                role,
+                copy_of: None,
+                view,
+            },
+            key: None,
+            exact: true,
+            owner: Owner::Snapshot,
+            restore: false,
+            tool: None,
+            confine: None,
+        }
+    }
+
+    fn host_mux() -> Mux {
+        Mux::Host(deck_core::mux::HostMux::new("omp-deck-test-prepare").expect("namespace"))
+    }
+
+    #[test]
+    fn a_chat_launch_asks_the_host_for_a_tsp_session_and_a_terminal_launch_does_not() {
+        let chat = prepare(
+            prepare_job(SessionView::Chat, SessionRole::Session),
+            Some("omp-prep-chat".into()),
+            None,
+            Some(host_mux()),
+            "omp-deck-test-prepare".into(),
+            None,
+            None,
+        );
+        assert_eq!(chat.view, SessionView::Chat);
+        match chat.launch.expect("launch") {
+            Launch::Host(spec) => {
+                assert!(spec.tsp, "the daemon must act as the TSP terminal");
+                assert_eq!(spec.args, ["--resume", "/s/a.jsonl"]);
+            }
+            other => panic!("not a host launch: {other:?}"),
+        }
+        let term = prepare(
+            prepare_job(SessionView::Terminal, SessionRole::Session),
+            Some("omp-prep-term".into()),
+            None,
+            Some(host_mux()),
+            "omp-deck-test-prepare".into(),
+            None,
+            None,
+        );
+        assert_eq!(term.view, SessionView::Terminal);
+        assert!(matches!(term.launch, Ok(Launch::Host(s)) if !s.tsp));
+        // A tool run is a terminal whatever its spec says.
+        let tool = prepare(
+            prepare_job(SessionView::Chat, SessionRole::Tool),
+            Some("omp-prep-tool".into()),
+            None,
+            Some(host_mux()),
+            "omp-deck-test-prepare".into(),
+            None,
+            None,
+        );
+        assert_eq!(tool.view, SessionView::Terminal);
+        assert!(matches!(tool.launch, Ok(Launch::Host(s)) if !s.tsp));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chat_launch_without_a_host_runs_as_a_terminal_and_says_so() {
+        // tmux would be the backend here: it cannot carry TSP.
+        let tmux = Mux::Tmux(deck_core::tmux::Tmux::with_socket(
+            "tmux",
+            "omp-deck-test-prepare",
+            "/nonexistent/tmux.conf",
+        ));
+        let p = prepare(
+            prepare_job(SessionView::Chat, SessionRole::Session),
+            Some("omp-prep-tmux".into()),
+            None,
+            Some(tmux),
+            "omp-deck-test-prepare".into(),
+            None,
+            None,
+        );
+        assert_eq!(p.view, SessionView::Terminal);
+        assert!(matches!(p.launch, Ok(Launch::Pty(_))));
+        // And no backend at all: a direct child.
+        let p = prepare(
+            prepare_job(SessionView::Chat, SessionRole::Session),
+            None,
+            None,
+            None,
+            "direct".into(),
+            None,
+            None,
+        );
+        assert_eq!(p.view, SessionView::Terminal);
+        assert!(matches!(p.launch, Ok(Launch::Pty(_))));
     }
 }

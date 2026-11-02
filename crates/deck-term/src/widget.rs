@@ -514,6 +514,21 @@ fn paste(term: &mut Terminal, text: Option<String>, mode: TermMode) {
 
 /// Clipboard and link actions behind the app's terminal context menu.
 impl Terminal {
+    /// Sends this frame's keyboard events (`events`, with `modifiers` the state at the end of
+    /// the frame) to the child exactly as [`TerminalView`] does while focused: held input,
+    /// win32 modifier records, kitty press/repeat/release reporting, the Ctrl+Shift+C/V and
+    /// Shift+Insert clipboard shortcuts, plain Ctrl+C/X/V clipboard events, IME preedit and
+    /// commits. For views that draw a TSP surface instead of the grid.
+    pub fn route_keyboard(&mut self, events: &[Event], modifiers: Modifiers) {
+        let mode = self.mode();
+        handle_keyboard(self, events, modifiers, mode);
+    }
+
+    /// The IME composition in progress (shown at the caret by whoever draws the input).
+    pub fn preedit(&self) -> &str {
+        &self.view.preedit
+    }
+
     /// A local (alacritty) selection exists: Shift+drag, or any drag without mouse reporting.
     pub fn has_selection(&self) -> bool {
         self.term

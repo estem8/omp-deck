@@ -161,6 +161,7 @@ pub(crate) enum Fin {
     Restarted {
         key: RequestKey,
         session: SessionKey,
+        view: Option<deck_core::config::SessionView>,
         result: Result<(), String>,
     },
     CopyFound {
@@ -720,8 +721,9 @@ impl Engine {
             Fin::Restarted {
                 key,
                 session,
+                view,
                 result,
-            } => self.on_restarted(key, session, result),
+            } => self.on_restarted(key, session, view, result),
             Fin::CopyFound {
                 session,
                 generation,

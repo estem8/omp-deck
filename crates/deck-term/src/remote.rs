@@ -377,7 +377,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::input::KeyRules;
     use crate::theme::{Palette, TermTheme};
-    use crate::{TermOptions, Terminal, wait_detached};
+    use crate::{BlockedKind, RunPhase, RunState, TermOptions, Terminal, wait_detached};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -835,6 +835,34 @@ pub(crate) mod tests {
         wait_detached(TIMEOUT);
     }
 
+    #[test]
+    fn an_observer_mirrors_tsp_but_never_writes() {
+        use deck_tsp::stream::{Verb, encode_message};
+        let (host, events) = mpsc::channel();
+        let mut t = Terminal::observe_headless(
+            Box::new(Follow {
+                events,
+                end: host.clone(),
+            }),
+            TermOptions::default(),
+            Arc::new(|_| {}),
+        );
+        let event = deck_tsp::wire::Event::Theme { dark: true };
+        assert_eq!(t.send_tsp(&event), Err(crate::TspRefused::ReadOnly));
+        output(
+            &host,
+            &encode_message(
+                Verb::Open,
+                &[],
+                br#"{"id":"s1","mode":"inline","role":"omp.session"}"#,
+            ),
+        );
+        until(&mut t, "the surface", |t| t.tsp().live());
+        assert_eq!(t.send_tsp(&event), Err(crate::TspRefused::ReadOnly));
+        drop(t);
+        wait_detached(TIMEOUT);
+    }
+
     /// What omp answers a width change with: wipe screen and scrollback, print everything again.
     /// Ends with a title change, which `until(.. title ..)` sees only after the lines are parsed.
     fn redraw(t: &mut Terminal, host: &Sender<RemoteEvent>, done: &str) {
@@ -895,5 +923,121 @@ pub(crate) mod tests {
         t.scroll_keep.cancel();
         redraw(&mut t, &host, "second");
         assert_eq!(display_offset(&t), 0);
+    }
+
+    #[test]
+    fn run_state_follows_output_and_a_snapshot_replaces_it() {
+        let (mut t, host, _log) = connect();
+        assert_eq!(t.run_state(), None);
+        // Split across reads, ST-terminated.
+        output(&host, b"x\x1b]7501;state=work");
+        output(&host, b"ing:app=omp\x1b\\");
+        until(&mut t, "working", |t| {
+            t.run_state() == Some(RunState::new(RunPhase::Working))
+        });
+        output(&host, b"\x1b]7501;state=error:app=omp:msg=Ym9vbQ==\x07");
+        until(&mut t, "error", |t| {
+            t.run_state()
+                == Some(RunState {
+                    state: RunPhase::Error,
+                    msg: Some("boom".into()),
+                })
+        });
+
+        // A host snapshot that carries a report replaces the state with it ...
+        host.send(RemoteEvent::Snapshot(
+            b"\x1bcsnap\x1b]7501;state=blocked:kind=question:app=omp\x1b\\".to_vec(),
+        ))
+        .expect("send");
+        until(&mut t, "snapshot state", |t| {
+            t.run_state()
+                == Some(RunState::new(RunPhase::Blocked {
+                    kind: Some(BlockedKind::Question),
+                }))
+        });
+        // ... and one that carries none leaves none: the old session's state does not survive.
+        host.send(RemoteEvent::Snapshot(b"\x1bcagain".to_vec()))
+            .expect("send");
+        until(&mut t, "snapshot without state", |t| {
+            t.screen_text().lines[0] == "again" && t.run_state().is_none()
+        });
+    }
+
+    /// Waits for the subscriber's snapshot, returning it and how long it took.
+    fn snapshot_of(
+        sub: &crate::OutputSubscription,
+        limit: Duration,
+    ) -> Option<(Arc<[u8]>, Duration)> {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            if let Some(crate::OutputEvent::Snapshot(bytes)) =
+                sub.recv_timeout(Duration::from_millis(20))
+            {
+                return Some((bytes, start.elapsed()));
+            }
+        }
+        None
+    }
+
+    /// An abandoned chunk sequence ends a joiner's wait on its own: nothing more arrives from an
+    /// idle program, and the splitter's expiry only runs when bytes do.
+    #[test]
+    fn a_join_behind_an_abandoned_chunk_sequence_completes_after_the_chunk_idle_time() {
+        use crate::tsp::tests::{frame1, frame2_chunks, hello, open};
+        let (mut t, host, _log) = connect();
+        let mut head = hello();
+        head.extend(open());
+        head.extend(frame1());
+        let chunks = frame2_chunks();
+        output(&host, &head);
+        output(&host, &chunks[0]);
+        output(&host, &chunks[1]);
+        settle(&mut t, &host, "started");
+
+        let sub = t.subscribe_output(Arc::new(|| {}));
+        assert!(
+            snapshot_of(&sub, Duration::from_millis(300)).is_none(),
+            "the sequence has not expired yet"
+        );
+        // No further output: the join ends when the sequence expires.
+        let (snapshot, _) = snapshot_of(&sub, Duration::from_secs(5)).expect("the join completes");
+        let mut mirror = deck_tsp::mirror::Mirror::new();
+        mirror.feed(&snapshot, Instant::now());
+        assert!(mirror.is_idle(), "the replay holds no half message");
+        assert!(mirror.live());
+
+        // Later chunks of the dropped sequence are skipped; the stream goes on after it.
+        for chunk in &chunks[2..] {
+            output(&host, chunk);
+        }
+        output(&host, b"\r\nafter");
+        until(&mut t, "output after the dropped sequence", |t| {
+            t.screen_text().lines.iter().any(|l| l.contains("after"))
+        });
+        assert_eq!(
+            t.tsp().with(|d| d
+                .surface("s1")
+                .and_then(|s| s.node("t"))
+                .and_then(|n| n.text().map(str::to_owned))),
+            Some("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_join_after_the_chunk_idle_time_needs_no_wait() {
+        use crate::tsp::tests::{frame1, frame2_chunks, hello, open};
+        let (mut t, host, _log) = connect();
+        let mut head = hello();
+        head.extend(open());
+        head.extend(frame1());
+        let chunks = frame2_chunks();
+        output(&host, &head);
+        output(&host, &chunks[0]);
+        settle(&mut t, &host, "started");
+        std::thread::sleep(deck_tsp::stream::CHUNK_IDLE + Duration::from_millis(200));
+
+        let sub = t.subscribe_output(Arc::new(|| {}));
+        let (_, took) = snapshot_of(&sub, Duration::from_secs(5)).expect("joined at once");
+        assert!(took < Duration::from_millis(500), "{took:?}");
     }
 }

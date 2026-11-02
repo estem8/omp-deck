@@ -3350,3 +3350,137 @@ module comment). Unknown verbs/fields/kinds/ops are tolerated, never fatal.
   recorded acks), `crates/deck-host/tests/tsp_host.rs` (hello before DA1, detached acks, classic untouched),
   `crates/deck-service/tests/tsp_live.rs` (real omp + fake model: native, `send`, streaming, detached turns, tool turn).
   Windows: xwin clippy only.
+
+## Native chat view (TSP) step 2: chat view (user, 2026-11-02)
+
+User: "move onto next step, the chat view must be elegant and beautiful". The visual direction is chosen by the
+user from mockups (`~/omp-deck-chat-mockups/`); this section fixes data, input, launch and persistence. Research:
+`/tmp/omp-chat/tsp-catalog.md` (what omp emits per kind/role), plumbing map below. The late-join replay originally
+planned as step 3 is a prerequisite here (the GUI frontend always joins after the gateway owner, the owner may join
+the host after omp's first frames), so it lands in step 2; step 3 is reduced to polish found in use.
+
+### Data: mirror + replay
+- **Single answerer stays the host.** Nothing outside deck-host may reply/ack (`Responder` is host-only); every other
+  copy of the document is a passive mirror.
+- deck-tsp:
+  - `Splitter::is_idle(&self) -> bool` (no APC in progress and no chunk sequence pending).
+  - `Document::apply` takes the receive time (`apply(&mut self, &Message, now: Instant)`; `Responder` passes its
+    `now`) and stamps each node with the time its props/text last changed: `NodeRef::changed_at() -> Instant`.
+  - `Document::revision() -> u64`, bumped by every applied message that changed anything.
+  - Program hello: the document remembers the program's last `hello` query (`Document::program() ->
+    Option<&Program>`; `Responder::program` reads it from there).
+  - `Document::replay(&self, now: Instant) -> Vec<u8>`: program→terminal APC bytes (`encode_chunked`, apc 65 536)
+    that rebuild an equal document in a fresh `Mirror`: the program's hello query, then per open surface `o`, `s`
+    stylesheets, one `f` of `add` ops (regions + subtrees in order, `seq` = the surface's last seq), `settle`s,
+    `focus`; retained blobs as `b`. Timers stay truthful: `age` props of unstopped `elapsed` nodes and of running
+    `tool`/`agent` nodes are advanced by `now - changed_at` in the replayed props.
+  - `mirror::Mirror { feed(&mut self, bytes, now) -> bool /* revision changed */, document(), is_idle(), live() /*
+    an open inline surface with role omp.session */, reset() }` = `Splitter` + `Document`, never produces bytes.
+  - Equality test: for the 18.15.0 fixture at every message boundary, `Mirror` fed `replay()` serializes equal to the
+    source document (except timer props, compared separately).
+- deck-host: `Core::snapshot` appends `tsp.document().replay(now)` after the VT replay when the session is TSP and
+  live (covers attach, observe, Peek and exit-linger). vte ignores APC, so the grid is unchanged.
+- deck-term (`OutputScan`): a `Mirror` beside the kitty scanner, fed in `OutputScan::feed`, rebuilt in `reset`;
+  `Engine::snapshot` appends `mirror.document().replay(now)` after the grid and before the unfinished-sequence
+  prefix; `Engine::ready` also waits while the mirror is not idle (a join mid-chunk-sequence would lose a frame).
+  Shared with the UI without the engine lock: `Terminal::tsp(&self) -> TspHandle` (cloneable) with
+  `revision() -> u64` (atomic), `live() -> bool`, `with<R>(&self, f: impl FnOnce(&Document) -> R) -> R` (short
+  mutex; the output thread holds it only while applying one message). Repaint rides the existing `Wakeup`.
+- deck-term input: `Terminal::send_tsp(&self, &deck_tsp::wire::Event) -> Result<(), TspRefused>` encodes with
+  `encode_event(.., InputEncoding::native())` and goes through the same checked path as user input; refused (typed:
+  `NotLive`, `Held`, `ReadOnly`, `Exited`, `Detached`) instead of silently dropped, so the UI can show it. Key
+  presses for omp's composer use the existing key encoders/`Terminal::write` (omp owns the editor text; it answers
+  with `text`/`splice`/`set`).
+
+### Launch and persistence
+- deck-core `AppConfig.session_view: SessionView { Terminal (default), Chat }` (`#[serde(default)]`): how new tabs
+  open. Shared settings field through `SettingsService` like other shared fields.
+- `TabState.view: SessionView` (`#[serde(default)]`): written from the tab, used when a restore has to create the
+  session again (an alive session keeps whatever mode it was created with).
+- deck-service gateway `protocol::LaunchSpec.view: SessionView` (`#[serde(default)]`). In `prepare`, `Chat` launches
+  on the **host** backend whenever it is available, regardless of `BackendChoice` (tmux cannot carry TSP), and sets
+  `SessionSpec.tsp = true`; host unavailable ⇒ launched as Terminal and the outcome says so
+  (`LaunchOutcome`/`Done` carries the effective view). Every other `LaunchSpec` constructor passes the view it means
+  (restart/restore/worktree/mobile keep the tab's current view; mobile launches use `AppConfig.session_view`).
+- Switching an open tab between views = restart of the omp process in the other mode (`omp --resume <file>`), idle
+  only, busy warning, same path as Restart session; the tab keeps its place.
+- `ControllerInfo.view: SessionView` (effective; from the host spec) so GUI/phone can tell.
+
+### GUI (omp-deck)
+- One dispatch in `show_terminal` and `show_split`: a tab whose `Terminal::tsp().live()` shows `chat_view::ChatView`,
+  else `TerminalView`. Chat view keeps the wrapper duties: `Terminal::resize` (cols from the chat column width in
+  the terminal font, rows from the pane) and `set_focused`, `focus_pending`/`terminal_focused` bookkeeping, split
+  focus border, visible-for-notifications.
+- Renders the inline surface: `main` as a scrolling transcript (stick-to-bottom while at bottom, "jump to latest"
+  pill otherwise), `dock` as the composer area, `layer` as overlays/pickers/toasts. Follows the active OmpDeck style
+  (all 18; colors from the theme, not omp's palette); omp `tone`s map onto theme colors. Markdown via the existing
+  styled markdown renderer where it fits; code/diff/ansi blocks in the terminal font. No allocation per frame per
+  node beyond egui layout; cache laid-out jobs by (node id, revision).
+- Composer = omp's `editor` node rendered natively (text, cursor, selection, placeholder, ghost); keys go to omp as
+  PTY bytes; paste through `paste_bytes`; send button/Enter per omp (`submit`); every clickable node sends the
+  event its `actions` declare (`toggle`/`select`/`activate`/`action`/`change`); `copy`/`open`/`zoom` local.
+- Menus: session row + tab menus "Open in chat view"/"Open in terminal" (+ "Switch to chat/terminal view" on open
+  tabs), Settings → General "Open sessions in", palette commands; a hover button on session rows for the
+  non-default view (project rule: context actions also as hover buttons).
+
+### Mirror as built (TspMirror, 2026-11-02)
+- Beyond the sketch: `Splitter::resume_bytes` / `Responder::resume_bytes` (the host appends them after the replay so a
+  client attaching mid chunk sequence still gets that frame); `Document::set_program`; `HostInfo.tsp: bool`
+  (`#[serde(default)]`); `Engine::join_split` (a join waiting on a non-idle mirror splits at the next ESC);
+  `TspHandle::revision` stays monotonic across snapshot resets. `deck_tsp::Program` lives in `document`.
+- `send_tsp` checks only the local terminal; an owner's later refusal of a frontend's bytes is asynchronous
+  (debug-logged). A stalled chunk sequence expires only when more bytes arrive.
+- Proof: `deck-tsp/tests/mirror.rs` (replay equality at every fixture boundary), `deck-host/tests/tsp_host.rs`,
+  deck-term frontend/remote tests, `deck-service/tests/tsp_mirror_live.rs` (real omp late joiner equal + send streams).
+
+### Visual direction (user, 2026-11-02): "F with A conversation style"
+Mockups `~/omp-deck-chat-mockups/F-signal-edge.png` + `A-conversation.png` (round 3; HTML beside them holds exact
+CSS). Structure from **A**: user turns right-aligned bubbles (max ~70% width) with avatar initials and time;
+assistant prose unboxed on the left under a small `omp · <model>` byline; tools inline in document order as
+cards; composer floats detached from the bottom edge with a shadow. Visual language from **F**: slanted
+(parallelogram) edges on user bubbles' and tool cards' headers, cyan→violet accent-pair gradient hairlines,
+the running tool glows (animated, respects reduce-motion), glass-like elevated composer with a gradient outline.
+Type: prose 15 px / 1.6 (proportional UI face), mono 12.5–13 px (terminal font), labels ≥ 11 px; measure ≤ ~880 px
+centered; Blueprint by default but colors come from the active style (all 18 styles, light included).
+Default view stays **Terminal**; chat is opt-in (user).
+
+### Step 2 as built (2026-11-02)
+- **Run state** (smoke found omp drops the `π` title under TSP; its state channel is OSC 7501, `run-status.ts`):
+  `deck_host::{RunState, RunPhase, BlockedKind, TspFacts, run_state::{RunStateScanner, Report, parse_osc,
+  encode_report}}` (re-exported by deck-term); held report replayed in host + engine snapshots; `HostInfo.run_state`,
+  `HostInfo.tsp_facts`; `Terminal::run_state()`; `Mux::pane_status() -> PaneStatus { title, run_state, tsp_facts }`
+  replaces `pane_titles`; `RunningSession.{run_state, tsp_facts}`. One precedence everywhere:
+  `Activity::derive(run_state, title, tsp_facts)` / `Activity::of_terminal(&Terminal)` = OSC 7501 report > `π` title
+  > TSP document (dock `omp.working` ⇒ Busy, `omp.editor.ask*` ⇒ Attention, sendable composer ⇒ Idle) > Unknown;
+  Working ⇒ Busy, Blocked ⇒ Attention, Idle/Done/Error ⇒ Idle. tmux sessions keep titles (tmux drops unknown OSC).
+  Gate: `deck-service/tests/tsp_run_state_live.rs`.
+- **Launch**: `Backends::for_launch`; `Mutation::Restart { target, view: Option<SessionView> }`, `Done::Session(target,
+  view)`; restart placement via `LaunchJob.owner` (`Owner`), a restart that changes backend (tmux → host for Chat)
+  changes the session key; `ControllerInfo.view`, `ManifestEntry.view`; mobile/worktree opens use
+  `AppConfig.session_view`. Gate: `deck-service/tests/chat_launch.rs`.
+- **GUI**: `omp-deck/src/chat_view/` (`ChatView::{new, id_salt, font_size, show} -> ChatResponse { response,
+  open_url, refused }`), dispatch in `show_terminal` and `show_split` on `tsp().live()`; non-default
+  open/new menu entries + row hover button, "Switch to chat/terminal view" (idle only, confirm), Settings → General
+  "Open sessions in", palette "View: Switch to …", toast when a Chat launch fell back to Terminal.
+  Chat links: `file://` hrefs (tool path targets) decode to a local path opened with the platform opener on the chat
+  path only (`is_openable_url` unchanged). TSP-live tabs/panes show a chat glyph. Running sessions without a tab offer
+  plain **Open** (attach keeps the session's real mode). Keyboard: `Terminal::route_keyboard` is the one routine both
+  `TerminalView` and `ChatView` use (win32 modifier sync, repeats/releases, IME preedit via `Terminal::preedit`).
+  `TspHandle::{epoch, with_stamp}`: the view re-syncs on (epoch, revision), never on the document's own revision.
+  Exited sessions show `[process exited: <code>]` in place of the composer; caret blink only while composer + window
+  are focused (≤ 20 s after the last input); `ChatState` swept after 15 min unseen.
+- **Activity publish**: the gateway republishes `Topic::Controllers` when `ctl.activity()` changes
+  (`Managed.published_activity`), not only on title change (gate `tsp_run_state_gateway_live.rs`). Child exit and RIS
+  clear the held run state; an exited terminal's `Activity::of_terminal` is `Unknown`.
+- **Injection under TSP** (`deck_service::inject`): when `terminal.tsp().live()`, composer state comes from the mirrored
+  document (`composer::TspComposer::of`: dock `editor` with `sendable` + surface focus; ask dialog/no focus ⇒ `Missing`;
+  draft text, chips, autocomplete open, `can_send` = hello lists `send`), passed as `Env.tsp`. Slash commands and idle
+  Send go as one TSP `send` event (`Write::Send`, `Terminal::inject_tsp` = `send_tsp` minus the input-hold check);
+  a confirmed draft is displaced into omp's recall history (no Ctrl+C). Insert/Steer/FollowUp/attachments/Stop/hotkeys
+  keep the PTY path and observe the document. No `send` in hello ⇒ PTY path for everything. A refused `Write::Send`
+  ends `Aborted`, never delivered. Gate `tsp_inject_live.rs`.
+- **Replay**: `Document::replay_with(now, ReplayBlobs::{Referenced, None})`; attach/observe replay only blobs a live node
+  references, Peek none (a blob sent before an attach and referenced only later is missing in that client — accepted).
+  `Splitter::resume_bytes(now, out)` carries skipping + sequence age (`x-resume-skip`, `x-resume-age`); a join waiting
+  on an abandoned chunk sequence completes after `CHUNK_IDLE` (`tsp-expiry` wake). Queued restores keep their real
+  backend in the manifest (`Owner::Restored`). `PROTOCOL` stays 1: gateway and clients are replaced together.

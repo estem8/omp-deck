@@ -1823,6 +1823,7 @@ impl Engine {
                     argv: super::sessions::omp_argv(None),
                     role: SessionRole::Session,
                     copy_of: None,
+                    view: self.cfg.session_view,
                 })
             }
             Op::Resume { session } => {
@@ -1835,9 +1836,13 @@ impl Engine {
                     argv: super::sessions::omp_argv(Some(&s.path)),
                     role: SessionRole::Session,
                     copy_of: None,
+                    view: self.cfg.session_view,
                 })
             }
-            Op::Restart { live } => Mutation::Restart(self.live_target(&live)?),
+            Op::Restart { live } => Mutation::Restart {
+                target: self.live_target(&live)?,
+                view: None,
+            },
             Op::Stop { live } => Mutation::Stop(self.live_target(&live)?),
             Op::Kill { live } => Mutation::Kill(self.live_target(&live)?),
             Op::Prompt { live, text } => submit(self, &live, Command::Prompt { text })?,
@@ -1988,7 +1993,7 @@ impl Engine {
             return v;
         }
         match d {
-            Done::Session(t) => D::Session { live: live_ref(t) },
+            Done::Session(t, _) => D::Session { live: live_ref(t) },
             Done::Submitted(r) => submitted(r),
             Done::Answered(applied) => D::Answered { applied: *applied },
             Done::Deleted(list) => D::Deleted {
@@ -2284,6 +2289,7 @@ mod tests {
             requests,
             views: 1,
             controlled: false,
+            view: deck_core::config::SessionView::Terminal,
         }
     }
 

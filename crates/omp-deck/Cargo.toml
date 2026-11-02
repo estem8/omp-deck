@@ -15,6 +15,7 @@ deck-core.workspace = true
 deck-term.workspace = true
 deck-service.workspace = true
 deck-host.workspace = true
+deck-tsp.workspace = true
 eframe.workspace = true
 egui.workspace = true
 serde.workspace = true
@@ -24,11 +25,16 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 egui_commonmark.workspace = true
+# The chat view parses assistant markdown itself (line height, selectable runs, streaming); the version
+# egui_commonmark already pulls in.
+pulldown-cmark = { version = "0.13", default-features = false }
 # Mobile access: the pairing QR code is painted from its module grid; the typed room key is wiped after use.
 qrcodegen.workspace = true
 zeroize.workspace = true
 # Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
 png = "0.18"
+# Chat view images (omp sends blobs as PNG or JPEG); both codecs are already in the lockfile.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Self-update downloads into a temporary folder that is removed afterwards.
 tempfile.workspace = true
 

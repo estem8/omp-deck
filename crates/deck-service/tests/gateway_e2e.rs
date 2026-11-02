@@ -307,6 +307,7 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
         argv: vec!["omp".into()],
         role: SessionRole::Session,
         copy_of: None,
+        view: Default::default(),
     }));
     launch
         .accepted
@@ -315,7 +316,10 @@ fn headless_gateway_controls_real_omp_without_a_gui() {
         .expect("launch accepted");
     let target = match launch.outcome.wait(Duration::from_secs(60)) {
         Some(Ok(Outcome::Done(d))) => match *d {
-            Done::Session(t) => t,
+            Done::Session(t, view) => {
+                assert_eq!(view, deck_core::config::SessionView::Terminal);
+                t
+            }
             other => panic!("launch result: {other:?}"),
         },
         other => panic!("launch outcome: {other:?}"),

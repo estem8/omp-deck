@@ -3,6 +3,7 @@
 
 use std::io::Write as _;
 
+use crate::run_state::{self, RunState};
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
@@ -28,6 +29,8 @@ pub struct SideState {
     pub sync_update: bool,
     /// DECSTBM region as 0-based `[top, bottom)` screen lines; `None` = whole screen.
     pub scroll_region: Option<(u16, u16)>,
+    /// omp's run status: the last OSC 7501 report that was not cleared.
+    pub run_state: Option<RunState>,
 }
 
 /// Maximum title stack depth (same as alacritty).
@@ -69,6 +72,11 @@ impl SideScanner {
 
     pub fn state(&self) -> &SideState {
         &self.tracker.state
+    }
+
+    /// The child ended; its last program status no longer describes a running program.
+    pub fn child_exited(&mut self) {
+        self.tracker.state.run_state = None;
     }
 }
 
@@ -134,6 +142,10 @@ impl Perform for Tracker {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let Some(report) = run_state::parse_osc(params) {
+            report.apply(&mut self.state.run_state);
+            return;
+        }
         if let [b"0" | b"2", rest @ ..] = params
             && !rest.is_empty()
         {
@@ -150,6 +162,7 @@ impl Perform for Tracker {
         // and 2031 are connection properties requested once (ConPTY) and survive.
         if !ignore && intermediates.is_empty() && byte == b'c' {
             self.state.title = None;
+            self.state.run_state = None;
             self.title_stack.clear();
             self.state.scroll_region = None;
         }
@@ -247,6 +260,9 @@ pub fn encode<T>(term: &mut Term<T>, side: &SideState, history_lines: usize) -> 
     }
     if side.win32_input_mode {
         w.out.extend_from_slice(b"\x1b[?9001h");
+    }
+    if let Some(run_state) = &side.run_state {
+        run_state::encode_report(run_state, &mut w.out);
     }
     if side.color_scheme_reports {
         w.out.extend_from_slice(b"\x1b[?2031h");
@@ -790,6 +806,58 @@ mod tests {
         s.advance(b"\x1b[?9001h\x1bc");
         assert_eq!(s.state().title, None);
         assert!(s.state().win32_input_mode);
+    }
+
+    #[test]
+    fn run_state_is_tracked_cleared_and_replayed() {
+        use crate::run_state::{BlockedKind, RunPhase};
+
+        let mut f = Fixture::new(20, 4);
+        assert_eq!(f.side.state().run_state, None);
+        // Split reads, both terminators; the last report wins.
+        f.feed(b"hi\x1b]7501;state=work");
+        f.feed(b"ing:app=omp\x07");
+        assert_eq!(
+            f.side.state().run_state,
+            Some(RunState::new(RunPhase::Working))
+        );
+        f.feed(b"\x1b]7501;state=blocked:kind=question:app=omp:msg=aGk=\x1b\\");
+        let blocked = RunState {
+            state: RunPhase::Blocked {
+                kind: Some(BlockedKind::Question),
+            },
+            msg: Some("hi".into()),
+        };
+        assert_eq!(f.side.state().run_state, Some(blocked.clone()));
+
+        // A late joiner learns the state from the snapshot alone.
+        let b = f.replay(100);
+        assert_eq!(b.side.state().run_state, Some(blocked));
+        assert_eq!(b.side.state(), f.side.state());
+
+        // A malformed report changes nothing; clear removes the record and the replay stays
+        // silent about it.
+        f.feed(b"\x1b]7501;state=bogus\x07");
+        assert!(f.side.state().run_state.is_some());
+        f.feed(b"\x1b]7501;state=clear\x1b\\");
+        assert_eq!(f.side.state().run_state, None);
+        assert_eq!(f.replay(100).side.state().run_state, None);
+    }
+
+    #[test]
+    fn child_exit_and_ris_clear_the_held_run_state() {
+        for reset in [false, true] {
+            let mut f = Fixture::new(20, 4);
+            f.feed(b"\x1b]7501;state=working\x07");
+            assert!(f.side.state().run_state.is_some());
+            if reset {
+                f.feed(b"\x1bc");
+            } else {
+                f.side.child_exited();
+            }
+            assert_eq!(f.side.state().run_state, None);
+            assert_eq!(f.replay(100).side.state().run_state, None);
+        }
     }
 
     #[test]

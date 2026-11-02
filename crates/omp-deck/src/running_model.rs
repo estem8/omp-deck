@@ -67,7 +67,11 @@ pub struct RunRow {
 
 impl RunRow {
     fn new(raw: RunningSession) -> RunRow {
-        let pane_activity = Activity::from_title(raw.title.as_deref());
+        let pane_activity = Activity::derive(
+            raw.run_state.as_ref(),
+            raw.title.as_deref(),
+            raw.tsp_facts.as_ref(),
+        );
         let ram = ram_text(raw.memory);
         RunRow {
             title: raw.name.clone(),
@@ -555,6 +559,8 @@ mod tests {
             backend: MuxKind::Tmux,
             files: Vec::new(),
             title: None,
+            run_state: None,
+            tsp_facts: None,
             cwd: None,
             started: None,
             pid: Some(1),

@@ -25,6 +25,8 @@ serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+# The run-state derivation reads a terminal's TSP document (`statusfmt::Activity::derive`).
+deck-tsp.workspace = true
 env_logger.workspace = true
 # Mobile access (R3): the Noise device protocol and relay wire format, the gateway's blocking relay
 # client (tungstenite + rustls/ring with the webpki roots ureq already uses), and stored keys.
@@ -56,8 +58,6 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shel
 [dev-dependencies]
 deck-service = { path = ".", features = ["test-push-loopback"] }
 tempfile.workspace = true
-# tests/tsp_live.rs: encodes the TSP events a terminal sends (send) and reads the host document.
-deck-tsp.workspace = true
 # tests/remote_device_backup_server.rs: an in-test SSH server (host key only) the backup server
 # destination dials.
 russh.workspace = true

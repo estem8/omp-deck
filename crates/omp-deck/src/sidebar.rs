@@ -17,7 +17,7 @@ use crate::icons::{
     ICON_REFRESH_CW, ICON_ROTATE_CCW, ICON_ROWS_2, ICON_SEARCH, ICON_SEARCH_X, ICON_TERMINAL,
     ICON_TRASH_2, ICON_X,
 };
-use deck_core::config::{ParkedBranch, RemovedWorktree};
+use deck_core::config::{ParkedBranch, RemovedWorktree, SessionView};
 use deck_core::sessions::{ProjectGroup, SessionEntry, SessionsRoot, abbreviate_home};
 use deck_core::worktree::Worktree;
 use egui::collapsing_header::CollapsingState;
@@ -105,9 +105,15 @@ fn split_display(display: &str) -> (&str, &str) {
 #[derive(Clone, Debug)]
 pub enum SidebarAction {
     Open(SessionEntry),
+    OpenView(SessionEntry, SessionView),
+    SwitchView {
+        uid: u64,
+        view: SessionView,
+    },
     /// Show the session's tree (reads the file; no tab needed).
     Tree(SessionEntry),
     New(PathBuf),
+    NewView(PathBuf, SessionView),
     Refresh,
     /// Open the session manager (scoped to this project when given).
     ManageSessions(Option<PathBuf>),
@@ -218,6 +224,8 @@ pub struct SidebarInput<'a> {
     pub refreshing: bool,
     /// Sessions can be stopped (a session backend available).
     pub can_stop: bool,
+    pub default_view: SessionView,
+    pub host_available: bool,
     /// omp was found: session copy/move are offered.
     pub omp_available: bool,
     /// Session files with a move in flight (their copy/move items are disabled).
@@ -733,6 +741,7 @@ fn show_group(
             shown,
             total: family.rows.len(),
             wt_button: wt_allowed,
+            default_view: input.default_view,
         },
         open_t,
         out,
@@ -742,6 +751,19 @@ fn show_group(
         if menu_item(ui, ICON_PLUS, "New session here", None, true, false).clicked() {
             let target = removed.map_or(&group.cwd, |r| &r.primary);
             out.actions.push(SidebarAction::New(target.clone()));
+            out.interacted = true;
+            ui.close();
+        }
+        let (view, _) = view_action(input.default_view, None);
+        let label = if view == SessionView::Chat {
+            "New chat session"
+        } else {
+            "New terminal session"
+        };
+        if menu_item(ui, view_icon(view), label, None, true, false).clicked() {
+            let target = removed.map_or(&group.cwd, |r| &r.primary);
+            out.actions
+                .push(SidebarAction::NewView(target.clone(), view));
             out.interacted = true;
             ui.close();
         }
@@ -1146,6 +1168,7 @@ struct HeaderSpec<'a> {
     total: usize,
     /// Offer the hover button that starts a session in a new worktree.
     wt_button: bool,
+    default_view: SessionView,
 }
 
 /// The header's name and its faint hint: folder name and parent path.
@@ -1172,7 +1195,7 @@ struct HeaderGeom {
 impl HeaderGeom {
     /// Width at the right of the name taken by buttons.
     fn reserved(&self, base: f32) -> f32 {
-        base + if self.wt.is_some() { 28.0 } else { 0.0 }
+        base + 28.0 + if self.wt.is_some() { 28.0 } else { 0.0 }
     }
 }
 
@@ -1200,8 +1223,21 @@ fn group_header(
     let wt_btn = spec
         .wt_button
         .then(|| ui.interact(wt_rect, resp.id.with("new-wt"), Sense::click()));
+    let (view, _) = view_action(spec.default_view, None);
+    let view_rect = plus_rect.translate(vec2(if spec.wt_button { -56.0 } else { -28.0 }, 0.0));
+    let view_button = ui
+        .interact(view_rect, resp.id.with("new-view"), Sense::click())
+        .on_hover_text(if view == SessionView::Chat {
+            "New chat session"
+        } else {
+            "New terminal session"
+        });
     let over = |r: &Option<egui::Response>| r.as_ref().is_some_and(egui::Response::hovered);
-    let hov_raw = resp.hovered() || plus.hovered() || over(&wt_btn) || resp.context_menu_opened();
+    let hov_raw = resp.hovered()
+        || plus.hovered()
+        || view_button.hovered()
+        || over(&wt_btn)
+        || resp.context_menu_opened();
     let ctx = ui.ctx().clone();
     let hover = HeaderHover {
         hov: ctx.animate_bool_with_time(resp.id.with("hov"), hov_raw, 0.1),
@@ -1223,6 +1259,16 @@ fn group_header(
             paint_header_neon(p, pal, spec, (&name, &hint), &geom, open_t, &hover);
         }
         paint_header_extras(p, pal, &geom, &hover);
+        if hover.hov > 0.01 {
+            paint_icon(
+                p,
+                view_rect.center(),
+                Align2::CENTER_CENTER,
+                view_icon(view),
+                16.0,
+                pal.accent,
+            );
+        }
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     group_hover(&resp, spec, &name, open_t);
@@ -1252,7 +1298,13 @@ fn group_header(
         out.interacted = true;
         return none;
     }
-    let toggle = resp.clicked() && !over(&wt_btn) && !plus.hovered();
+    if view_button.clicked() {
+        out.actions
+            .push(SidebarAction::NewView(group.cwd.clone(), view));
+        out.interacted = true;
+        return none;
+    }
+    let toggle = resp.clicked() && !view_button.hovered() && !over(&wt_btn) && !plus.hovered();
     HeaderResult { resp, toggle }
 }
 
@@ -1620,10 +1672,16 @@ fn open_tab_row(
     let close_rect =
         Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(20.0, 20.0));
     let close = ui.interact(close_rect, resp.id.with("close"), Sense::click());
+    let (view, view_label) = view_action(input.default_view, Some(tab.view()));
+    let view_why = view_switch_reason(tab, view, input.host_available);
+    let view_rect = close_rect.translate(vec2(-26.0, 0.0));
+    let view_button = ui
+        .interact(view_rect, resp.id.with("session-view"), Sense::click())
+        .on_hover_text(view_why.unwrap_or(view_label));
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
-        resp.hovered() || close.hovered() || resp.context_menu_opened(),
+        resp.hovered() || close.hovered() || view_button.hovered() || resp.context_menu_opened(),
         0.12,
     );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
@@ -1669,7 +1727,7 @@ fn open_tab_row(
             );
         }
         let text_x = pill.left() + if neutral { 28.0 } else { 32.0 };
-        job.wrap.max_width = (close_rect.left() - 4.0 - text_x).max(10.0);
+        job.wrap.max_width = (view_rect.left() - 4.0 - text_x).max(10.0);
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
         let galley = p.layout_job(job);
@@ -1679,6 +1737,18 @@ fn open_tab_row(
             color,
         );
         if hov > 0.01 {
+            paint_icon(
+                p,
+                view_rect.center(),
+                Align2::CENTER_CENTER,
+                view_icon(view),
+                14.0,
+                if view_why.is_none() {
+                    pal.accent
+                } else {
+                    pal.weak
+                },
+            );
             let ch = ctx.animate_bool_with_time(close.id.with("hov"), close.hovered(), 0.1);
             p.circle_filled(
                 close_rect.center(),
@@ -1700,6 +1770,12 @@ fn open_tab_row(
     tabs::hover_card(&resp, pal, tab, label, status);
     if close.clicked() || resp.middle_clicked() {
         out.actions.push(SidebarAction::CloseTab(i));
+    } else if view_button.clicked() {
+        if view_why.is_none() {
+            out.actions
+                .push(SidebarAction::SwitchView { uid: tab.uid, view });
+            out.interacted = true;
+        }
     } else if resp.clicked() {
         out.actions.push(SidebarAction::ActivateTab(i));
         out.interacted = true;
@@ -1824,6 +1900,29 @@ fn session_row(
                 .collect()
         })
         .unwrap_or_default();
+    let work_slots = slots.len();
+    let view_offer = row_view_action(
+        input.default_view,
+        input
+            .tabs
+            .iter()
+            .find(|t| t.session_path() == Some(entry.path.as_path()))
+            .map(Tab::view),
+        running,
+    );
+    let (other_view, view_label) = view_offer.unwrap_or((input.default_view, "Open"));
+    let view_why = input
+        .tabs
+        .iter()
+        .find(|t| t.session_path() == Some(entry.path.as_path()))
+        .and_then(|t| view_switch_reason(t, other_view, input.host_available));
+    let mut slots = slots;
+    if view_offer.is_some() {
+        slots.push(Slot {
+            icon: view_icon(other_view),
+            enabled: view_why.is_none(),
+        });
+    }
     let pill_rect = rect.shrink2(vec2(2.0, 0.0));
     let btn_rects: Vec<Rect> = (0..slots.len())
         .map(|k| {
@@ -1950,7 +2049,9 @@ fn session_row(
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         let _ = btn.clone().on_hover_ui(|ui| {
-            if let Some(act) = row_acts(&env, entry).get(k) {
+            if k == work_slots {
+                ui.label(view_why.unwrap_or(view_label));
+            } else if let Some(act) = row_acts(&env, entry).get(k) {
                 ui.label(act.button_tip());
             }
         });
@@ -1961,7 +2062,22 @@ fn session_row(
         .find(|(k, b)| b.clicked() && slots[*k].enabled)
         .map(|(k, _)| k);
     if let Some(k) = clicked {
-        if let Some(act) = row_acts(&env, entry).into_iter().nth(k) {
+        if k == work_slots {
+            out.actions.push(
+                match input
+                    .tabs
+                    .iter()
+                    .find(|t| t.session_path() == Some(entry.path.as_path()))
+                {
+                    Some(t) => SidebarAction::SwitchView {
+                        uid: t.uid,
+                        view: other_view,
+                    },
+                    None => SidebarAction::OpenView(entry.clone(), other_view),
+                },
+            );
+            out.interacted = true;
+        } else if let Some(act) = row_acts(&env, entry).into_iter().nth(k) {
             out.actions.push(act.action);
             out.interacted = true;
         }
@@ -2242,6 +2358,9 @@ pub struct MenuEnv<'a> {
     pub omp_available: bool,
     /// Sessions can be stopped and restarted (a session backend available).
     pub can_stop: bool,
+    pub default_view: SessionView,
+    pub host_available: bool,
+    pub tabs: &'a [Tab],
     /// Session files with a move/copy/delete in flight.
     pub busy: &'a HashSet<PathBuf>,
     pub backup: BackupMenu<'a>,
@@ -2275,6 +2394,9 @@ impl SidebarInput<'_> {
             groups: self.groups.unwrap_or(&[]),
             omp_available: self.omp_available,
             can_stop: self.can_stop,
+            default_view: self.default_view,
+            host_available: self.host_available,
+            tabs: self.tabs,
             busy: self.busy,
             backup: self.backup,
             live_tabs: self.open_paths,
@@ -2303,9 +2425,82 @@ pub fn tab_menu(ui: &mut Ui, i: usize, tab: &Tab, env: &MenuEnv<'_>, out: &mut S
         out.actions.push(SidebarAction::KillTab(i));
         ui.close();
     }
+    if entry.is_none() && tab.role == tabs::TabRole::Session {
+        let (view, label) = view_action(env.default_view, Some(tab.view()));
+        let why = view_switch_reason(tab, view, env.host_available);
+        if menu_item(ui, view_icon(view), label, None, why.is_none(), false)
+            .on_disabled_hover_text(why.unwrap_or(""))
+            .clicked()
+        {
+            out.actions
+                .push(SidebarAction::SwitchView { uid: tab.uid, view });
+            ui.close();
+        }
+    }
     if let Some(entry) = entry {
         ui.separator();
         session_menu(ui, entry, running, false, env, out);
+    }
+}
+pub fn view_action(
+    default: SessionView,
+    current: Option<SessionView>,
+) -> (SessionView, &'static str) {
+    match current {
+        Some(SessionView::Terminal) => (SessionView::Chat, "Switch to chat view"),
+        Some(SessionView::Chat) => (SessionView::Terminal, "Switch to terminal view"),
+        None if default == SessionView::Terminal => (SessionView::Chat, "Open in chat view"),
+        None => (SessionView::Terminal, "Open in terminal"),
+    }
+}
+
+fn view_icon(view: SessionView) -> Icon {
+    match view {
+        SessionView::Chat => ICON_MESSAGES_SQUARE,
+        SessionView::Terminal => ICON_TERMINAL,
+    }
+}
+
+/// Detached live sessions attach in their actual mode; only tabs can restart to switch modes.
+fn row_view_action(
+    default: SessionView,
+    current: Option<SessionView>,
+    running: bool,
+) -> Option<(SessionView, &'static str)> {
+    if running && current.is_none() {
+        None
+    } else {
+        Some(view_action(default, current))
+    }
+}
+
+pub fn view_switch_reason(tab: &Tab, view: SessionView, host: bool) -> Option<&'static str> {
+    switch_reason(
+        tab.role == tabs::TabRole::Session && !tab.terminal().is_exited(),
+        tab.session_path().is_some() && tab.mux_name.is_some(),
+        tab.activity() == deck_service::statusfmt::Activity::Idle,
+        view,
+        host,
+    )
+}
+
+fn switch_reason(
+    session: bool,
+    restartable: bool,
+    idle: bool,
+    view: SessionView,
+    host: bool,
+) -> Option<&'static str> {
+    if !session {
+        Some("Select a running session first")
+    } else if !restartable {
+        Some("Wait until the session has been saved on a session backend")
+    } else if view == SessionView::Chat && !host {
+        Some("Chat view requires the OmpDeck session host")
+    } else if !idle {
+        Some("omp is working; wait until the session is idle before switching views")
+    } else {
+        None
     }
 }
 
@@ -2334,6 +2529,24 @@ fn session_menu(
     fn copy(ui: &mut Ui, out: &mut SidebarOutput, text: String, what: &'static str) {
         out.actions.push(SidebarAction::CopyText { text, what });
         ui.close();
+    }
+    let tab = env
+        .tabs
+        .iter()
+        .find(|t| t.session_path() == Some(entry.path.as_path()));
+    if let Some((view, label)) = row_view_action(env.default_view, tab.map(Tab::view), running) {
+        let why = tab.and_then(|t| view_switch_reason(t, view, env.host_available));
+        if menu_item(ui, view_icon(view), label, None, why.is_none(), false)
+            .on_disabled_hover_text(why.unwrap_or(""))
+            .clicked()
+        {
+            out.actions.push(match tab {
+                Some(t) => SidebarAction::SwitchView { uid: t.uid, view },
+                None => SidebarAction::OpenView(entry.clone(), view),
+            });
+            out.interacted = true;
+            ui.close();
+        }
     }
     if menu_item(ui, ICON_PLAY, "Open", None, true, false).clicked() {
         out.actions.push(SidebarAction::Open(entry.clone()));
@@ -2593,6 +2806,9 @@ mod tests {
             groups: &[],
             omp_available: true,
             can_stop: true,
+            default_view: SessionView::Terminal,
+            host_available: true,
+            tabs: &[],
             busy: &busy,
             backup: BackupMenu {
                 place: "Google Drive",
@@ -2656,6 +2872,9 @@ mod tests {
                 groups: &[],
                 omp_available: true,
                 can_stop: true,
+                default_view: SessionView::Terminal,
+                host_available: true,
+                tabs: &[],
                 busy: &busy,
                 backup: BackupMenu {
                     place: "Google Drive",
@@ -2945,5 +3164,69 @@ mod tests {
         assert_eq!(open_set(&ex, &groups), [false, false]);
         ex.set_all(groups.iter().map(|g| g.cwd.as_path()), true);
         assert_eq!(open_set(&ex, &groups), [true, true]);
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::{SessionView, switch_reason, view_action};
+
+    #[test]
+    fn non_default_open_and_current_tab_switch_are_distinct() {
+        assert_eq!(
+            view_action(SessionView::Terminal, None),
+            (SessionView::Chat, "Open in chat view")
+        );
+        assert_eq!(
+            view_action(SessionView::Chat, None),
+            (SessionView::Terminal, "Open in terminal")
+        );
+        for default in [SessionView::Terminal, SessionView::Chat] {
+            assert_eq!(
+                view_action(default, Some(SessionView::Terminal)),
+                (SessionView::Chat, "Switch to chat view")
+            );
+            assert_eq!(
+                view_action(default, Some(SessionView::Chat)),
+                (SessionView::Terminal, "Switch to terminal view")
+            );
+        }
+    }
+
+    #[test]
+    fn menu_and_palette_share_idle_restart_gating() {
+        for view in [SessionView::Terminal, SessionView::Chat] {
+            assert!(switch_reason(false, true, true, view, true).is_some());
+            assert!(switch_reason(true, false, true, view, true).is_some());
+            assert!(switch_reason(true, true, false, view, true).is_some());
+            assert_eq!(switch_reason(true, true, true, view, true), None);
+        }
+        assert!(switch_reason(true, true, true, SessionView::Chat, false).is_some());
+        assert_eq!(
+            switch_reason(true, true, true, SessionView::Terminal, false),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod detached_view_tests {
+    use super::{SessionView, row_view_action, view_action};
+
+    #[test]
+    fn detached_running_sessions_never_promise_a_different_launch_mode() {
+        for default in [SessionView::Terminal, SessionView::Chat] {
+            assert_eq!(row_view_action(default, None, true), None);
+            assert_eq!(
+                row_view_action(default, None, false),
+                Some(view_action(default, None))
+            );
+            for current in [SessionView::Terminal, SessionView::Chat] {
+                assert_eq!(
+                    row_view_action(default, Some(current), true),
+                    Some(view_action(default, Some(current)))
+                );
+            }
+        }
     }
 }

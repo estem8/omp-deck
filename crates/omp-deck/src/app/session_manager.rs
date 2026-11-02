@@ -317,7 +317,7 @@ impl App {
             if let Some(p) = t.session_path() {
                 let l = live.entry(p.to_path_buf()).or_default();
                 l.in_tab = true;
-                l.busy |= Activity::from_title(t.terminal().title()) != Activity::Idle;
+                l.busy |= Activity::of_terminal(t.terminal()) != Activity::Idle;
             }
         }
         self.sessions.model.set_live(live);
@@ -330,7 +330,7 @@ impl App {
                             || t.session_path()
                                 .is_some_and(|p| r.raw.files.iter().any(|f| f == p)))
                 })
-                .map(|t| Activity::from_title(t.terminal().title()))
+                .map(|t| Activity::of_terminal(t.terminal()))
         });
     }
 

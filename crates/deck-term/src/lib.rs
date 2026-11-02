@@ -20,6 +20,7 @@ mod remote;
 mod render;
 mod scan;
 mod theme;
+mod tsp;
 mod wake;
 mod widget;
 
@@ -35,5 +36,7 @@ pub use crate::frontend::{
 pub use crate::out::{InputProgress, wait_detached};
 pub use crate::remote::{Observer, ObserverTx, Remote, RemoteEvent, RemoteRx, RemoteTx};
 pub use crate::theme::{TermColors, TermTheme};
+pub use crate::tsp::{TspHandle, TspRefused};
 pub use crate::wake::WakeCallback;
 pub use crate::widget::{TerminalResponse, TerminalView};
+pub use deck_host::run_state::{BlockedKind, RunPhase, RunState, TspFacts};

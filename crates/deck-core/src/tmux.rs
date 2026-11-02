@@ -298,6 +298,8 @@ impl Tmux {
                 sessions.push(RunningSession {
                     name: row.session.clone(),
                     backend: MuxKind::Tmux,
+                    run_state: None,
+                    tsp_facts: None,
                     files: Vec::new(),
                     title: None,
                     cwd: None,

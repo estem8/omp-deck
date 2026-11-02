@@ -1134,6 +1134,7 @@ mod tests {
                 session_path: None,
                 title: title.to_owned(),
                 role: tabs::TabRole::Session,
+                view: Default::default(),
             },
         )
     }
@@ -1166,6 +1167,9 @@ mod tests {
                     groups: &[],
                     omp_available: true,
                     can_stop: true,
+                    default_view: deck_core::config::SessionView::Terminal,
+                    host_available: true,
+                    tabs: &[],
                     busy: &busy,
                     backup: crate::sidebar::BackupMenu {
                         place: "Google Drive",

@@ -19,6 +19,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{ClipboardType, Config, Osc52, Term, TermMode};
 
+use deck_host::run_state::RunState;
+
 use crate::clipboard::Clipboard;
 use crate::engine::{Engine, OutputEvent, OutputNotify, OutputSubscription};
 use crate::frontend::{
@@ -28,8 +30,9 @@ use crate::graphics::{Graphics, ImageReplay};
 use crate::input::{KeyRules, Mods};
 use crate::out::{PtyOut, Sink, WriteProgress, register_detaching};
 use crate::remote::{self, Feeder, Remote, ScrollKeep};
-use crate::scan::{KeyModes, OutputScan};
+use crate::scan::{KeyModes, OutputScan, RunShared};
 use crate::theme::{self, Palette, TermTheme};
+use crate::tsp::{TspHandle, TspRefused, TspShared};
 use crate::wake::{Wake, WakeCallback};
 use crate::widget::ViewState;
 
@@ -273,7 +276,9 @@ struct Parts {
     gate: Arc<RepaintGate>,
     graphics: Arc<Graphics>,
     key_modes: Arc<KeyModes>,
+    run_state: Arc<RunShared>,
     engine: Arc<Engine>,
+    tsp: Arc<TspShared>,
     window_size: WindowSize,
     wake: Wake,
     /// The owner of its output (publishes to subscribers).
@@ -325,10 +330,14 @@ impl Parts {
         let decode = !(serve && matches!(wake, Wake::Headless(_)));
         let graphics = Arc::new(Graphics::new(ctx.clone(), wake.clone(), decode));
         let key_modes = Arc::new(KeyModes::default());
+        let run_state = Arc::new(RunShared::default());
+        let tsp = Arc::new(TspShared::new());
         let scan = OutputScan::new(
             key_modes.clone(),
+            run_state.clone(),
             graphics.clone(),
             serve.then(ImageReplay::default),
+            tsp.clone(),
         );
         let scroll_keep = Arc::<ScrollKeep>::default();
         let engine = Engine::new(
@@ -350,7 +359,9 @@ impl Parts {
             gate,
             graphics,
             key_modes,
+            run_state,
             engine,
+            tsp,
             window_size,
             wake,
             serve,
@@ -386,6 +397,7 @@ impl Parts {
             palette: Palette::for_theme(opts.theme),
             tmux_client,
             key_modes: self.key_modes,
+            run_state: self.run_state,
             scroll_keep: self.scroll_keep,
             title: None,
             exit_code: None,
@@ -401,6 +413,7 @@ impl Parts {
             gate: self.gate,
             graphics: self.graphics,
             engine: self.engine,
+            tsp: TspHandle(self.tsp),
             serving: self.serve,
             wake: self.wake,
             view: ViewState::default(),
@@ -427,6 +440,8 @@ pub struct Terminal {
     tmux_client: bool,
     /// Keyboard modes requested by the child that `TermMode` lacks (set by the output thread).
     key_modes: Arc<KeyModes>,
+    /// omp's run status from its OSC 7501 reports (set by the output thread).
+    run_state: Arc<RunShared>,
     /// Holds a scrolled-back view across the redraw an app answers a resize with.
     pub(crate) scroll_keep: Arc<ScrollKeep>,
     title: Option<String>,
@@ -450,6 +465,8 @@ pub struct Terminal {
     pub(crate) graphics: Arc<Graphics>,
     /// Output parsing and publication.
     engine: Arc<Engine>,
+    /// The program's TSP surfaces (passive mirror).
+    tsp: TspHandle,
     /// This terminal owns its output (output subscribers, state publication).
     serving: bool,
     wake: Wake,
@@ -779,6 +796,7 @@ impl Terminal {
     /// Records the exit code (the first one wins).
     fn set_exit(&mut self, code: i32) {
         if self.exit_code.is_none() && !self.displaced {
+            self.run_state.clear();
             self.exit_code = Some(code);
             self.banner = Some(format!("[process exited: {code}]"));
         }
@@ -1002,6 +1020,68 @@ impl Terminal {
                 .then(|| self.view.win32_mods.bits()),
         };
         self.out.write(bytes, meta);
+    }
+
+    /// omp's run status as its OSC 7501 reports say (`None` before the first report, after
+    /// `state=clear`, RIS, or child exit). Replayed with the rest of the side state, so a terminal
+    /// attaching mid-turn knows it. omp sends it in classic and in TSP mode; under TSP it is
+    /// the only state omp publishes besides the document, the `π` title being dropped.
+    pub fn run_state(&self) -> Option<RunState> {
+        if self.is_exited() {
+            None
+        } else {
+            self.run_state.get()
+        }
+    }
+
+    /// The program's TSP surfaces, mirrored from its output (never answered here: the
+    /// session host is the only TSP terminal that replies).
+    pub fn tsp(&self) -> TspHandle {
+        self.tsp.clone()
+    }
+
+    /// Sends a terminal → program TSP event to the child's input, through the same checks as
+    /// user input (an observer, a stale or displaced connection and an input hold refuse it).
+    /// Refused instead of silently dropped, so the UI can say so. A frontend can only check
+    /// its own state: its owner may still refuse the bytes later.
+    pub fn send_tsp(&self, event: &deck_tsp::wire::Event) -> Result<(), TspRefused> {
+        self.tsp_gate()?;
+        if self.input_held() {
+            return Err(TspRefused::Held);
+        }
+        self.write_tsp(event);
+        Ok(())
+    }
+
+    /// [`Self::send_tsp`] for an injected command: the injector holds the user's input while its
+    /// job runs, and that hold must not refuse the job's own event (raw [`Self::write`] and
+    /// [`Self::send_key`] bypass it likewise). Every other check applies.
+    pub fn inject_tsp(&self, event: &deck_tsp::wire::Event) -> Result<(), TspRefused> {
+        self.tsp_gate()?;
+        self.write_tsp(event);
+        Ok(())
+    }
+
+    fn tsp_gate(&self) -> Result<(), TspRefused> {
+        if self.read_only {
+            return Err(TspRefused::ReadOnly);
+        }
+        if self.is_exited() {
+            return Err(TspRefused::Exited);
+        }
+        if self.displaced || !self.accepts_input() {
+            return Err(TspRefused::Detached);
+        }
+        if !self.tsp.live() {
+            return Err(TspRefused::NotLive);
+        }
+        Ok(())
+    }
+
+    fn write_tsp(&self, event: &deck_tsp::wire::Event) {
+        let bytes =
+            deck_tsp::terminal::encode_event(event, deck_tsp::terminal::InputEncoding::native());
+        self.write_input(&bytes, false);
     }
 
     /// Whether this connection still owns its write path. Observer and displaced/lost

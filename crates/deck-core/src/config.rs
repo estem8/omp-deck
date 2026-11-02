@@ -131,6 +131,18 @@ pub struct AppConfig {
     pub split: Option<SplitState>,
     /// Lifetime of the per-user mobile-companion gateway (`Off` for configs that predate it).
     pub gateway_mode: GatewayMode,
+    /// How new tabs open: the terminal grid or the native chat view (omp's TSP surface).
+    pub session_view: SessionView,
+}
+
+/// How a session is shown. `Chat` runs omp in Tern Surface Protocol mode on the OmpDeck session
+/// host and renders its surface natively; `Terminal` is the plain terminal grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionView {
+    #[default]
+    Terminal,
+    Chat,
 }
 
 /// How long the per-user gateway owner lives. `Off` disables mobile access and autostart (the
@@ -268,6 +280,7 @@ impl Default for AppConfig {
             parked_branches: Vec::new(),
             split: None,
             gateway_mode: GatewayMode::Off,
+            session_view: SessionView::default(),
         }
     }
 }
@@ -619,6 +632,9 @@ pub struct TabState {
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
+    /// The view the tab was opened in; used when a restore has to create the session again.
+    #[serde(default)]
+    pub view: SessionView,
 }
 
 /// Open tabs remembered per folder (folder-mode launch/restore).
@@ -781,6 +797,7 @@ mod tests {
                 cwd: "/home/u/x".into(),
                 session_path: Some("/s/a.jsonl".into()),
                 title: "T".into(),
+                view: SessionView::Chat,
             }],
             active_tab: Some(0),
             style: UiStyle::Neon,
@@ -1280,6 +1297,50 @@ mod tests {
         assert!(text.contains("\"session_name\""), "{text}");
         assert!(!text.contains("tmux_name"), "{text}");
         assert_eq!(AppConfig::load_from(&p).open_tabs, cfg.open_tabs);
+    }
+
+    #[test]
+    fn session_view_is_lowercase_and_old_state_opens_as_terminal() {
+        assert_eq!(
+            serde_json::to_string(&SessionView::Chat).unwrap(),
+            r#""chat""#
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionView>(r#""terminal""#).unwrap(),
+            SessionView::Terminal
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        // A state file written before views existed: no `session_view`, tabs without `view`.
+        fs::write(
+            &p,
+            r#"{"open_tabs":[{"session_name":"omp-1","cwd":"/w","session_path":null,"title":"t"}],
+                "folder_tabs":{"/w":{"open_tabs":[{"tmux_name":"omp-2","cwd":"/w","session_path":null,"title":"u"}]}}}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_from(&p);
+        assert_eq!(cfg.session_view, SessionView::Terminal);
+        assert_eq!(cfg.open_tabs[0].view, SessionView::Terminal);
+        assert_eq!(
+            cfg.folder_tabs[Path::new("/w")].open_tabs[0].view,
+            SessionView::Terminal
+        );
+        // Chat survives a save/load, both as the default and on a tab.
+        let mut cfg = AppConfig {
+            session_view: SessionView::Chat,
+            ..AppConfig::default()
+        };
+        cfg.open_tabs.push(TabState {
+            session_name: "omp-3".into(),
+            cwd: "/w".into(),
+            session_path: None,
+            title: "c".into(),
+            view: SessionView::Chat,
+        });
+        cfg.save_to(&p).unwrap();
+        let back = AppConfig::load_from(&p);
+        assert_eq!(back.session_view, SessionView::Chat);
+        assert_eq!(back.open_tabs[0].view, SessionView::Chat);
     }
 
     #[test]

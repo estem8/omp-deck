@@ -16,6 +16,8 @@ log.workspace = true
 serde.workspace = true
 # VT snapshot encoder + side-state scanner for output subscribers.
 deck-host.workspace = true
+# Passive mirror of the program's TSP surfaces (chat view data); never answers.
+deck-tsp.workspace = true
 # Kitty graphics decoding; the versions eframe already pulls in.
 png = "0.18"
 miniz_oxide = "0.8"
@@ -36,4 +38,5 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true
 eframe.workspace = true

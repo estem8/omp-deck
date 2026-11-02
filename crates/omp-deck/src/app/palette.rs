@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use deck_core::config::{
-    Density, MAX_PALETTE_RECENT, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiStyle,
+    Density, MAX_PALETTE_RECENT, MAX_UI_SCALE, MIN_UI_SCALE, SessionView, Theme, UiFont, UiStyle,
 };
 use deck_core::omp::UpdateKind;
 use deck_core::sessions::abbreviate_home;
@@ -261,7 +261,11 @@ impl App {
             items.push(Item {
                 target: Target::Command(id.to_owned()),
                 label: label.to_owned(),
-                detail: String::new(),
+                detail: if id.starts_with("view.") || id == "session.open_chat" {
+                    why.unwrap_or_default().to_owned()
+                } else {
+                    String::new()
+                },
                 hint,
                 icon,
                 disabled: why,
@@ -375,6 +379,46 @@ impl App {
             None,
             ICON_CHEVRON_LEFT,
             in_split,
+        );
+
+        if let Some(tab) = session_tab {
+            let (view, _) = crate::sidebar::view_action(self.cfg.session_view, Some(tab.view()));
+            add(
+                if view == SessionView::Chat {
+                    "view.chat"
+                } else {
+                    "view.terminal"
+                },
+                if view == SessionView::Chat {
+                    "View: Switch to chat view"
+                } else {
+                    "View: Switch to terminal view"
+                },
+                None,
+                if view == SessionView::Chat {
+                    ICON_MESSAGES_SQUARE
+                } else {
+                    ICON_TERMINAL
+                },
+                crate::sidebar::view_switch_reason(tab, view, self.host_available()),
+            );
+        }
+        add(
+            "session.open_chat",
+            "Session: Open in chat view",
+            None,
+            ICON_MESSAGES_SQUARE,
+            entry_why.or_else(|| {
+                session_tab
+                    .filter(|t| t.view() != SessionView::Chat)
+                    .and_then(|t| {
+                        crate::sidebar::view_switch_reason(
+                            t,
+                            SessionView::Chat,
+                            self.host_available(),
+                        )
+                    })
+            }),
         );
 
         // Sessions of the active tab.
@@ -1213,6 +1257,33 @@ impl App {
             "split.right" | "split.down" | "split.grid" | "split.unsplit" | "pane.next"
             | "pane.prev" => {
                 self.run_split_command(id);
+            }
+            "view.chat" | "view.terminal" => {
+                if let Some(uid) = self.tabs.get(active).map(|t| t.uid) {
+                    self.request_switch_view(
+                        uid,
+                        if id == "view.chat" {
+                            SessionView::Chat
+                        } else {
+                            SessionView::Terminal
+                        },
+                    );
+                }
+            }
+            "session.open_chat" => {
+                if let Some(e) = entry {
+                    match self
+                        .tabs
+                        .iter()
+                        .find(|t| t.session_path() == Some(e.path.as_path()))
+                        .map(|t| (t.uid, t.view()))
+                    {
+                        Some((uid, SessionView::Terminal)) => {
+                            self.request_switch_view(uid, SessionView::Chat)
+                        }
+                        _ => self.open_session_view(&e, SessionView::Chat),
+                    }
+                }
             }
             "session.new" => {
                 if let Some(cwd) = cwd {

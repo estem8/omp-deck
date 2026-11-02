@@ -1171,6 +1171,7 @@ name = "deck-host"
 version = "0.24.1"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
  "deck-tsp",
  "dirs",
  "getrandom 0.4.3",
@@ -1271,6 +1272,7 @@ dependencies = [
  "alacritty_terminal",
  "arboard",
  "deck-host",
+ "deck-tsp",
  "eframe",
  "egui",
  "egui_system_font_provider",
@@ -1280,6 +1282,7 @@ dependencies = [
  "png",
  "polling",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
@@ -2726,6 +2729,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3646,6 +3651,7 @@ dependencies = [
  "deck-host",
  "deck-service",
  "deck-term",
+ "deck-tsp",
  "dirs",
  "eframe",
  "egui",
@@ -3653,8 +3659,10 @@ dependencies = [
  "embed-resource",
  "env_logger",
  "futures-lite",
+ "image",
  "log",
  "png",
+ "pulldown-cmark",
  "qrcodegen",
  "raw-window-handle",
  "rfd",

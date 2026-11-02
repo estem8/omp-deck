@@ -4,10 +4,15 @@
 //! frontend feeders) runs each chunk through one [`OutputScan`] inside the terminal's engine,
 //! right after the `Term` saw it; the bytes themselves pass unchanged.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
+
+use deck_host::run_state::{Report, RunState, RunStateScanner};
+use deck_tsp::stream::CHUNK_IDLE;
 
 use crate::graphics::{ApcScanner, Command, Graphics, ImageReplay};
+use crate::tsp::{TspShared, may_touch_mirror};
 
 const ESC: u8 = 0x1b;
 
@@ -21,30 +26,73 @@ pub(crate) struct KeyModes {
     pub(crate) win32_input: AtomicBool,
 }
 
+/// omp's run status (OSC 7501) as the output thread last saw it, read by the UI thread.
+#[derive(Debug, Default)]
+pub(crate) struct RunShared(Mutex<Option<RunState>>);
+
+impl RunShared {
+    pub(crate) fn get(&self) -> Option<RunState> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn apply(&self, report: Report) {
+        report.apply(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
 /// The scanners of one terminal's output plus where their results go.
 pub(crate) struct OutputScan {
     mok: MokScanner,
     win32: Win32ModeScanner,
     apc: ApcScanner,
     modes: Arc<KeyModes>,
+    run: RunStateScanner,
+    run_shared: Arc<RunShared>,
+    /// A snapshot replaces the terminal and no report of it arrived yet: the held state is
+    /// the old session's until one does (or [`Self::end_reset`] finds it carried none).
+    reset_pending: bool,
     graphics: Arc<Graphics>,
     /// An owner's retained images, replayed to renderers attaching later.
     replay: Option<ImageReplay>,
+    /// The program's TSP surfaces (passive; shared with the UI through `TspHandle`).
+    tsp: Arc<TspShared>,
+    /// The mirror is between TSP messages (the last chunk left it so).
+    tsp_idle: bool,
+    /// The last chunk fed to the mirror ended in ESC (the next may continue a sequence).
+    tsp_esc_tail: bool,
+    /// The last time a chunk was fed to the mirror that left it not idle.
+    tsp_busy_at: Instant,
 }
 
 impl OutputScan {
     pub(crate) fn new(
         modes: Arc<KeyModes>,
+        run_shared: Arc<RunShared>,
         graphics: Arc<Graphics>,
         replay: Option<ImageReplay>,
+        tsp: Arc<TspShared>,
     ) -> OutputScan {
         OutputScan {
             mok: MokScanner::default(),
             win32: Win32ModeScanner::default(),
             apc: ApcScanner::default(),
             modes,
+            run: RunStateScanner::default(),
+            run_shared,
+            reset_pending: false,
             graphics,
             replay,
+            tsp,
+            tsp_idle: true,
+            tsp_esc_tail: false,
+            tsp_busy_at: Instant::now(),
         }
     }
 
@@ -55,6 +103,10 @@ impl OutputScan {
         }
         if let Some(on) = self.win32.feed(bytes) {
             self.modes.win32_input.store(on, Ordering::Relaxed);
+        }
+        if let Some(report) = self.run.feed(bytes) {
+            self.reset_pending = false;
+            self.run_shared.apply(report);
         }
         let graphics = &self.graphics;
         let replay = &mut self.replay;
@@ -73,6 +125,43 @@ impl OutputScan {
                 graphics.apply(cmd);
             }
         });
+        // Plain output (no ESC, no TSP string half read) never touches the mirror or its lock.
+        if may_touch_mirror(self.tsp_idle && !self.tsp_esc_tail, bytes) {
+            let now = Instant::now();
+            self.tsp_idle = self.tsp.feed(bytes, now);
+            self.tsp_esc_tail = bytes.last() == Some(&ESC);
+            if !self.tsp_idle {
+                self.tsp_busy_at = now;
+            }
+        }
+    }
+
+    /// The mirror is between TSP messages: no APC string is half read and no chunked message
+    /// waits for its next chunk. A subscriber joining now misses nothing.
+    pub(crate) fn tsp_idle(&self) -> bool {
+        self.tsp_idle
+    }
+
+    /// When a mirror that is not idle can no longer be waiting for a chunk (`None`: idle). It
+    /// is the time of the last chunk fed while not idle plus [`CHUNK_IDLE`]; the mirror's own
+    /// sequence is never younger than that, so it has expired by then.
+    pub(crate) fn tsp_deadline(&self) -> Option<Instant> {
+        (!self.tsp_idle).then(|| self.tsp_busy_at + CHUNK_IDLE)
+    }
+
+    /// Lets an abandoned chunk sequence of the mirror expire at `now` (the splitter has no
+    /// clock; expiry otherwise only happens when more output arrives). Returns whether the
+    /// mirror is idle afterwards.
+    pub(crate) fn expire_tsp(&mut self, now: Instant) -> bool {
+        if !self.tsp_idle {
+            self.tsp_idle = self.tsp.feed(&[], now);
+        }
+        self.tsp_idle
+    }
+
+    /// Appends the TSP replay of the program's surfaces (empty when it has none).
+    pub(crate) fn tsp_replay(&self, now: Instant, out: &mut Vec<u8>) {
+        self.tsp.replay(now, out);
     }
 
     /// Appends the APC replay of the retained images (nothing unless this is an owner).
@@ -88,8 +177,28 @@ impl OutputScan {
         self.mok = MokScanner::default();
         self.win32 = Win32ModeScanner::default();
         self.apc = ApcScanner::default();
+        self.run.reset();
+        self.reset_pending = true;
         self.modes.modify_other_keys.store(0, Ordering::Relaxed);
         self.modes.win32_input.store(false, Ordering::Relaxed);
+        self.tsp.reset();
+        self.tsp_idle = true;
+        self.tsp_esc_tail = false;
+    }
+
+    /// The snapshot after [`Self::reset`] was fed completely: a run state it did not carry is
+    /// gone (the replay re-sends the held report, so a missing one means none is held).
+    pub(crate) fn end_reset(&mut self) {
+        if std::mem::take(&mut self.reset_pending) {
+            self.run_shared.clear();
+        }
+    }
+
+    /// Output ended: no program remains to own the held run status.
+    pub(crate) fn finish(&mut self) {
+        self.run.reset();
+        self.reset_pending = false;
+        self.run_shared.clear();
     }
 }
 

@@ -33,6 +33,21 @@ fn exit_code_reported_once() {
 }
 
 #[test]
+fn child_exit_clears_held_run_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let release = dir.path().join("exit");
+    let script = format!(
+        r"printf '\033]7501;state=working\007'; while test ! -e {}; do sleep 0.01; done; exit 0",
+        sh_quote(&release.display().to_string())
+    );
+    let mut t = spawn_sh(&script, false);
+    poll_until(&mut t, "working report", |_, t| t.run_state());
+    std::fs::write(&release, []).expect("release child");
+    poll_until(&mut t, "child exit", |ev, _| ev.exited);
+    assert_eq!(t.run_state(), None);
+}
+
+#[test]
 fn osc11_da1_dsr_replies() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("replies");

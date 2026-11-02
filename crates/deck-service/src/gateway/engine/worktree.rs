@@ -23,7 +23,7 @@ use deck_core::worktree::{
 };
 
 use super::mutate::Post;
-use super::sessions::{LaunchJob, omp_argv};
+use super::sessions::{LaunchJob, Owner, omp_argv};
 use super::{Engine, Fin, JobState};
 use crate::controller::{
     Command, Delivery, Refusal as CtlRefusal, Rejected, RequestKey, RequestRecord, SessionKey,
@@ -1650,11 +1650,13 @@ impl Engine {
             label: entry.title.clone().unwrap_or_default(),
             role: SessionRole::Session,
             copy_of: None,
+            view: self.cfg.session_view,
         };
         self.sess.queue(LaunchJob {
             spec,
             key,
             exact: false,
+            owner: Owner::Snapshot,
             restore: false,
             tool: None,
             confine: None,
@@ -1683,9 +1685,11 @@ impl Engine {
                 argv: omp_argv(None),
                 role: SessionRole::Session,
                 copy_of: None,
+                view: self.cfg.session_view,
             },
             key: Some(key),
             exact: false,
+            owner: Owner::Snapshot,
             restore: false,
             tool: None,
             confine: None,

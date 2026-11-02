@@ -108,6 +108,7 @@ impl App {
             cwd: info.cwd.clone(),
             session_path: info.session_path.clone(),
             title: info.label.clone(),
+            view: info.view,
         });
     }
 

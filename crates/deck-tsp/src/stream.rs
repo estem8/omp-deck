@@ -16,7 +16,9 @@
 //! - One APC string (everything after `ESC _`) is capped at [`MAX_APC`] bytes; a longer one
 //!   is dropped and logged.
 //!
-//! Idle expiry is evaluated when bytes arrive (this crate has no clock or timer).
+//! Idle expiry is evaluated when [`Splitter::feed`] is called, with or without bytes (this
+//! crate has no clock or timer): a caller that must not wait for output that may never come
+//! feeds an empty slice at the current time.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +30,15 @@ pub const MAX_APC: usize = 262_144;
 pub const MAX_BODY: usize = (16usize << 20).div_ceil(3) * 4 + 4096;
 /// A chunk sequence idle this long is dropped.
 pub const CHUNK_IDLE: Duration = Duration::from_secs(1);
+
+/// Body bytes per chunk of [`Splitter::resume_bytes`].
+const RESUME_CHUNK: usize = 65_536;
+/// Parameter of a chunk written by [`Splitter::resume_bytes`]: how many milliseconds old the
+/// sequence's last chunk was. Never part of a [`Message`].
+const RESUME_AGE: &str = "x-resume-age";
+/// Parameter of the marker chunk written by [`Splitter::resume_bytes`] for a sequence whose
+/// remaining chunks are skipped. Never part of a [`Message`].
+const RESUME_SKIP: &str = "x-resume-skip";
 
 /// A message verb (the letter after `tsp;`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +176,67 @@ impl Splitter {
             seen: 0,
             sequence: None,
             skipping: None,
+        }
+    }
+
+    /// No APC string is being read and no chunked message is waiting for its next chunk: the
+    /// stream is at a point where a fresh scanner would see the same messages from here on.
+    /// A lone ESC does not count as in progress. The idle expiry of a pending chunk sequence
+    /// is only evaluated when bytes arrive, so a sequence abandoned by the program keeps this
+    /// `false` until the next output.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, State::Ground | State::Esc) && self.sequence.is_none()
+    }
+
+    /// Appends bytes that, fed to a fresh splitter, leave it in this one's state: a sequence
+    /// being skipped as a `x-resume-skip` chunk, a pending chunk sequence as `m=1` chunks of
+    /// what has arrived (each carrying its age at `now` as `x-resume-age`, so it expires when
+    /// this one does), then the APC string being read (TSP only; other APC strings are not
+    /// buffered). A late joiner given the document's replay and then these bytes sees the
+    /// messages this splitter completes from here on. A lone ESC is resumed as that ESC; an
+    /// idle splitter otherwise appends nothing.
+    pub fn resume_bytes(&self, now: Instant, out: &mut Vec<u8>) {
+        if let Some(id) = &self.skipping {
+            out.extend_from_slice(&encode_message(
+                Verb::Frame,
+                &[("c", id.as_str()), ("m", "1"), (RESUME_SKIP, "1")],
+                b"",
+            ));
+        }
+        if let Some(seq) = &self.sequence {
+            let age = now
+                .saturating_duration_since(seq.last)
+                .as_millis()
+                .to_string();
+            let mut start = 0;
+            let mut first = true;
+            loop {
+                let end = chunk_end(&seq.body, start, RESUME_CHUNK);
+                let mut params: Vec<(&str, &str)> = Vec::new();
+                if first {
+                    params.extend(seq.params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                }
+                params.push(("c", seq.id.as_str()));
+                params.push(("m", "1"));
+                params.push((RESUME_AGE, age.as_str()));
+                out.extend_from_slice(&encode_message(seq.verb, &params, &seq.body[start..end]));
+                first = false;
+                start = end;
+                if start >= seq.body.len() {
+                    break;
+                }
+            }
+        }
+        match (self.state, self.kind) {
+            (State::Esc, _) => out.push(ESC),
+            (State::Apc | State::ApcEsc, Kind::Undecided | Kind::Tsp) => {
+                out.extend_from_slice(b"\x1b_");
+                out.extend_from_slice(&self.buf);
+                if self.state == State::ApcEsc {
+                    out.push(ESC);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -309,6 +381,20 @@ impl Splitter {
             out.push(raw.into_message());
             return;
         };
+        if raw.params.iter().any(|(k, _)| k == RESUME_SKIP) {
+            // The state of a splitter that was skipping this sequence (see `resume_bytes`).
+            self.sequence = None;
+            self.skipping = Some(id);
+            return;
+        }
+        // A resumed chunk is as old as it was at the splitter it resumes.
+        let last = raw
+            .params
+            .iter()
+            .find(|(k, _)| k == RESUME_AGE)
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .and_then(|ms| now.checked_sub(Duration::from_millis(ms)))
+            .unwrap_or(now);
         if let Some(skip) = &self.skipping {
             if *skip == id {
                 if !more {
@@ -321,7 +407,7 @@ impl Splitter {
         match self.sequence.take() {
             Some(mut seq) if seq.id == id && seq.verb == raw.verb => {
                 seq.body.extend_from_slice(&raw.body);
-                seq.last = now;
+                seq.last = last;
                 if seq.body.len() > MAX_BODY {
                     log::warn!("chunked TSP message c={id} dropped: over {MAX_BODY} bytes");
                     if more {
@@ -343,7 +429,7 @@ impl Splitter {
                 }
                 let verb = raw.verb;
                 let mut params = raw.params;
-                params.retain(|(k, _)| k != "c" && k != "m");
+                params.retain(|(k, _)| !is_framing(k));
                 if raw.body.len() > MAX_BODY {
                     log::warn!("chunked TSP message c={id} dropped: over {MAX_BODY} bytes");
                     if more {
@@ -355,7 +441,7 @@ impl Splitter {
                         verb,
                         params,
                         body: raw.body,
-                        last: now,
+                        last,
                     });
                 } else {
                     out.push(Message {
@@ -375,6 +461,11 @@ impl Splitter {
     }
 }
 
+/// Whether parameter `key` belongs to the chunk framing (and is not part of the message).
+fn is_framing(key: &str) -> bool {
+    matches!(key, "c" | "m" | RESUME_AGE | RESUME_SKIP)
+}
+
 struct Raw {
     verb: Verb,
     params: Vec<(String, String)>,
@@ -383,7 +474,7 @@ struct Raw {
 
 impl Raw {
     fn into_message(mut self) -> Message {
-        self.params.retain(|(k, _)| k != "c" && k != "m");
+        self.params.retain(|(k, _)| !is_framing(k));
         Message {
             verb: self.verb,
             params: self.params,
@@ -681,6 +772,242 @@ mod tests {
         // The skip ended with the last chunk: the id is usable again.
         let again = encode_message(Verb::Frame, &[("c", "k")], b"{}");
         assert_eq!(s.feed(&again, late).len(), 1);
+    }
+
+    #[test]
+    fn is_idle_follows_apc_and_chunk_sequence_state_at_every_byte() {
+        let start = t0();
+        let mut s = Splitter::new();
+        assert!(s.is_idle());
+
+        // Inside an APC string (any APC, kitty graphics too) it is busy at every byte but
+        // the last, and idle again after the terminator.
+        for wire in [
+            encode_message(Verb::Frame, &[], br#"{"sf":"a","s":1,"ops":[]}"#),
+            b"\x1b_Gf=24,s=1,v=1;AAAA\x1b\\".to_vec(),
+        ] {
+            for end in 1..=wire.len() {
+                let mut s = Splitter::new();
+                s.feed(&wire[..end], start);
+                let inside = (2..wire.len()).contains(&end);
+                assert_eq!(s.is_idle(), !inside, "{end} of {} bytes", wire.len());
+            }
+        }
+
+        // A chunk sequence is pending from its first chunk to its last, however the chunks'
+        // bytes arrive, and plain output in between does not end it.
+        let first = encode_message(Verb::Frame, &[("c", "q"), ("m", "1")], br#"{"sf":"a","#);
+        let last = encode_message(Verb::Frame, &[("c", "q")], br#""s":1,"ops":[]}"#);
+        assert_eq!(s.feed(&first, start).len(), 0);
+        assert!(!s.is_idle());
+        s.feed(b"plain output\r\n\x1b[31mred\x1b[0m", start);
+        assert!(!s.is_idle(), "non-TSP output leaves the sequence pending");
+        assert_eq!(s.feed(&last, start).len(), 1);
+        assert!(s.is_idle());
+
+        // Interrupted by another TSP message: the sequence is dropped, the stream idle.
+        s.feed(&first, start);
+        assert!(!s.is_idle());
+        let other = encode_message(Verb::Open, &[], b"{}");
+        assert_eq!(s.feed(&other, start).len(), 1);
+        assert!(s.is_idle());
+
+        // Expired: evaluated when bytes arrive, so it stays pending until then.
+        s.feed(&first, start);
+        let late = start + CHUNK_IDLE + Duration::from_millis(1);
+        assert!(!s.is_idle(), "no clock of its own");
+        s.feed(b"x", late);
+        assert!(s.is_idle());
+
+        // A lone ESC between sequences is not an APC in progress.
+        s.feed(b"\x1b", late);
+        assert!(s.is_idle());
+    }
+
+    #[test]
+    fn resume_bytes_bring_a_fresh_splitter_to_the_same_state_at_every_offset() {
+        let start = t0();
+        let body = format!(
+            r#"{{"sf":"a","s":1,"ops":[["add","n","a",null,{{"id":"n","k":"text","p":{{"text":"{}"}}}}]]}}"#,
+            "é€;k=v;😀".repeat(40)
+        );
+        let mut wire = encode_message(Verb::Open, &[], br#"{"id":"a"}"#);
+        wire.extend_from_slice(b"\x1b_Gf=24;AAAA\x1b\\plain\x1b[1m");
+        wire.extend(encode_chunked(
+            Verb::Frame,
+            &[("k", "v")],
+            body.as_bytes(),
+            37,
+            "seq1",
+        ));
+        wire.extend(encode_message(Verb::Blob, &[("mime", "x/y")], b"QUJD"));
+        wire.extend(encode_chunked(
+            Verb::Frame,
+            &[],
+            body.as_bytes(),
+            61,
+            "seq2",
+        ));
+
+        let mut checked_pending = 0;
+        for k in 0..=wire.len() {
+            let mut a = Splitter::new();
+            a.feed(&wire[..k], start);
+            let mut b = Splitter::new();
+            let mut resume = Vec::new();
+            a.resume_bytes(start, &mut resume);
+            assert!(
+                b.feed(&resume, start).is_empty(),
+                "offset {k}: nothing completes in the resume bytes"
+            );
+            if !resume.is_empty() {
+                checked_pending += 1;
+            }
+            if a.is_idle() {
+                assert!(
+                    resume.is_empty() || resume == [ESC],
+                    "offset {k}: an idle splitter resumes at most a lone ESC"
+                );
+            }
+            let rest_a = a.feed(&wire[k..], start);
+            let rest_b = b.feed(&wire[k..], start);
+            assert_eq!(rest_a, rest_b, "offset {k}");
+        }
+        assert!(checked_pending > 100, "{checked_pending}");
+
+        // A body past one chunk of the resume encoding: re-encoded in pieces, joined again.
+        let big = "x".repeat(RESUME_CHUNK * 2 + 10);
+        let mut a = Splitter::new();
+        a.feed(
+            &encode_message(Verb::Blob, &[("c", "big"), ("m", "1")], big.as_bytes()),
+            start,
+        );
+        let mut resume = Vec::new();
+        a.resume_bytes(start, &mut resume);
+        let mut b = Splitter::new();
+        assert!(b.feed(&resume, start).is_empty());
+        let end = encode_message(Verb::Blob, &[("c", "big")], b"END");
+        let got = b.feed(&end, start);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body.len(), big.len() + 3);
+        assert_eq!(a.feed(&end, start), got);
+    }
+
+    #[test]
+    fn resume_bytes_carry_a_skipped_sequence_at_every_offset() {
+        let start = t0();
+        let late = start + CHUNK_IDLE + Duration::from_millis(1);
+        let chunk = |more: bool, body: &[u8]| {
+            let mut p = vec![("c", "k")];
+            if more {
+                p.push(("m", "1"));
+            }
+            encode_message(Verb::Frame, &p, body)
+        };
+        // The rest of a sequence that timed out, then a message and a whole sequence.
+        let mut wire = chunk(true, b"\"b\":");
+        wire.extend(chunk(true, b"2,"));
+        wire.extend(chunk(false, b"\"c\":3}"));
+        wire.extend(encode_message(Verb::Open, &[], br#"{"id":"a"}"#));
+        wire.extend(encode_chunked(
+            Verb::Frame,
+            &[],
+            b"{\"whole\":true}",
+            5,
+            "k2",
+        ));
+
+        let mut with_marker = 0;
+        for k in 0..=wire.len() {
+            let mut a = Splitter::new();
+            assert!(a.feed(&chunk(true, b"{\"a\":1,"), start).is_empty());
+            let mut got_a = a.feed(&wire[..k], late);
+            let mut resume = Vec::new();
+            a.resume_bytes(late, &mut resume);
+            let mut b = Splitter::new();
+            assert!(b.feed(&resume, late).is_empty(), "offset {k}");
+            if resume
+                .windows(RESUME_SKIP.len())
+                .any(|w| w == RESUME_SKIP.as_bytes())
+            {
+                with_marker += 1;
+            }
+            let got_b = b.feed(&wire[k..], late);
+            got_a.extend(a.feed(&wire[k..], late));
+            assert_eq!(got_b, got_a[got_a.len() - got_b.len()..], "offset {k}");
+            assert_eq!(
+                got_a.len(),
+                2,
+                "offset {k}: the skipped tail is not a message"
+            );
+            assert_eq!(got_a[0].verb, Verb::Open);
+            assert_eq!(got_a[1].body, b"{\"whole\":true}");
+        }
+        assert!(with_marker > 10, "{with_marker}");
+    }
+
+    #[test]
+    fn resume_bytes_carry_an_oversized_sequence_being_skipped() {
+        let start = t0();
+        let piece = vec![b'x'; 200_000];
+        let n = MAX_BODY / piece.len() + 2;
+        let chunk = |more: bool| {
+            let mut p = vec![("c", "big")];
+            if more {
+                p.push(("m", "1"));
+            }
+            encode_message(Verb::Blob, &p, &piece)
+        };
+        let mut a = Splitter::new();
+        for _ in 0..n - 1 {
+            assert!(a.feed(&chunk(true), start).is_empty());
+        }
+        assert!(a.is_idle(), "the oversized sequence was dropped");
+        let mut resume = Vec::new();
+        a.resume_bytes(start, &mut resume);
+        assert!(!resume.is_empty(), "its remaining chunks are still skipped");
+        let mut b = Splitter::new();
+        assert!(b.feed(&resume, start).is_empty());
+        let rest = [chunk(true), chunk(false)].concat();
+        let open = encode_message(Verb::Open, &[], b"{}");
+        assert!(b.feed(&rest, start).is_empty(), "the tail is not a message");
+        assert_eq!(b.feed(&open, start).len(), 1);
+        assert!(a.feed(&rest, start).is_empty());
+        assert_eq!(a.feed(&open, start).len(), 1);
+        // Once the skip ended, the id is free again on the resumed splitter too.
+        let again = encode_message(Verb::Blob, &[("c", "big")], b"QUJD");
+        assert_eq!(b.feed(&again, start).len(), 1);
+    }
+
+    #[test]
+    fn a_resumed_sequence_expires_when_the_original_does() {
+        let start = t0();
+        let first = encode_message(Verb::Frame, &[("c", "k"), ("m", "1")], b"{\"a\":");
+        let rest = encode_message(Verb::Frame, &[("c", "k")], b"1}");
+        let mut a = Splitter::new();
+        a.feed(&first, start);
+
+        // Resumed 900 ms into its life (any later wall time on the resumed side).
+        let at = start + Duration::from_millis(900);
+        let mut resume = Vec::new();
+        a.resume_bytes(at, &mut resume);
+        let base = start + Duration::from_secs(60);
+
+        // 100 ms later it is not yet old enough to drop, at both ends.
+        let mut b = Splitter::new();
+        assert!(b.feed(&resume, base).is_empty());
+        let got = b.feed(&rest, base + Duration::from_millis(99));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got, a.feed(&rest, at + Duration::from_millis(99)));
+
+        // 200 ms later both dropped it (the resumed one does not start its second over).
+        let mut a = Splitter::new();
+        a.feed(&first, start);
+        let mut b = Splitter::new();
+        assert!(b.feed(&resume, base).is_empty());
+        assert!(b.feed(&rest, base + Duration::from_millis(200)).is_empty());
+        assert!(a.feed(&rest, at + Duration::from_millis(200)).is_empty());
+        assert!(a.is_idle() && b.is_idle());
     }
 
     #[test]

@@ -784,7 +784,7 @@ impl App {
                 app.wt.continuing.remove(&key);
                 app.refresh_sessions();
                 match r {
-                    Ok(Done::Session(target)) if open => {
+                    Ok(Done::Session(target, _)) if open => {
                         let text = match place {
                             ContinueIn::Main => format!("The main checkout is on {branch} now"),
                             _ => format!("Continuing “{branch}”"),
@@ -1021,7 +1021,12 @@ impl App {
     /// then the tab opens on the moved file there. When the move fails the session opens as
     /// before (launched in the primary) with an error toast; when its file is gone by then
     /// (another move got it first) the fresh scan is searched for the session by id.
-    pub(super) fn open_relocated(&mut self, entry: &SessionEntry, primary: PathBuf) {
+    pub(super) fn open_relocated(
+        &mut self,
+        entry: &SessionEntry,
+        primary: PathBuf,
+        view: deck_core::config::SessionView,
+    ) {
         if !self.wt.in_flight.insert(entry.path.clone()) {
             self.toasts.info(
                 &self.ctx,
@@ -1048,7 +1053,7 @@ impl App {
                 match moved {
                     Ok(new_path) => {
                         app.refresh_sessions();
-                        app.open_entry_at(&entry, new_path, primary);
+                        app.open_entry_view(&entry, new_path, primary, view);
                     }
                     Err(e) => {
                         app.toasts.error(
@@ -1062,7 +1067,9 @@ impl App {
                         let old = entry.path.clone();
                         app.gw.native(
                             move || old.exists(),
-                            move |app, exists| app.open_after_failed_move(&entry, primary, exists),
+                            move |app, exists| {
+                                app.open_after_failed_move(&entry, primary, exists, view)
+                            },
                         );
                     }
                 }
@@ -1072,9 +1079,15 @@ impl App {
 
     /// The move of `entry` failed: open its file where it is, or — when it no longer exists —
     /// the session with the same id from the latest scan.
-    fn open_after_failed_move(&mut self, entry: &SessionEntry, primary: PathBuf, exists: bool) {
+    fn open_after_failed_move(
+        &mut self,
+        entry: &SessionEntry,
+        primary: PathBuf,
+        exists: bool,
+        view: deck_core::config::SessionView,
+    ) {
         if exists {
-            self.open_entry_at(entry, entry.path.clone(), primary);
+            self.open_entry_view(entry, entry.path.clone(), primary, view);
             return;
         }
         self.refresh_sessions();
@@ -1085,7 +1098,9 @@ impl App {
                 .cloned()
         });
         match moved {
-            Some(found) => self.open_entry_at(&found, found.path.clone(), found.cwd.clone()),
+            Some(found) => {
+                self.open_entry_view(&found, found.path.clone(), found.cwd.clone(), view)
+            }
             None => self.toasts.error(
                 &self.ctx,
                 "The session's file is gone — rescan and try again",

@@ -237,6 +237,7 @@ impl SettingsState {
 
 pub struct SettingsInput<'a> {
     pub font_size: f32,
+    pub session_view: deck_core::config::SessionView,
     pub font_range: (f32, f32),
     pub font_default: f32,
     /// App-wide scale (egui zoom, 1.0 = 100 %).
@@ -301,6 +302,7 @@ pub enum SettingsAction {
     Backup(BackupAction),
     /// Where new sessions run (Unix: tmux or the OmpDeck host).
     SessionBackend(BackendChoice),
+    SessionView(deck_core::config::SessionView),
     /// The project sync page.
     Sync(SyncAction),
     Notify(NotifyAction),
@@ -1220,6 +1222,35 @@ fn ui_font_row(ui: &mut Ui, current: UiFont, actions: &mut Vec<SettingsAction>) 
 fn general_cards(ui: &mut Ui, input: &SettingsInput<'_>, actions: &mut Vec<SettingsAction>) {
     let pal = Palette::of_ui(ui);
     card(ui, "Sessions", |ui| {
+        setting_row(
+            ui,
+            "Open sessions in",
+            "Chat view runs sessions on the OmpDeck session host",
+            |ui| {
+                let mut view = input.session_view;
+                egui::ComboBox::from_id_salt("session-view")
+                    .selected_text(if view == deck_core::config::SessionView::Chat {
+                        "Chat view"
+                    } else {
+                        "Terminal"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut view,
+                            deck_core::config::SessionView::Terminal,
+                            "Terminal",
+                        );
+                        ui.selectable_value(
+                            &mut view,
+                            deck_core::config::SessionView::Chat,
+                            "Chat view",
+                        );
+                    });
+                if view != input.session_view {
+                    actions.push(SettingsAction::SessionView(view));
+                }
+            },
+        );
         if cfg!(windows) {
             setting_row(
                 ui,

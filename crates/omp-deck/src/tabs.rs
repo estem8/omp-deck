@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use deck_core::config::SessionView;
 use deck_core::mux::is_noise_title;
 use deck_core::omp::UpdateKind;
 use deck_service::controller::{ActionFacts, SessionTarget};
@@ -14,7 +15,8 @@ use deck_term::Terminal;
 
 use crate::badge::{self, Hue};
 use crate::icons::{
-    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_SPARKLES, ICON_TERMINAL, ICON_X, Icon,
+    ICON_CIRCLE_CHECK, ICON_CIRCLE_X, ICON_DOWNLOAD, ICON_MESSAGES_SQUARE, ICON_SPARKLES,
+    ICON_TERMINAL, ICON_X, Icon,
 };
 use crate::titlebar::strip_omp_prefix;
 use crate::{card, tips};
@@ -26,6 +28,14 @@ use egui::{
 use crate::sidebar::{self, MenuEnv, SidebarAction, SidebarOutput};
 use crate::theme::{self, Palette, skin};
 use crate::widgets::paint_icon;
+
+fn session_icon(chat: bool) -> Icon {
+    if chat {
+        ICON_MESSAGES_SQUARE
+    } else {
+        ICON_TERMINAL
+    }
+}
 
 /// What a terminal tab runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +77,9 @@ pub struct Tab {
     pub ctl_seen: bool,
     /// When the tab was spawned (a freshly launched omp needs a moment to open its socket).
     pub spawned: Instant,
+    /// The view the launch (or the last restart) reported; the gateway's record, once it
+    /// describes the attached session, takes over (see [`Tab::view`]).
+    view: SessionView,
 }
 
 /// A copy in progress: the tab runs `omp --fork <src>`; the gateway finds the new session file
@@ -95,6 +108,7 @@ impl Tab {
             uid,
             ctl_seen: false,
             spawned: Instant::now(),
+            view: launch.view,
         }
     }
 }
@@ -106,6 +120,8 @@ pub struct TabLaunch {
     pub session_path: Option<PathBuf>,
     pub title: String,
     pub role: TabRole,
+    /// The view the session runs in (as the gateway reported it at launch).
+    pub view: SessionView,
 }
 
 impl Tab {
@@ -130,6 +146,25 @@ impl Tab {
     /// The gateway's latest record of the session, `None` until it appeared in the cache.
     pub fn info(&self) -> Option<&ControllerInfo> {
         self.info.as_ref()
+    }
+
+    /// The view the session runs in: the gateway's record of the attached generation, until that
+    /// arrives the one the launch or restart reported.
+    pub fn view(&self) -> SessionView {
+        match &self.info {
+            Some(i)
+                if i.target.key == self.target.key
+                    && i.target.generation >= self.target.generation =>
+            {
+                i.view
+            }
+            _ => self.view,
+        }
+    }
+
+    /// A restart reported the view the relaunched session runs in.
+    pub fn set_view(&mut self, view: SessionView) {
+        self.view = view;
     }
 
     /// Takes the gateway's record. A recorded file catches up with a hint sent by this window; a
@@ -224,14 +259,17 @@ impl Tab {
                 theme::mix(pal.weak, pal.accent_a, sel.max(0.6)),
             )
         } else {
-            (ICON_TERMINAL, theme::mix(pal.weak, pal.accent_b, sel))
+            (
+                session_icon(self.term.tsp().live()),
+                theme::mix(pal.weak, pal.accent_b, sel),
+            )
         }
     }
 
     pub fn activity(&self) -> Activity {
         self.info
             .as_ref()
-            .map_or_else(|| Activity::from_title(self.term.title()), |i| i.activity)
+            .map_or_else(|| Activity::of_terminal(&self.term), |i| i.activity)
     }
 
     pub fn pending_switch(&self) -> Option<&SwitchInfo> {
@@ -350,6 +388,8 @@ pub struct ClosedTab {
     pub cwd: PathBuf,
     pub session_path: Option<PathBuf>,
     pub title: String,
+    /// The view to open it in again.
+    pub view: SessionView,
 }
 
 impl ClosedTab {
@@ -778,5 +818,15 @@ mod tests {
         assert_eq!(active_after_close(1, 1, 3), 1); // closed active, next slides in
         assert_eq!(active_after_close(2, 2, 3), 1); // closed last active
         assert_eq!(active_after_close(0, 0, 1), 0); // empty: clamped to 0
+    }
+}
+
+#[cfg(test)]
+mod session_icon_tests {
+    #[test]
+    fn live_chat_has_a_distinct_glyph() {
+        assert_eq!(super::session_icon(true), super::ICON_MESSAGES_SQUARE);
+        assert_eq!(super::session_icon(false), super::ICON_TERMINAL);
+        assert_ne!(super::session_icon(true), super::session_icon(false));
     }
 }

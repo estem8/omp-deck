@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use deck_core::mux::session_name_for;
-use deck_core::mux::{Mux, MuxKind};
+use deck_core::mux::{Mux, MuxKind, PaneStatus};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +41,9 @@ pub struct RunningSnapshot {
     /// Backend of each live session (the first one listing it); empty when unknown.
     owners: HashMap<String, MuxKind>,
     held: HashMap<PathBuf, String>,
-    /// What omp reports in the terminal title of each live session (`Activity::Unknown` is not
-    /// stored). Only state changes alter the snapshot, not spinner frames.
+    /// What omp reports of each live session, by its OSC 7501 run state and else its terminal
+    /// title (`Activity::Unknown` is not stored). Only state changes alter the snapshot, not
+    /// spinner frames.
     activities: HashMap<String, Activity>,
     /// Live sessions whose live-control endpoint exists (a background fork may use it).
     pub ctl: HashSet<String>,
@@ -76,7 +77,7 @@ impl RunningSnapshot {
         self
     }
 
-    /// What live session `name` is doing, from its terminal title; `Unknown` without one.
+    /// What live session `name` is doing, from its run state or title; `Unknown` without one.
     pub fn activity_of(&self, name: &str) -> Activity {
         self.activities
             .get(name)
@@ -314,8 +315,8 @@ struct Polled {
     kind: MuxKind,
     alive: HashSet<String>,
     files: HashMap<String, Vec<PathBuf>>,
-    /// Session name → current terminal title.
-    titles: HashMap<String, String>,
+    /// Session name → current terminal title and run state.
+    status: HashMap<String, PaneStatus>,
 }
 
 /// Whether a session's control endpoint is up: its `ctl.sock` (Unix) or its named pipe
@@ -332,16 +333,16 @@ pub fn ctl_endpoint_exists(dir: &Path) -> bool {
 fn poll(muxes: &[Mux], sessions_root: &Path) -> RunningSnapshot {
     merge(muxes.iter().map(|mux| {
         let alive = mux.alive_sessions();
-        let (files, titles) = if alive.is_empty() {
+        let (files, status) = if alive.is_empty() {
             (HashMap::new(), HashMap::new())
         } else {
-            (mux.session_files(sessions_root), mux.pane_titles())
+            (mux.session_files(sessions_root), mux.pane_status())
         };
         Polled {
             kind: mux.kind(),
             alive,
             files,
-            titles,
+            status,
         }
     }))
 }
@@ -363,8 +364,12 @@ fn merge(polled: impl IntoIterator<Item = Polled>) -> RunningSnapshot {
                 files.insert(name, list);
             }
         }
-        for (name, title) in p.titles {
-            let activity = Activity::from_title(Some(&title));
+        for (name, status) in p.status {
+            let activity = Activity::derive(
+                status.run_state.as_ref(),
+                status.title.as_deref(),
+                status.tsp_facts.as_ref(),
+            );
             if activity != Activity::Unknown && owners.get(&name) == Some(&p.kind) {
                 activities.insert(name, activity);
             }
@@ -464,7 +469,7 @@ mod tests {
                 .iter()
                 .map(|(n, f)| ((*n).to_owned(), f.iter().map(PathBuf::from).collect()))
                 .collect(),
-            titles: HashMap::new(),
+            status: HashMap::new(),
         }
     }
 
@@ -492,15 +497,20 @@ mod tests {
 
     #[test]
     fn titles_become_activity_of_the_owning_backend_only() {
+        let title = |t: &str| PaneStatus {
+            title: Some(t.to_owned()),
+            run_state: None,
+            tsp_facts: None,
+        };
         let mut tmux = polled(MuxKind::Tmux, &[], &["omp-a", "omp-b", "omp-c"]);
-        tmux.titles = [
-            ("omp-a".to_owned(), "π > proj".to_owned()),
-            ("omp-b".to_owned(), "π ⠦ proj".to_owned()),
-            ("omp-c".to_owned(), "bash".to_owned()),
+        tmux.status = [
+            ("omp-a".to_owned(), title("π > proj")),
+            ("omp-b".to_owned(), title("π ⠦ proj")),
+            ("omp-c".to_owned(), title("bash")),
         ]
         .into();
         let mut host = polled(MuxKind::Host, &[], &["omp-a"]);
-        host.titles = [("omp-a".to_owned(), "π ! stale".to_owned())].into();
+        host.status = [("omp-a".to_owned(), title("π ! stale"))].into();
         let s = merge([tmux, host]);
         assert_eq!(s.activity_of("omp-a"), Activity::Idle, "first backend wins");
         assert_eq!(s.activity_of("omp-b"), Activity::Busy);
@@ -510,6 +520,82 @@ mod tests {
             "not an omp title"
         );
         assert_eq!(s.activity_of("omp-zzz"), Activity::Unknown);
+    }
+
+    #[test]
+    fn a_host_run_state_gives_activity_without_an_omp_title() {
+        use deck_term::{BlockedKind, RunPhase, RunState};
+        let run = |phase| PaneStatus {
+            title: Some("omp".to_owned()),
+            run_state: Some(RunState::new(phase)),
+            tsp_facts: None,
+        };
+        let mut host = polled(
+            MuxKind::Host,
+            &[],
+            &["omp-w", "omp-d", "omp-q", "omp-plain", "omp-both"],
+        );
+        host.status = [
+            ("omp-w".to_owned(), run(RunPhase::Working)),
+            ("omp-d".to_owned(), run(RunPhase::Done)),
+            (
+                "omp-q".to_owned(),
+                run(RunPhase::Blocked {
+                    kind: Some(BlockedKind::Question),
+                }),
+            ),
+            (
+                "omp-plain".to_owned(),
+                PaneStatus {
+                    title: Some("omp".to_owned()),
+                    run_state: None,
+                    tsp_facts: None,
+                },
+            ),
+            // A held report wins over a contradicting classic title.
+            (
+                "omp-both".to_owned(),
+                PaneStatus {
+                    title: Some("π > proj".to_owned()),
+                    run_state: Some(RunState::new(RunPhase::Working)),
+                    tsp_facts: None,
+                },
+            ),
+        ]
+        .into();
+        let s = merge([host]);
+        assert_eq!(s.activity_of("omp-w"), Activity::Busy);
+        assert_eq!(s.activity_of("omp-d"), Activity::Idle);
+        assert_eq!(s.activity_of("omp-q"), Activity::Attention);
+        assert_eq!(s.activity_of("omp-plain"), Activity::Unknown);
+        assert_eq!(s.activity_of("omp-both"), Activity::Busy);
+    }
+
+    #[test]
+    fn a_tsp_document_gives_a_host_session_activity_when_nothing_else_does() {
+        use deck_term::TspFacts;
+        let docked = |asking, working, composer| PaneStatus {
+            title: Some("omp".to_owned()),
+            run_state: None,
+            tsp_facts: Some(TspFacts {
+                asking,
+                working,
+                composer,
+            }),
+        };
+        let mut host = polled(MuxKind::Host, &[], &["omp-i", "omp-b", "omp-a", "omp-e"]);
+        host.status = [
+            ("omp-i".to_owned(), docked(false, false, true)),
+            ("omp-b".to_owned(), docked(false, true, true)),
+            ("omp-a".to_owned(), docked(true, false, false)),
+            ("omp-e".to_owned(), docked(false, false, false)),
+        ]
+        .into();
+        let s = merge([host]);
+        assert_eq!(s.activity_of("omp-i"), Activity::Idle);
+        assert_eq!(s.activity_of("omp-b"), Activity::Busy);
+        assert_eq!(s.activity_of("omp-a"), Activity::Attention);
+        assert_eq!(s.activity_of("omp-e"), Activity::Unknown);
     }
 
     #[test]

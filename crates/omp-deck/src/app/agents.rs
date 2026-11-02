@@ -465,6 +465,7 @@ impl App {
                     cwd: card.cwd.clone(),
                     session_path: card.session.clone(),
                     title: card.title.clone(),
+                    view: self.cfg.session_view,
                 };
                 self.open_resolved(req);
                 self.close_dashboard();

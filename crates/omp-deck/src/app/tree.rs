@@ -228,7 +228,7 @@ impl App {
             .or_else(|| {
                 self.tabs
                     .get(self.active)
-                    .map(|t| Activity::from_title(t.terminal().title()) == Activity::Idle)
+                    .map(|t| Activity::of_terminal(t.terminal()) == Activity::Idle)
             })
             .unwrap_or(false);
         if idle {
@@ -477,6 +477,7 @@ impl App {
                 cwd: busy.cwd.clone(),
                 session_path: Some(file),
                 title: format!("{} (fork)", busy.title),
+                view: self.cfg.session_view,
             },
             focus,
         );

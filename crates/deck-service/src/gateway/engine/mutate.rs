@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::sessions::LaunchJob;
+use super::sessions::{LaunchJob, Owner};
 use super::{Engine, Fin, JobState, Msg, Sched, lock};
 use crate::controller::{RequestKey, ServiceEpoch, Submission, Submitted};
 use crate::gateway::desktop;
@@ -19,6 +19,7 @@ use crate::gateway::protocol::{
 };
 use crate::settings::{Field, SettingsError, Snapshot};
 use deck_core::backup::Destination;
+use deck_core::config::SessionView;
 
 /// Progress events of one job are sent at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(150);
@@ -558,19 +559,20 @@ impl Engine {
                     spec,
                     key: Some(key),
                     exact: false,
+                    owner: Owner::Snapshot,
                     restore: false,
                     tool: None,
                     confine,
                 });
                 self.pump_launches();
             }
-            Mutation::Restart(_) => {
+            Mutation::Restart { view, .. } => {
                 let Some(i) = index else {
                     return self.vanished(conn, id, key);
                 };
                 self.track(&key, "restart", Post::Refresh);
                 self.accepted(conn, id, &key);
-                self.begin_restart(i, key);
+                self.begin_restart(i, key, view);
             }
             Mutation::Stop(_) => {
                 let Some(i) = index else {
@@ -660,8 +662,9 @@ impl Engine {
                     return self.vanished(conn, id, key);
                 };
                 self.accepted(conn, id, &key);
+                let view = self.sess.managed[i].view;
                 let target = self.set_session_path(i, path);
-                self.finish_journal(&key, Outcome::Done(Box::new(Done::Session(target))));
+                self.finish_journal(&key, Outcome::Done(Box::new(Done::Session(target, view))));
             }
             Mutation::ForkAt { file, entry_id } => {
                 let running = self.ctl_holder(&file);
@@ -941,9 +944,11 @@ impl Engine {
                         argv,
                         role: SessionRole::Tool,
                         copy_of: None,
+                        view: SessionView::Terminal,
                     },
                     key: Some(key),
                     exact: false,
+                    owner: Owner::Snapshot,
                     restore: false,
                     tool: Some(tool),
                     confine: None,

@@ -39,6 +39,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
+use deck_tsp::document::ReplayBlobs;
 
 use crate::error::{Error, Result};
 use crate::namespace::Namespace;
@@ -237,6 +238,7 @@ fn start(
         s.child.close_console();
         s.wait_status(DRAIN_TIMEOUT, |st| st.reader_done);
         s.input.close();
+        s.core().scanner.child_exited();
         s.update_status(|st| st.exited = Some(code));
         // Nobody has seen this session yet (e.g. the program failed at launch): keep serving
         // until the first attach received the final screen and `Exited`, or a kill.
@@ -608,6 +610,9 @@ impl Shared {
     }
 
     fn info(&self, core: &Core) -> HostInfo {
+        // A lingering final screen is not a live program. Suppress every activity signal,
+        // including title/TSP fallbacks consumed by the gateway's running poller.
+        let live = !self.status().child_exited;
         HostInfo {
             name: self.name.clone(),
             protocol: PROTOCOL,
@@ -622,7 +627,18 @@ impl Shared {
             attached: core.client.is_some(),
             cols: core.size.cols,
             rows: core.size.rows,
-            title: core.scanner.state().title.clone(),
+            title: live.then(|| core.scanner.state().title.clone()).flatten(),
+            tsp: core.tsp.is_some(),
+            run_state: live
+                .then(|| core.scanner.state().run_state.clone())
+                .flatten(),
+            tsp_facts: live
+                .then(|| {
+                    core.tsp
+                        .as_ref()
+                        .and_then(|tsp| crate::run_state::TspFacts::of(tsp.document()))
+                })
+                .flatten(),
         }
     }
 }
@@ -747,10 +763,22 @@ impl Core {
         }
     }
 
-    fn snapshot(&mut self, history_lines: u32) -> Vec<u8> {
+    /// The VT replay of the screen and, for a live TSP session, the replay of its surface
+    /// document (APC strings the terminal emulator ignores, with the `blobs` it asks for)
+    /// followed by the message still arriving, so a client that joins here and then follows
+    /// the output holds the same document as this daemon.
+    fn snapshot(&mut self, history_lines: u32, blobs: ReplayBlobs) -> Vec<u8> {
         self.flush_sync();
         let side = self.scanner.state().clone();
-        snapshot::encode(&mut self.term, &side, history_lines as usize)
+        let mut out = snapshot::encode(&mut self.term, &side, history_lines as usize);
+        if let Some(tsp) = &self.tsp
+            && tsp.live()
+        {
+            let now = Instant::now();
+            out.extend_from_slice(&tsp.document().replay_with(now, blobs));
+            out.extend_from_slice(&tsp.resume_bytes(now));
+        }
+        out
     }
 }
 
@@ -1023,7 +1051,7 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
                 let params: PeekParams = protocol::parse(&conn.payload)?;
                 shared.settle_exit();
                 let mut core = shared.core();
-                let snapshot = core.snapshot(params.history_lines);
+                let snapshot = core.snapshot(params.history_lines, ReplayBlobs::None);
                 shared.send_replies(core);
                 for chunk in snapshot.chunks(SNAPSHOT_CHUNK) {
                     conn.reply(Kind::Snapshot, chunk)?;
@@ -1120,7 +1148,7 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         params.cell_height,
     );
     core.set_palette(params.palette);
-    let snapshot = core.snapshot(params.history_lines);
+    let snapshot = core.snapshot(params.history_lines, ReplayBlobs::Referenced);
     if let Some(old) = core.client.take() {
         // The old writer sends this, then sees the queue closed and ends its stream.
         let _ = old.queue.try_send(Out::Frame(Kind::Displaced, Vec::new()));
@@ -1155,7 +1183,7 @@ fn attach_after_exit(
     code: Option<i32>,
 ) -> Result<()> {
     let shared = conn.shared;
-    let snapshot = core.snapshot(history_lines);
+    let snapshot = core.snapshot(history_lines, ReplayBlobs::Referenced);
     core.replies.clear();
     drop(core);
     shared.update_status(|st| st.busy += 1);
@@ -1224,7 +1252,7 @@ fn observe(conn: &mut Conn<'_>, params: &ObserveParams) -> Result<()> {
         }
     };
     let grid = json_payload(&core.grid())?;
-    let snapshot = core.snapshot(params.history_lines);
+    let snapshot = core.snapshot(params.history_lines, ReplayBlobs::Referenced);
     let queue = Arc::new(ObserverQueue::new(
         OBSERVER_BUDGET + snapshot.len(),
         abort_stream,
@@ -1272,7 +1300,7 @@ fn observe_after_exit(
         }
     };
     let grid = core.grid();
-    let snapshot = core.snapshot(history_lines);
+    let snapshot = core.snapshot(history_lines, ReplayBlobs::Referenced);
     core.replies.clear();
     drop(core);
     shared.update_status(|st| st.busy += 1);

@@ -15,8 +15,8 @@ use crate::icons::{
 };
 use deck_core::agents::AgentsTarget;
 use deck_core::config::{
-    AppConfig, Density, FolderTabs, GatewayMode, TabState, Theme, UiFont, UiStyle, WindowGeometry,
-    clamp_ui_scale,
+    AppConfig, Density, FolderTabs, GatewayMode, SessionView, TabState, Theme, UiFont, UiStyle,
+    WindowGeometry, clamp_ui_scale,
 };
 use deck_core::mux::{BackendChoice, MuxKind, new_session_name, session_name_for};
 use deck_core::omp::{DeleteTarget, MoveKind, MoveOutcome, Setting, UpdateKind, fork_argv};
@@ -170,6 +170,11 @@ enum PendingConfirm {
     },
     /// Restart a running session from the sidebar (with or without a tab).
     RestartSession(RestartTarget),
+    SwitchView {
+        uid: u64,
+        session: PathBuf,
+        view: SessionView,
+    },
     /// Delete a session file (and its artifacts) through omp.
     DeleteSession(SessionEntry),
     /// Delete the sessions checked in the session manager.
@@ -818,6 +823,12 @@ impl App {
         self.gw.gateway().is_some_and(|g| !g.backends.is_empty())
     }
 
+    fn host_available(&self) -> bool {
+        self.gw
+            .gateway()
+            .is_some_and(|g| g.backends.contains(&MuxKind::Host))
+    }
+
     /// Per frame: once omp is found, ask for its model catalog and settings; after an installer
     /// run, report whether the gateway found the new omp.
     fn tick_omp(&mut self) {
@@ -918,6 +929,23 @@ impl App {
     }
 
     fn open_session(&mut self, entry: &SessionEntry) {
+        let view = self
+            .gw
+            .controllers()
+            .and_then(|infos| {
+                infos
+                    .iter()
+                    .find(|i| {
+                        i.exit_code.is_none()
+                            && i.session_path.as_deref() == Some(entry.path.as_path())
+                    })
+                    .map(|i| i.view)
+            })
+            .unwrap_or(self.cfg.session_view);
+        self.open_session_view(entry, view);
+    }
+
+    fn open_session_view(&mut self, entry: &SessionEntry, view: SessionView) {
         // A removed worktree's folder is gone: its session is moved into the primary checkout
         // first (unless a tab already shows it), then opened there.
         let primary = self
@@ -931,19 +959,25 @@ impl App {
                 .iter()
                 .any(|t| t.session_path() == Some(entry.path.as_path()))
         {
-            self.open_relocated(entry, primary);
+            self.open_relocated(entry, primary, view);
             return;
         }
-        self.open_entry_at(entry, entry.path.clone(), entry.cwd.clone());
+        self.open_entry_view(entry, entry.path.clone(), entry.cwd.clone(), view);
     }
 
-    /// Opens `entry` (a tab is focused or launched) on the session file `path` in `cwd`.
-    fn open_entry_at(&mut self, entry: &SessionEntry, path: PathBuf, cwd: PathBuf) {
+    fn open_entry_view(
+        &mut self,
+        entry: &SessionEntry,
+        path: PathBuf,
+        cwd: PathBuf,
+        view: SessionView,
+    ) {
         self.open_resolved(ClosedTab {
             mux_name: Some(session_name_for(&entry.id)),
             cwd,
             session_path: Some(path),
             title: entry.label().to_owned(),
+            view,
         });
     }
 
@@ -1007,7 +1041,7 @@ impl App {
                 )
                 .into_name()
             });
-        self.spawn_tab_focus(name, req.cwd, req.session_path, req.title, focus);
+        self.spawn_tab_focus(name, req.cwd, req.session_path, req.title, req.view, focus);
     }
 
     fn open_deferred(&mut self) {
@@ -1027,7 +1061,8 @@ impl App {
         session_path: Option<PathBuf>,
         title: String,
     ) {
-        self.spawn_tab_focus(mux_name, cwd, session_path, title, Focus::Claim);
+        let view = self.cfg.session_view;
+        self.spawn_tab_focus(mux_name, cwd, session_path, title, view, Focus::Claim);
     }
 
     fn spawn_tab_focus(
@@ -1036,6 +1071,7 @@ impl App {
         cwd: PathBuf,
         session_path: Option<PathBuf>,
         title: String,
+        view: SessionView,
         focus: Focus,
     ) {
         self.spawn_tab_post(SpawnReq::session(
@@ -1043,6 +1079,7 @@ impl App {
             cwd,
             session_path,
             title,
+            view,
             Post::None,
             focus,
         ));
@@ -1122,6 +1159,7 @@ impl App {
                 cwd: t.cwd.clone(),
                 session_path: t.session_path_owned(),
                 title: t.title(&self.labels).to_owned(),
+                view: t.view(),
             });
         }
         let launch = (tab.session_path_owned(), tab.mux_name.clone());
@@ -1279,6 +1317,7 @@ impl App {
                 st.cwd.clone(),
                 path,
                 st.title.clone(),
+                st.view,
                 Post::Restore {
                     active: Some(i) == active,
                     index: i,
@@ -1524,6 +1563,24 @@ impl App {
         });
     }
 
+    /// Chat nodes may activate local files; ordinary terminal URLs retain their scheme policy.
+    fn open_chat_link(&self, url: String) {
+        let Some(path) = chat_file_path(&url) else {
+            self.open_external(url);
+            return;
+        };
+        let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = platform::open_path(path.as_os_str()) {
+                let _ = tx.send(AppEvent::Toast(
+                    ToastKind::Error,
+                    format!("Could not open the file: {e}"),
+                ));
+                ctx.request_repaint();
+            }
+        });
+    }
+
     /// Open `dir` in the desktop file manager, entirely off the UI thread.
     fn open_folder(&self, dir: PathBuf) {
         let (tx, ctx) = (self.events_tx.clone(), self.ctx.clone());
@@ -1605,6 +1662,7 @@ impl App {
             cwd,
             session_path: None,
             title,
+            view: self.cfg.session_view,
         });
     }
 
@@ -1710,6 +1768,9 @@ impl App {
                     groups: groups.as_deref().map_or(&[][..], Vec::as_slice),
                     omp_available: omp_found,
                     can_stop: self.backends_available(),
+                    default_view: self.cfg.session_view,
+                    host_available: self.host_available(),
+                    tabs: &self.tabs,
                     busy: &self.moving,
                     backup: crate::sidebar::BackupMenu {
                         place: &place,
@@ -1860,6 +1921,8 @@ impl App {
             now: SystemTime::now(),
             refreshing,
             can_stop: self.backends_available(),
+            default_view: self.cfg.session_view,
+            host_available: self.host_available(),
             omp_available: self.omp_found(),
             busy: &self.moving,
             generation,
@@ -1923,6 +1986,12 @@ impl App {
     fn apply_sidebar_action(&mut self, action: SidebarAction) {
         match action {
             SidebarAction::Open(entry) => self.open_session(&entry),
+            SidebarAction::OpenView(entry, view) => self.open_session_view(&entry, view),
+            SidebarAction::SwitchView { uid, view } => self.request_switch_view(uid, view),
+            SidebarAction::NewView(cwd, view) => {
+                let name = self.new_mux_name();
+                self.spawn_tab_focus(name, cwd, None, String::new(), view, Focus::Claim);
+            }
             SidebarAction::New(cwd) => self.new_session(cwd),
             SidebarAction::Refresh => self.refresh_sessions(),
             SidebarAction::ManageSessions(scope) => self.open_sessions(scope),
@@ -2019,6 +2088,7 @@ impl App {
         let rows = self.sync_rows();
         let input = SettingsInput {
             font_size: self.cfg.font_size,
+            session_view: self.cfg.session_view,
             font_range: (MIN_FONT, MAX_FONT),
             font_default: DEFAULT_FONT,
             ui_scale: self.cfg.ui_scale,
@@ -2081,6 +2151,10 @@ impl App {
                 SettingsAction::SeparatedPanels(v) => self.set_separated_panels(v),
                 SettingsAction::UiFont(v) => self.set_ui_font(v),
                 SettingsAction::SessionBackend(v) => self.set_session_backend(v),
+                SettingsAction::SessionView(v) => {
+                    self.cfg.session_view = v;
+                    self.dirty = true;
+                }
                 SettingsAction::NativeDecorations(v) => self.set_native_decorations(v),
                 SettingsAction::SetCheckUpdates(v) => {
                     self.cfg.check_updates = v;
@@ -2114,7 +2188,9 @@ impl App {
 
     fn show_terminal(&mut self, ui: &mut egui::Ui) {
         let mut open_url = None;
+        let mut chat_url = None;
         let mut copy_link = None;
+        let mut refused = None;
         let pal = Palette::of_ui(ui);
         let font_size = self.terminal_font_size();
         theme::skin::central(ui, pal, true, |ui| {
@@ -2130,20 +2206,38 @@ impl App {
             let surrender = ctx.options(|o| o.input_options.surrender_focus_on);
             ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
             let uid = tab.uid;
-            let out = TerminalView::new(tab.terminal_mut())
-                .id_salt(uid)
-                .font_size(font_size)
-                .show(ui);
+            let chat = tab.terminal().tsp().live();
+            let (response, url) = if chat {
+                let out = crate::chat_view::ChatView::new(tab.terminal_mut())
+                    .id_salt(uid)
+                    .font_size(font_size)
+                    .show(ui);
+                refused = out.refused;
+                (out.response, out.open_url)
+            } else {
+                let out = TerminalView::new(tab.terminal_mut())
+                    .id_salt(uid)
+                    .font_size(font_size)
+                    .show(ui);
+                (out.response, out.open_url)
+            };
             ctx.options_mut(|o| o.input_options.surrender_focus_on = surrender);
             if self.focus_pending {
-                out.response.request_focus();
+                response.request_focus();
                 self.focus_pending = false;
                 ui.ctx().request_repaint();
             }
-            self.terminal_focused = out.response.has_focus();
+            self.terminal_focused = response.has_focus();
             tab.bell = false;
-            open_url = out.open_url;
-            match terminal_menu(&out.response, tab.terminal()) {
+            if chat {
+                chat_url = url;
+            } else {
+                open_url = url;
+            }
+            match (!chat)
+                .then(|| terminal_menu(&response, tab.terminal()))
+                .flatten()
+            {
                 Some(TermMenu::Copy) => {
                     tab.terminal().copy_selection();
                 }
@@ -2153,12 +2247,30 @@ impl App {
                 None => {}
             }
         });
+        if let Some(reason) = refused {
+            self.tsp_refused(reason);
+        }
+        if let Some(url) = chat_url {
+            self.open_chat_link(url);
+        }
         if let Some(url) = open_url {
             self.open_external(url);
         }
         if let Some(url) = copy_link {
             self.copy_text(&url, "link");
         }
+    }
+
+    fn tsp_refused(&mut self, reason: deck_term::TspRefused) {
+        use deck_term::TspRefused;
+        let message = match reason {
+            TspRefused::Held => "omp is busy with a command; try again",
+            TspRefused::NotLive => "The chat view is not ready yet; try again",
+            TspRefused::ReadOnly => "This session is read-only",
+            TspRefused::Exited => "This session's process has stopped",
+            TspRefused::Detached => "This session is disconnected; reconnect and try again",
+        };
+        self.toasts.info(&self.ctx, message);
     }
 
     /// A confirmation or form dialog (or the Settings window) is open.
@@ -2213,6 +2325,9 @@ impl App {
                 self.execute_restart_live(uid, &session);
             }
             PendingConfirm::RestartSession(target) => self.execute_restart_session(target),
+            PendingConfirm::SwitchView { uid, session, view } => {
+                self.execute_switch_view(uid, &session, view)
+            }
             PendingConfirm::RemoveServer => self.remove_server(),
             PendingConfirm::DeleteSession(entry) => self.execute_delete(entry),
             PendingConfirm::DeleteSessions(paths) => self.execute_delete_sessions(paths),
@@ -2285,6 +2400,7 @@ impl App {
                     cwd: t.cwd.clone(),
                     session_path: t.session_path_owned(),
                     title: t.title(&self.labels).to_owned(),
+                    view: t.view(),
                 });
                 persisted.push(t.uid);
             }
@@ -2765,6 +2881,7 @@ impl App {
             dest.to_path_buf(),
             None,
             entry.label().to_owned(),
+            self.cfg.session_view,
             Post::Copy {
                 label: entry.label().to_owned(),
                 dest: dest.to_path_buf(),
@@ -2863,6 +2980,7 @@ impl App {
                     cwd: t.cwd.clone(),
                     session_path: Some(entry.path.clone()),
                     title: entry.label().to_owned(),
+                    view: t.view(),
                 });
             } else if i < slot {
                 slot -= 1; // a tab in front of the first one is closed too
@@ -2892,7 +3010,7 @@ impl App {
         let busy = self.tabs.iter().any(|t| {
             !t.terminal().is_exited()
                 && t.session_path() == Some(entry.path.as_path())
-                && Activity::from_title(t.terminal().title()) != Activity::Idle
+                && Activity::of_terminal(t.terminal()) != Activity::Idle
         });
         let live = if running {
             " Its running omp process is stopped first."
@@ -3058,6 +3176,7 @@ impl App {
             t.cwd,
             t.session_path,
             t.title,
+            t.view,
             Post::Anchor(anchor),
             if refocus == Some(self.activation_seq) {
                 Focus::Claim
@@ -3415,6 +3534,47 @@ fn paste_from_menu(term: &mut deck_term::Terminal) {
     term.paste_clipboard();
 }
 
+fn chat_file_path(url: &str) -> Option<PathBuf> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("file") {
+        return None;
+    }
+    // File links target this machine: ignore the authority (including localhost).
+    let slash = rest.find('/')?;
+    let path = rest[slash..].split(['?', '#']).next()?;
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        let byte = if byte == b'%' {
+            let hi = (input.next()? as char).to_digit(16)?;
+            let lo = (input.next()? as char).to_digit(16)?;
+            (hi * 16 + lo) as u8
+        } else {
+            byte
+        };
+        if byte == 0 {
+            return None;
+        }
+        bytes.push(byte);
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        let text = String::from_utf8(bytes).ok()?;
+        let text = if text.as_bytes().get(2) == Some(&b':') {
+            &text[1..]
+        } else {
+            &text
+        };
+        PathBuf::from(text)
+    };
+    path.is_absolute().then_some(path)
+}
+
 /// Only `http`, `https`, `mailto` (scheme matched case-insensitively) may reach the desktop's
 /// opener.
 fn is_openable_url(url: &str) -> bool {
@@ -3655,6 +3815,53 @@ mod tests {
             "x-http://y",
         ] {
             assert!(!is_openable_url(bad), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_link_tests {
+    use super::{chat_file_path, is_openable_url};
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_file_links_decode_paths_and_drop_authority() {
+        #[cfg(unix)]
+        let (href, expected) = ("file:///tmp/a%20b%23c.rs", "/tmp/a b#c.rs");
+        #[cfg(windows)]
+        let (href, expected) = ("file:///C:/tmp/a%20b%23c.rs", "C:/tmp/a b#c.rs");
+        assert_eq!(chat_file_path(href), Some(PathBuf::from(expected)));
+        assert_eq!(
+            chat_file_path(&href.replace("file:///", "FILE://localhost/")),
+            Some(PathBuf::from(expected))
+        );
+        assert_eq!(
+            chat_file_path(&href.replace("file:///", "file://desktop/")),
+            Some(PathBuf::from(expected))
+        );
+        assert_eq!(
+            chat_file_path(&format!("{href}?line=2#anchor")),
+            Some(PathBuf::from(expected))
+        );
+        assert!(
+            !is_openable_url(href),
+            "ordinary terminal URL policy must not widen"
+        );
+    }
+
+    #[test]
+    fn invalid_file_links_and_other_schemes_are_not_paths() {
+        for href in [
+            "file://",
+            "file:relative",
+            "file://localhost",
+            "file:///tmp/%",
+            "file:///tmp/%XZ",
+            "file:///tmp/%00x",
+            "https://example.com/file",
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(chat_file_path(href), None, "{href}");
         }
     }
 }

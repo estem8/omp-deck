@@ -31,8 +31,8 @@ use std::thread::JoinHandle;
 use deck_core::backup::Destination;
 use deck_core::config::{
     AppConfig, Density, FolderTabs, GatewayMode, NotifyConfig, ParkedBranch, RemovedWorktree,
-    SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle, WindowGeometry,
-    clamp_ui_scale, config_dir, parse_config,
+    SessionView, SplitState, SyncInterval, SyncRow, TabState, Theme, UiFont, UiStyle,
+    WindowGeometry, clamp_ui_scale, config_dir, parse_config,
 };
 use deck_core::mux::BackendChoice;
 use serde::{Deserialize, Serialize};
@@ -301,6 +301,7 @@ settings! {
     PaletteRecent(palette_recent: Vec<String>) = Device,
     ChangesPanelWidth(changes_panel_width: f32) = Device,
     GatewayMode(gateway_mode: GatewayMode) = Device,
+    SessionView(session_view: SessionView) = Shared,
 }
 
 /// The committed settings as one client read them.
@@ -765,12 +766,44 @@ mod tests {
         assert_eq!(stored.ui_scale, deck_core::config::MAX_UI_SCALE);
     }
 
+    #[test]
+    fn the_session_view_is_a_shared_setting_that_round_trips() {
+        assert_eq!(Field::SessionView.scope(), Scope::Shared);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = open(&dir);
+        let b = open(&dir);
+        let base = a.snapshot().config;
+        assert_eq!(base.session_view, SessionView::Terminal);
+        let mut edited = (*base).clone();
+        edited.session_view = SessionView::Chat;
+        let edit = Edit::between(base.clone(), &edited);
+        assert_eq!(edit.changes.len(), 1, "only the view differs");
+        let snap = a.submit(edit).wait().expect("commits");
+        assert_eq!(snap.config.session_view, SessionView::Chat);
+        let stored = AppConfig::load_from(&dir.path().join("state.json"));
+        assert_eq!(stored.session_view, SessionView::Chat);
+        // A window that only changed its font keeps the view the other window chose, both
+        // by rebasing and when its edit commits.
+        let mut untouched = (*base).clone();
+        rebase(&mut untouched, &base, &snap.config);
+        assert_eq!(untouched.session_view, SessionView::Chat);
+        let mut own = (*base).clone();
+        own.font_size = 19.0;
+        let merged = b
+            .submit(Edit::between(base, &own))
+            .wait()
+            .expect("an unrelated edit merges");
+        assert_eq!(merged.config.session_view, SessionView::Chat);
+        assert_eq!(merged.config.font_size, 19.0);
+    }
+
     fn tab(name: &str) -> TabState {
         TabState {
             session_name: name.to_owned(),
             cwd: PathBuf::from("/w"),
             session_path: None,
             title: name.to_owned(),
+            view: SessionView::Terminal,
         }
     }
 

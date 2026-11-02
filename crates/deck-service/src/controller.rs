@@ -39,6 +39,7 @@ use deck_core::mux::{Mux, MuxKind};
 use deck_term::{InputMeta, ScreenText, Terminal, TerminalEvents};
 use serde::{Deserialize, Serialize};
 
+use crate::composer::TspComposer;
 use crate::inject::{ComposeMode, End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
 use crate::model_switch::{FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
 use crate::session_actions::{self, Action, ActionCtx};
@@ -781,9 +782,10 @@ impl SessionController {
         true
     }
 
-    /// omp's state from the terminal title.
+    /// omp's state: its OSC 7501 report, else the `π` title, else (a TSP terminal) the document
+    /// (see [`Activity::of_terminal`]).
     pub fn activity(&self) -> Activity {
-        Activity::from_title(self.terminal.title())
+        Activity::of_terminal(&self.terminal)
     }
 
     /// The session's indicator; `bell` is the client's own unseen-bell marker.
@@ -1243,21 +1245,39 @@ impl SessionController {
         let term = &self.terminal;
         let screen = || term.screen_text();
         let paste = |t: &str| term.paste_bytes(t);
+        let handle = term.tsp();
+        let tsp = || handle.with(TspComposer::of);
         let poll = self.injector.poll(&Env {
             now,
             activity,
             last_ctrl_c: term.last_ctrl_c(),
             screen: &screen,
             paste: &paste,
+            tsp: handle.live().then_some(&tsp as &dyn Fn() -> TspComposer),
         });
         // The hold comes first so no user key can slip in between our bytes.
         if let Some(h) = poll.hold_for {
             term.hold_input_until(now + h);
         }
+        // A TSP event the terminal refused was never written: the job it ends must not read as
+        // delivered (the injector wrote at most one job's bytes this poll).
+        let mut unwritten = false;
         for w in poll.writes {
             match w {
                 Write::Bytes(bytes) => term.write(&bytes),
                 Write::Key(key, mods) => term.send_key(key, mods),
+                Write::Send {
+                    surface,
+                    editor,
+                    text,
+                } => {
+                    let event = deck_tsp::wire::Event::Send {
+                        sf: surface,
+                        id: editor,
+                        text,
+                    };
+                    unwritten |= term.inject_tsp(&event).is_err();
+                }
             }
         }
         for e in poll.ended {
@@ -1266,6 +1286,7 @@ impl SessionController {
                 self.awaiting = None;
             }
             let delivery = match e.end {
+                End::Completed if unwritten => Delivery::Aborted,
                 End::Completed => {
                     // Written; delivered once the input sink accepted the last byte.
                     let checkpoint = self.terminal.input_progress().queued;

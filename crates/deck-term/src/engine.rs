@@ -11,9 +11,13 @@
 //! synchronized update (whose bytes vte keeps unapplied) a join waits for the update's end —
 //! its `CSI ? 2026 l`, vte's timeout or size limit, or the end of output — and an unfinished
 //! sequence longer than [`MAX_PREFIX`] makes it wait for that sequence's end.
+//! A join also waits while the TSP mirror is inside a chunked message; a sequence the program
+//! abandoned expires after `CHUNK_IDLE` on its own (a timer thread, started only while a join
+//! waits for it), so a quiet program cannot hold a join up for ever.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -102,6 +106,8 @@ pub(crate) struct Engine {
     /// Holds a scrolled-back view across the redraw an app answers a resize with.
     keep: Arc<ScrollKeep>,
     inner: Mutex<Inner>,
+    /// Itself, for the expiry timer.
+    me: Weak<Engine>,
 }
 
 struct Inner {
@@ -125,6 +131,8 @@ struct Serve {
     /// Waiting for the end of a synchronized update or of an over-long sequence.
     pending: Vec<Arc<Queue>>,
     end: Option<OutputEvent>,
+    /// The expiry timer runs (see [`Engine::arm_expiry`]).
+    expiry_armed: bool,
 }
 
 impl Serve {
@@ -175,8 +183,9 @@ impl Engine {
             subs: Vec::new(),
             pending: Vec::new(),
             end: None,
+            expiry_armed: false,
         });
-        Arc::new(Engine {
+        Arc::new_cyclic(|me| Engine {
             term,
             config,
             listener,
@@ -186,6 +195,7 @@ impl Engine {
                 scan,
                 serve,
             }),
+            me: me.clone(),
         })
     }
 
@@ -222,6 +232,13 @@ impl Engine {
                 .position(|w| w == ESU)
                 .map_or(rest.len(), |at| at + ESU.len());
         }
+        if s.ground.is_ground() && !inner.scan.tsp_idle() {
+            // Waiting for the end of a chunked TSP message: only an escape can complete one,
+            // so plain bytes before the next ESC need no checks in between.
+            if let Some(at) = rest.iter().position(|&b| b == 0x1b).filter(|&at| at > 0) {
+                return at;
+            }
+        }
         let mut probe = s.ground;
         probe.feed_to_ground(rest).unwrap_or(rest.len())
     }
@@ -246,18 +263,74 @@ impl Engine {
         self.listener.send_event(Event::Wakeup);
     }
 
-    /// Whether a subscriber can join now (`None`: not an owner).
-    fn ready(inner: &Inner) -> Option<bool> {
-        inner.serve.as_ref().map(|s| {
-            s.end.is_some() || (!syncing(&inner.parser) && (s.ground.is_ground() || !s.prefix_lost))
-        })
+    /// Whether a subscriber can join now (`None`: not an owner). An abandoned chunk sequence
+    /// of the TSP mirror expires here, so a joiner is not held up by output that never comes.
+    fn ready(inner: &mut Inner) -> Option<bool> {
+        let s = inner.serve.as_ref()?;
+        if s.end.is_some() {
+            return Some(true);
+        }
+        if syncing(&inner.parser) || !(s.ground.is_ground() || !s.prefix_lost) {
+            return Some(false);
+        }
+        Some(inner.scan.expire_tsp(Instant::now()))
     }
 
     fn join_if_ready(&self, inner: &mut Inner) {
         let waiting = inner.serve.as_ref().is_some_and(|s| !s.pending.is_empty());
-        if waiting && Self::ready(inner) == Some(true) {
-            self.join_pending(inner);
+        if !waiting {
+            return;
         }
+        if Self::ready(inner) == Some(true) {
+            self.join_pending(inner);
+        } else {
+            self.arm_expiry(inner);
+        }
+    }
+
+    /// Starts the timer that lets waiting joins re-check once the TSP chunk sequence they wait
+    /// for has expired: expiry otherwise only happens when more output arrives, and an idle
+    /// program sends none. One timer at a time, ended by [`Self::expiry_step`].
+    fn arm_expiry(&self, inner: &mut Inner) {
+        let Some(s) = &mut inner.serve else { return };
+        if s.expiry_armed || inner.scan.tsp_idle() {
+            return;
+        }
+        s.expiry_armed = true;
+        let me = self.me.clone();
+        let spawned = thread::Builder::new()
+            .name("tsp-expiry".into())
+            .spawn(move || {
+                while let Some(engine) = me.upgrade() {
+                    let Some(wait) = engine.expiry_step() else {
+                        return;
+                    };
+                    drop(engine);
+                    thread::sleep(wait);
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("tsp expiry timer: {e}");
+            s.expiry_armed = false;
+        }
+    }
+
+    /// One round of the expiry timer: how long to sleep before the next, or `None` once the
+    /// joins no longer wait for a chunk sequence.
+    fn expiry_step(&self) -> Option<Duration> {
+        let mut inner = self.lock();
+        let waiting = inner.serve.as_ref().is_some_and(|s| !s.pending.is_empty());
+        if waiting && let Some(at) = inner.scan.tsp_deadline() {
+            let now = Instant::now();
+            if now <= at {
+                return Some(at - now + Duration::from_millis(1));
+            }
+            self.join_if_ready(&mut inner);
+        }
+        if let Some(s) = &mut inner.serve {
+            s.expiry_armed = false;
+        }
+        None
     }
 
     /// Deadline of a synchronized update in progress.
@@ -309,6 +382,7 @@ impl Engine {
         for chunk in bytes.chunks(MAX_LOCKED) {
             self.parse(&mut inner, chunk, false);
         }
+        inner.scan.end_reset();
         let Some(s) = &mut inner.serve else { return };
         broadcast(&mut s.subs, &OutputEvent::Snapshot(Arc::from(bytes)));
         self.join_if_ready(&mut inner);
@@ -389,6 +463,7 @@ impl Engine {
     /// received is shown, as its timeout would.
     pub(crate) fn finish(&self, end: OutputEvent) {
         let mut inner = self.lock();
+        inner.scan.finish();
         let Some(s) = &mut inner.serve else { return };
         if s.end.is_some() {
             return;
@@ -408,7 +483,7 @@ impl Engine {
     pub(crate) fn subscribe(self: &Arc<Self>, notify: OutputNotify) -> OutputSubscription {
         let queue = Arc::new(Queue::new(notify));
         let mut inner = self.lock();
-        match Self::ready(&inner) {
+        match Self::ready(&mut inner) {
             None => {
                 queue.push(OutputEvent::Closed);
             }
@@ -420,6 +495,7 @@ impl Engine {
                 if let Some(s) = &mut inner.serve {
                     s.pending.push(queue.clone());
                 }
+                self.arm_expiry(&mut inner);
             }
         }
         OutputSubscription {
@@ -461,9 +537,10 @@ impl Engine {
         }
     }
 
-    /// Replay of the owner's current state: retained images, the VT snapshot, then the
-    /// unfinished sequence. Only taken outside synchronized updates (see [`Self::ready`]), so
-    /// the replaying parser must not start one either.
+    /// Replay of the owner's current state: retained images, the VT snapshot, the TSP
+    /// surfaces, then the unfinished sequence. Only taken outside synchronized updates and
+    /// between TSP messages (see [`Self::ready`]), so the replaying parser must not start a
+    /// synchronized update either.
     fn snapshot(&self, inner: &Inner) -> Arc<[u8]> {
         let mut out = Vec::new();
         inner.scan.image_replay(&mut out);
@@ -471,6 +548,7 @@ impl Engine {
             let mut side = s.side.state().clone();
             side.sync_update = false;
             out.extend_from_slice(&snapshot::encode(&mut *self.term.lock(), &side, usize::MAX));
+            inner.scan.tsp_replay(Instant::now(), &mut out);
             if !s.ground.is_ground() && !s.prefix_lost {
                 out.extend_from_slice(&s.prefix);
             }

@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use deck_core::config::SessionView;
 use deck_core::mux::{BackendChoice, Mux, MuxKind};
 
 /// How long a stop waits for the backend to drop the session.
@@ -78,6 +79,21 @@ impl Backends {
     pub fn primary(&self) -> Option<&Mux> {
         let kinds: Vec<MuxKind> = self.muxes.iter().map(Mux::kind).collect();
         pick_kind(self.choice, &kinds).and_then(|k| self.of_kind(k))
+    }
+
+    /// The backend a launch runs on. A session that is alive keeps its `owner`. A new session
+    /// opened in the chat view needs the host (tmux cannot carry TSP), so it uses it whenever it
+    /// is available, whatever the choice; without a host it takes the primary backend and runs
+    /// as a terminal. Everything else goes to the primary backend.
+    pub fn for_launch(&self, owner: Option<MuxKind>, view: SessionView) -> Option<&Mux> {
+        owner
+            .and_then(|k| self.of_kind(k))
+            .or_else(|| {
+                (view == SessionView::Chat)
+                    .then(|| self.of_kind(MuxKind::Host))
+                    .flatten()
+            })
+            .or_else(|| self.primary())
     }
 
     /// The explicitly chosen backend when it is not available and another one stands in.
@@ -245,5 +261,68 @@ mod tests {
         b.set_choice(BackendChoice::Host);
         assert_eq!(b.primary().map(Mux::kind), Some(Host));
         assert_eq!(b.all().len(), 1);
+    }
+
+    fn tmux_and_host(choice: BackendChoice) -> Backends {
+        let tmux = deck_core::tmux::Tmux::with_socket(
+            "tmux",
+            "omp-deck-test-backends",
+            "/nonexistent/tmux.conf",
+        );
+        let host = deck_core::mux::HostMux::new("omp-deck-test-backends").expect("namespace");
+        Backends::new(vec![Mux::Tmux(tmux), Mux::Host(host)], choice)
+    }
+
+    #[test]
+    fn a_chat_launch_takes_the_host_even_when_tmux_is_primary_or_chosen() {
+        for choice in [
+            BackendChoice::Auto,
+            BackendChoice::Tmux,
+            BackendChoice::Host,
+        ] {
+            let b = tmux_and_host(choice);
+            assert_eq!(
+                b.for_launch(None, SessionView::Chat).map(Mux::kind),
+                Some(Host),
+                "{choice:?}"
+            );
+        }
+        let b = tmux_and_host(BackendChoice::Tmux);
+        assert_eq!(b.primary().map(Mux::kind), Some(Tmux));
+        assert_eq!(
+            b.for_launch(None, SessionView::Terminal).map(Mux::kind),
+            Some(Tmux),
+            "a terminal launch still follows the choice"
+        );
+    }
+
+    #[test]
+    fn a_live_session_keeps_its_backend_whatever_the_view() {
+        let b = tmux_and_host(BackendChoice::Auto);
+        assert_eq!(
+            b.for_launch(Some(Tmux), SessionView::Chat).map(Mux::kind),
+            Some(Tmux)
+        );
+        assert_eq!(
+            b.for_launch(Some(Host), SessionView::Terminal)
+                .map(Mux::kind),
+            Some(Host)
+        );
+    }
+
+    #[test]
+    fn a_chat_launch_without_a_host_falls_back_to_the_primary_backend() {
+        let tmux = deck_core::tmux::Tmux::with_socket(
+            "tmux",
+            "omp-deck-test-backends",
+            "/nonexistent/tmux.conf",
+        );
+        let b = Backends::new(vec![Mux::Tmux(tmux)], BackendChoice::Auto);
+        assert_eq!(
+            b.for_launch(None, SessionView::Chat).map(Mux::kind),
+            Some(Tmux)
+        );
+        let none = Backends::new(Vec::new(), BackendChoice::Auto);
+        assert!(none.for_launch(None, SessionView::Chat).is_none());
     }
 }

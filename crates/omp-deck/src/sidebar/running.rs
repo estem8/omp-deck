@@ -254,10 +254,19 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
     let neutral = theme::flat();
 
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h()), Sense::click());
+    let (view, view_label) = super::view_action(input.default_view, tab.map(tabs::Tab::view));
+    let view_why = tab.and_then(|t| super::view_switch_reason(t, view, input.host_available));
+    let view_rect =
+        egui::Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(22.0, 22.0));
+    let view_button = tab.is_some().then(|| {
+        ui.interact(view_rect, resp.id.with("session-view"), Sense::click())
+            .on_hover_text(view_why.unwrap_or(view_label))
+    });
+    let over_view = view_button.as_ref().is_some_and(egui::Response::hovered);
     let ctx = ui.ctx().clone();
     let hov = ctx.animate_bool_with_time(
         resp.id.with("hov"),
-        resp.hovered() || resp.context_menu_opened(),
+        resp.hovered() || over_view || resp.context_menu_opened(),
         0.12,
     );
     let sel = ctx.animate_bool_with_time(resp.id.with("sel"), active, 0.18);
@@ -281,13 +290,18 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         }
         // Marks a session that already has a tab.
         let mut text_right = pill.right() - 8.0;
-        if tab.is_some() {
-            let c = pos2(pill.right() - 16.0, pill.center().y);
+        if view_button.is_some() {
+            let c = view_rect.center();
+            let icon = if hov > 0.01 {
+                super::view_icon(view)
+            } else {
+                ICON_APP_WINDOW
+            };
             paint_icon(
                 p,
                 c,
                 Align2::CENTER_CENTER,
-                ICON_APP_WINDOW,
+                icon,
                 14.0,
                 theme::mix(pal.weak, pal.accent, 0.5 + 0.5 * sel),
             );
@@ -328,7 +342,15 @@ fn running_row(ui: &mut Ui, input: &SidebarInput<'_>, row: &Row, out: &mut Sideb
         );
     }
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if resp.clicked() {
+    if view_button.as_ref().is_some_and(egui::Response::clicked) {
+        if view_why.is_none() {
+            if let Some(t) = tab {
+                out.actions
+                    .push(SidebarAction::SwitchView { uid: t.uid, view });
+            }
+            out.interacted = true;
+        }
+    } else if resp.clicked() {
         out.actions.push(match (row.tab, entry) {
             (Some(i), _) => SidebarAction::ActivateTab(i),
             (None, Some(e)) => SidebarAction::Open(e.clone()),

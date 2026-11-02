@@ -54,9 +54,11 @@ pub struct Sighting {
     pub exit_code: Option<i32>,
     /// The tab is shown in a pane (the active tab, or any pane of a split).
     pub visible: bool,
-    /// The terminal title is omp's (`π …`). Without it a live status says nothing about turns:
-    /// omp has not set one yet, or tmux restored the title from before it because the process
-    /// is ending (`CSI 23 t`, one tick before the exit is seen). That must not read as "idle".
+    /// omp's state is known: it reported a run state (OSC 7501), set its `π …` title, or (TSP)
+    /// shows a document that says what it does. Without it a live status says nothing about
+    /// turns: omp has not said anything yet, or tmux restored the title from before it because
+    /// the process is ending (`CSI 23 t`, one tick before the exit is seen). That must not
+    /// read as "idle".
     pub omp_title: bool,
 }
 

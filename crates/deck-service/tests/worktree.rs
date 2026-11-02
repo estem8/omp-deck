@@ -331,6 +331,7 @@ fn launch_omp(client: &GatewayClient, dir: &Path, name: &str) -> SessionTarget {
         argv: vec!["omp".into()],
         role: SessionRole::Session,
         copy_of: None,
+        view: Default::default(),
     }));
     launch
         .accepted
@@ -339,7 +340,7 @@ fn launch_omp(client: &GatewayClient, dir: &Path, name: &str) -> SessionTarget {
         .expect("launch accepted");
     let target = match launch.outcome.wait(WAIT) {
         Some(Ok(Outcome::Done(d))) => match *d {
-            Done::Session(t) => t,
+            Done::Session(t, _) => t,
             other => panic!("launch result: {other:?}"),
         },
         other => panic!("launch outcome: {other:?}"),

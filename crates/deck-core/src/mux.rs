@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use deck_host::{RunState, TspFacts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +42,17 @@ pub enum MuxKind {
     Host,
 }
 
+/// What omp shows of its state in one live session (see [`Mux::pane_status`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneStatus {
+    /// Terminal title of the (active) pane.
+    pub title: Option<String>,
+    /// omp's OSC 7501 run state.
+    pub run_state: Option<RunState>,
+    /// What omp's TSP document shows of its run (host TSP sessions only).
+    pub tsp_facts: Option<TspFacts>,
+}
+
 /// One live mux session as the Running view shows it ([`Mux::running`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningSession {
@@ -51,6 +63,14 @@ pub struct RunningSession {
     pub files: Vec<PathBuf>,
     /// Terminal title of the (active) pane; `None` when it set none.
     pub title: Option<String>,
+    /// omp's run status from its OSC 7501 reports (host sessions only; `None` when none is
+    /// held). Under TSP omp drops the `π` title, so this is its only state besides the
+    /// document.
+    #[serde(default)]
+    pub run_state: Option<RunState>,
+    /// What omp's TSP document shows of its run (host TSP sessions only).
+    #[serde(default)]
+    pub tsp_facts: Option<TspFacts>,
     /// tmux: the pane's current path. Host: the session's working directory.
     pub cwd: Option<PathBuf>,
     /// tmux `session_created`; host: when its child started.
@@ -169,6 +189,8 @@ impl HostMux {
                 name: info.name,
                 backend: MuxKind::Host,
                 title: info.title.filter(|t| !t.is_empty()),
+                run_state: info.run_state,
+                tsp_facts: info.tsp_facts,
                 cwd: Some(info.cwd),
                 started: Some(UNIX_EPOCH + Duration::from_millis(info.child_started_unix_ms)),
                 pid: Some(info.child_pid),
@@ -177,20 +199,31 @@ impl HostMux {
             .collect()
     }
 
-    /// Titles reported by the live sessions' daemons.
-    fn titles(&self) -> HashMap<String, String> {
+    /// Titles and run states reported by the live sessions' daemons (one `info` each, so one
+    /// stuck daemon costs one control timeout, not one per session).
+    fn status(&self) -> HashMap<String, PaneStatus> {
         let names = self.ns.list();
         std::thread::scope(|scope| {
             let jobs: Vec<_> = names
                 .iter()
                 .map(|name| {
-                    scope.spawn(|| self.ns.info(name).ok()?.title.filter(|t| !t.is_empty()))
+                    scope.spawn(|| {
+                        let info = self.ns.info(name).ok()?;
+                        Some(PaneStatus {
+                            title: info.title.filter(|t| !t.is_empty()),
+                            run_state: info.run_state,
+                            tsp_facts: info.tsp_facts,
+                        })
+                    })
                 })
                 .collect();
             names
                 .iter()
                 .zip(jobs)
                 .filter_map(|(name, job)| Some((name.clone(), job.join().ok()??)))
+                .filter(|(_, s)| {
+                    s.title.is_some() || s.run_state.is_some() || s.tsp_facts.is_some()
+                })
                 .collect()
         })
     }
@@ -362,13 +395,28 @@ impl Mux {
         }
     }
 
-    /// Session name → current terminal title of every live session that has one: tmux asks its
-    /// server once (active pane); the host asks each session's daemon (`info`, concurrently, so
-    /// one stuck daemon costs one control timeout, not one per session). Failures → no entry.
-    pub fn pane_titles(&self) -> HashMap<String, String> {
+    /// Session name → what omp shows of its state in each live session: the terminal title of
+    /// the active pane and, on the host, omp's OSC 7501 run state (tmux 3.7 does not forward
+    /// unknown OSC to its clients, so there only the title exists). tmux asks its server once;
+    /// the host asks each session's daemon (`info`, concurrently). Sessions with neither, and
+    /// failures, have no entry.
+    pub fn pane_status(&self) -> HashMap<String, PaneStatus> {
         match self {
-            Mux::Tmux(t) => t.pane_titles(),
-            Mux::Host(h) => h.titles(),
+            Mux::Tmux(t) => t
+                .pane_titles()
+                .into_iter()
+                .map(|(name, title)| {
+                    (
+                        name,
+                        PaneStatus {
+                            title: Some(title),
+                            run_state: None,
+                            tsp_facts: None,
+                        },
+                    )
+                })
+                .collect(),
+            Mux::Host(h) => h.status(),
         }
     }
 }

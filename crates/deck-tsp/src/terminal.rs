@@ -31,6 +31,7 @@
 use std::time::Instant;
 
 use crate::document::Document;
+pub use crate::document::Program;
 use crate::stream::{Message, Splitter, Verb, encode_message};
 use crate::wire::{DEFAULT_APC_LIMIT, DEFAULT_CREDITS, Event, KINDS, Query, Reply, VERSION};
 
@@ -72,22 +73,6 @@ pub struct TermInfo {
     /// The user's system reads a 12-hour clock.
     pub hour12: bool,
     pub input: InputEncoding,
-}
-
-/// What the program said about itself in its last `hello`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Program {
-    pub app: Option<String>,
-    pub ver: Option<String>,
-    /// `edit`, `undo`, `send`: what the program applies. `send` is required before sending a
-    /// [`Event::Send`].
-    pub features: Vec<String>,
-}
-
-impl Program {
-    pub fn supports(&self, feature: &str) -> bool {
-        self.features.iter().any(|f| f == feature)
-    }
 }
 
 /// The hello reply for `info`.
@@ -173,7 +158,6 @@ pub struct Responder {
     document: Document,
     info: TermInfo,
     live: bool,
-    program: Option<Program>,
     held_acks: Vec<(String, u64)>,
     held_errors: Vec<Event>,
 }
@@ -185,7 +169,6 @@ impl Responder {
             document: Document::new(),
             info,
             live: false,
-            program: None,
             held_acks: Vec::new(),
             held_errors: Vec::new(),
         }
@@ -206,9 +189,17 @@ impl Responder {
         &self.info
     }
 
-    /// The program's last `hello` (`None` before one).
+    /// The program's last `hello` (`None` before one); kept by the document.
     pub fn program(&self) -> Option<&Program> {
-        self.program.as_ref()
+        self.document.program()
+    }
+
+    /// Bytes that finish what a replay of [`Responder::document`] cannot carry: the chunked
+    /// message and APC string still arriving (see [`Splitter::resume_bytes`]), at `now`.
+    pub fn resume_bytes(&self, now: Instant) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.splitter.resume_bytes(now, &mut out);
+        out
     }
 
     /// Scans `bytes` of child output. Returns the bytes for the child's input, in order: the
@@ -226,7 +217,7 @@ impl Responder {
                 self.query(msg, &mut out);
                 continue;
             }
-            let applied = self.document.apply(msg);
+            let applied = self.document.apply(msg, now);
             for (sf, s) in applied.acks {
                 match self.held_acks.iter_mut().find(|(f, _)| *f == sf) {
                     Some((_, held)) => *held = (*held).max(s),
@@ -274,7 +265,7 @@ impl Responder {
                 if !v.contains(&VERSION) {
                     return;
                 }
-                self.program = Some(Program { app, ver, features });
+                self.document.set_program(Program { app, ver, features });
                 self.live = true;
                 out.extend(encode_reply(&hello_reply(&self.info), self.info.input));
             }

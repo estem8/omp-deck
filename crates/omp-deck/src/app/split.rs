@@ -12,7 +12,7 @@ use egui::{
 };
 
 use super::{App, TermMenu, paste_from_menu, terminal_menu};
-use crate::icons::{ICON_TERMINAL, ICON_X};
+use crate::icons::{ICON_MESSAGES_SQUARE, ICON_TERMINAL, ICON_X, Icon};
 use crate::panes::{self, Dir, Side};
 use crate::tabs::{Tab, paint_status};
 use crate::theme::{self, Palette};
@@ -43,6 +43,7 @@ fn pane_header(
     title: &str,
     focused: bool,
     tab_open: bool,
+    icon: Icon,
 ) -> HeaderOut {
     let resp = ui.interact(rect, Id::unique(("pane-header", slot)), Sense::click());
     let close_rect = Rect::from_center_size(
@@ -70,7 +71,7 @@ fn pane_header(
             p,
             icon_c,
             Align2::CENTER_CENTER,
-            ICON_TERMINAL,
+            icon,
             14.0,
             if focused { col } else { pal.weak },
         );
@@ -114,6 +115,7 @@ struct Requests {
     close: Option<usize>,
     dividers: Vec<(usize, f32)>,
     open_url: Option<String>,
+    chat_url: Option<String>,
     copy_link: Option<String>,
 }
 
@@ -375,6 +377,7 @@ impl App {
     pub(super) fn show_split(&mut self, ui: &mut Ui) {
         let pal = Palette::of_ui(ui);
         let mut frame = Requests::default();
+        let mut refused = None;
         theme::skin::central(ui, pal, true, |ui| {
             let area = ui.max_rect();
             let rects = panes::pane_rects(self.split.layout(), area, self.split.ratios());
@@ -408,6 +411,11 @@ impl App {
                     &title,
                     is_focused,
                     index.is_some(),
+                    if index.is_some_and(|i| self.tabs[i].terminal().tsp().live()) {
+                        ICON_MESSAGES_SQUARE
+                    } else {
+                        ICON_TERMINAL
+                    },
                 );
                 if header.close {
                     frame.close = Some(slot);
@@ -422,21 +430,39 @@ impl App {
                     );
                     child.set_clip_rect(body.intersect(ui.clip_rect()));
                     let uid = t.uid;
-                    let out = TerminalView::new(t.terminal_mut())
-                        .id_salt(uid)
-                        .font_size(font_size)
-                        .show(&mut child);
+                    let chat = t.terminal().tsp().live();
+                    let (response, url) = if chat {
+                        let out = crate::chat_view::ChatView::new(t.terminal_mut())
+                            .id_salt(uid)
+                            .font_size(font_size)
+                            .show(&mut child);
+                        refused = refused.or(out.refused);
+                        (out.response, out.open_url)
+                    } else {
+                        let out = TerminalView::new(t.terminal_mut())
+                            .id_salt(uid)
+                            .font_size(font_size)
+                            .show(&mut child);
+                        (out.response, out.open_url)
+                    };
                     if self.focus_pending && is_focused {
-                        out.response.request_focus();
+                        response.request_focus();
                         focus_taken = true;
                     }
-                    any_focus |= out.response.has_focus();
-                    hit |= pressed && out.response.contains_pointer();
+                    any_focus |= response.has_focus();
+                    hit |= pressed && response.contains_pointer();
                     t.bell = false;
-                    if out.open_url.is_some() {
-                        frame.open_url = out.open_url;
+                    if url.is_some() {
+                        if chat {
+                            frame.chat_url = url;
+                        } else {
+                            frame.open_url = url;
+                        }
                     }
-                    match terminal_menu(&out.response, t.terminal()) {
+                    match (!chat)
+                        .then(|| terminal_menu(&response, t.terminal()))
+                        .flatten()
+                    {
                         Some(TermMenu::Copy) => {
                             t.terminal().copy_selection();
                         }
@@ -519,6 +545,9 @@ impl App {
                 }
             }
         });
+        if let Some(reason) = refused {
+            self.tsp_refused(reason);
+        }
         for (index, value) in frame.dividers {
             self.split.set_divider(index, value);
             self.dirty = true;
@@ -527,6 +556,9 @@ impl App {
             self.close_pane(slot);
         } else if let Some(slot) = frame.focus {
             self.focus_pane(slot);
+        }
+        if let Some(url) = frame.chat_url {
+            self.open_chat_link(url);
         }
         if let Some(url) = frame.open_url {
             self.open_external(url);

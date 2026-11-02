@@ -19,6 +19,7 @@
 //!   the node or a descendant, as the spec says; it never changes the tree.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -28,9 +29,13 @@ use sha2::{Digest, Sha256};
 
 use crate::stream::{Message, Verb};
 use crate::wire::{
-    Close, Event, Frame, Mode, Node, Op, Open, REGION_DOCK, REGION_LAYER, RevealAt, ScrollBy,
-    Stylesheet, TextMode,
+    Close, Event, Frame, Mode, Node, Op, Open, Query, REGION_DOCK, REGION_LAYER, RevealAt,
+    ScrollBy, Stylesheet, TextMode, VERSION,
 };
+
+mod replay;
+
+pub use replay::ReplayBlobs;
 
 /// Nodes per surface, root included (spec limit).
 pub const MAX_NODES: usize = 200_000;
@@ -81,6 +86,8 @@ struct Entry {
     parent: Option<String>,
     children: Vec<String>,
     settled: bool,
+    /// When the props or text last changed (or the node was added).
+    changed: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +153,12 @@ impl<'a> NodeRef<'a> {
         self.entry.settled
     }
 
+    /// When the node's props or text last changed, or it was added; the receive time of that
+    /// message (as passed to [`Document::apply`]).
+    pub fn changed_at(&self) -> Instant {
+        self.entry.changed
+    }
+
     pub fn parent(&self) -> Option<NodeRef<'a>> {
         self.surface.node(self.entry.parent.as_deref()?)
     }
@@ -206,7 +219,7 @@ fn strip_nulls(mut p: Map<String, Value>) -> Map<String, Value> {
 }
 
 impl Surface {
-    fn new(open: &Open) -> Surface {
+    fn new(open: &Open, now: Instant) -> Surface {
         let mut nodes = HashMap::new();
         nodes.insert(
             open.id.clone(),
@@ -216,6 +229,7 @@ impl Surface {
                 parent: None,
                 children: Vec::new(),
                 settled: false,
+                changed: now,
             },
         );
         Surface {
@@ -416,7 +430,7 @@ impl Surface {
         Ok(())
     }
 
-    fn insert_tree(&mut self, node: Node, parent: &str) {
+    fn insert_tree(&mut self, node: Node, parent: &str, now: Instant) {
         let Node { id, k, p, c } = node;
         let children = c.iter().map(|n| n.id.clone()).collect();
         self.nodes.insert(
@@ -427,10 +441,11 @@ impl Surface {
                 parent: Some(parent.to_owned()),
                 children,
                 settled: false,
+                changed: now,
             },
         );
         for child in c {
-            self.insert_tree(child, &id);
+            self.insert_tree(child, &id, now);
         }
     }
 
@@ -464,8 +479,8 @@ impl Surface {
         }
     }
 
-    /// Applies one op. Public for the renderer's own mirrors and tests.
-    pub fn apply_op(&mut self, op: Op) -> Result<(), OpError> {
+    /// Applies one op received at `now`. Public for the renderer's own mirrors and tests.
+    pub fn apply_op(&mut self, op: Op, now: Instant) -> Result<(), OpError> {
         match op {
             Op::Add {
                 id,
@@ -492,7 +507,7 @@ impl Surface {
                 }
                 self.validate_subtree(&node, parent_depth + 1, &mut HashSet::new())?;
                 self.touch(&parent);
-                self.insert_tree(node, &parent);
+                self.insert_tree(node, &parent, now);
                 self.link(&id, &parent, before.as_deref());
                 Ok(())
             }
@@ -505,6 +520,7 @@ impl Surface {
                         e.p.insert(k, v);
                     }
                 }
+                e.changed = now;
                 self.touch(&id);
                 Ok(())
             }
@@ -517,6 +533,7 @@ impl Surface {
                     }
                     (TextMode::Append, Some(_)) => return Err(OpError::TextNotString(id)),
                 }
+                e.changed = now;
                 self.touch(&id);
                 Ok(())
             }
@@ -546,6 +563,7 @@ impl Surface {
                     }
                     Some(_) => return Err(OpError::TextNotString(id)),
                 }
+                e.changed = now;
                 self.touch(&id);
                 Ok(())
             }
@@ -771,16 +789,51 @@ pub struct Applied {
     pub errors: Vec<Event>,
 }
 
+/// What a program said about itself in its last `hello` query.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Program {
+    pub app: Option<String>,
+    pub ver: Option<String>,
+    /// `edit`, `undo`, `send`: what the program applies. `send` is required before sending a
+    /// [`Event::Send`].
+    pub features: Vec<String>,
+}
+
+impl Program {
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
 /// The terminal's copy of every surface of one pane, plus its blobs.
 #[derive(Debug, Default)]
 pub struct Document {
     surfaces: Vec<Surface>,
     blobs: BlobStore,
+    program: Option<Program>,
+    revision: u64,
 }
 
 impl Document {
     pub fn new() -> Document {
         Document::default()
+    }
+
+    /// Bumped by every applied message that changed anything (surface, tree, stylesheet,
+    /// blob, program); a renderer repaints when it moved.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The program's last `hello` query that listed protocol version 1 (`None` before one).
+    pub fn program(&self) -> Option<&Program> {
+        self.program.as_ref()
+    }
+
+    /// Records the program's identity (what [`Document::apply`] does with a `hello` query).
+    pub fn set_program(&mut self, program: Program) {
+        self.program = Some(program);
+        self.revision += 1;
     }
 
     /// Every surface, oldest first (closed ones included).
@@ -827,18 +880,33 @@ impl Document {
         have
     }
 
-    /// Applies one message (`o`, `f`, `x`, `s`, `b`); other verbs change nothing.
-    pub fn apply(&mut self, msg: &Message) -> Applied {
+    /// Applies one message (`o`, `f`, `x`, `s`, `b`, and the `hello` query) received at `now`;
+    /// other verbs change nothing.
+    pub fn apply(&mut self, msg: &Message, now: Instant) -> Applied {
         match msg.verb {
-            Verb::Open => self.open(&msg.body),
-            Verb::Frame => self.frame(&msg.body),
+            Verb::Open => self.open(&msg.body, now),
+            Verb::Frame => self.frame(&msg.body, now),
             Verb::Close => self.close(&msg.body),
             Verb::Style => self.style(&msg.body),
             Verb::Blob => self.blob_message(msg),
-            Verb::Query | Verb::Palette | Verb::Reply | Verb::Event | Verb::Unknown(_) => {
-                Applied::default()
-            }
+            Verb::Query => self.query(&msg.body),
+            Verb::Palette | Verb::Reply | Verb::Event | Verb::Unknown(_) => Applied::default(),
         }
+    }
+
+    /// Only the `hello` query is remembered; answering queries is the terminal's job.
+    fn query(&mut self, body: &[u8]) -> Applied {
+        if let Ok(Query::Hello {
+            v,
+            app,
+            ver,
+            features,
+        }) = serde_json::from_slice(body)
+            && v.contains(&VERSION)
+        {
+            self.set_program(Program { app, ver, features });
+        }
+        Applied::default()
     }
 
     fn rejected(msg: impl Into<String>) -> Applied {
@@ -878,7 +946,7 @@ impl Document {
         });
     }
 
-    fn open(&mut self, body: &[u8]) -> Applied {
+    fn open(&mut self, body: &[u8], now: Instant) -> Applied {
         let open: Open = match serde_json::from_slice(body) {
             Ok(o) => o,
             Err(e) => return Document::rejected(format!("malformed o body: {e}")),
@@ -898,8 +966,9 @@ impl Document {
             Mode::Flow => self.retire(|s| s.mode == Mode::Flow),
             Mode::Unknown => {}
         }
-        self.surfaces.push(Surface::new(&open));
+        self.surfaces.push(Surface::new(&open, now));
         self.trim_closed();
+        self.revision += 1;
         Applied::default()
     }
 
@@ -944,10 +1013,11 @@ impl Document {
             surface.font.clone_from(&open.font);
         }
         self.surfaces.push(surface);
+        self.revision += 1;
         Applied::default()
     }
 
-    fn frame(&mut self, body: &[u8]) -> Applied {
+    fn frame(&mut self, body: &[u8], now: Instant) -> Applied {
         let frame: Frame = match serde_json::from_slice(body) {
             Ok(f) => f,
             Err(e) => return Document::rejected(format!("malformed f body: {e}")),
@@ -968,7 +1038,7 @@ impl Document {
         let listen = surface.listen;
         let mut applied = Applied::default();
         for (i, op) in ops.into_iter().enumerate() {
-            if let Err(e) = surface.apply_op(op)
+            if let Err(e) = surface.apply_op(op, now)
                 && listen
             {
                 applied.errors.push(Event::Error {
@@ -983,6 +1053,7 @@ impl Document {
         if listen {
             applied.acks.push((sf, s));
         }
+        self.revision += 1;
         applied
     }
 
@@ -1000,6 +1071,7 @@ impl Document {
         } else {
             self.surfaces.remove(idx);
         }
+        self.revision += 1;
         Applied::default()
     }
 
@@ -1036,6 +1108,7 @@ impl Document {
                 css: sheet.css,
             }),
         }
+        self.revision += 1;
         Applied::default()
     }
 
@@ -1060,6 +1133,7 @@ impl Document {
                 bytes,
             },
         );
+        self.revision += 1;
         Applied::default()
     }
 }
@@ -1120,10 +1194,13 @@ mod tests {
     }
 
     fn open_inline(doc: &mut Document, id: &str) {
-        let a = doc.apply(&msg(
-            Verb::Open,
-            &json!({"id": id, "mode": "inline", "role": "omp.session"}),
-        ));
+        let a = doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": id, "mode": "inline", "role": "omp.session"}),
+            ),
+            Instant::now(),
+        );
         assert_eq!(a, Applied::default());
         frame(
             doc,
@@ -1138,7 +1215,10 @@ mod tests {
     }
 
     fn frame(doc: &mut Document, sf: &str, s: u64, ops: Value) -> Applied {
-        doc.apply(&msg(Verb::Frame, &json!({"sf": sf, "s": s, "ops": ops})))
+        doc.apply(
+            &msg(Verb::Frame, &json!({"sf": sf, "s": s, "ops": ops})),
+            Instant::now(),
+        )
     }
 
     fn text_of(doc: &Document, sf: &str, id: &str) -> Option<String> {
@@ -1588,23 +1668,31 @@ mod tests {
             node,
         };
         assert_eq!(
-            surface.apply_op(add(chain("d", MAX_DEPTH))),
+            surface.apply_op(add(chain("d", MAX_DEPTH)), Instant::now()),
             Err(OpError::TooDeep)
         );
         assert!(
             surface.node("d0").is_none(),
             "nothing of the rejected add stays"
         );
-        assert_eq!(surface.apply_op(add(chain("e", MAX_DEPTH - 1))), Ok(()));
+        assert_eq!(
+            surface.apply_op(add(chain("e", MAX_DEPTH - 1)), Instant::now()),
+            Ok(())
+        );
         assert_eq!(surface.depth_of("e0"), Some(MAX_DEPTH));
         // Moving a subtree deeper than the limit is refused too.
-        surface.apply_op(add(chain("g", 2))).unwrap();
+        surface
+            .apply_op(add(chain("g", 2)), Instant::now())
+            .unwrap();
         assert_eq!(
-            surface.apply_op(Op::Move {
-                id: "g1".into(),
-                parent: "e0".into(),
-                before: None
-            }),
+            surface.apply_op(
+                Op::Move {
+                    id: "g1".into(),
+                    parent: "e0".into(),
+                    before: None
+                },
+                Instant::now()
+            ),
             Err(OpError::TooDeep)
         );
 
@@ -1612,22 +1700,28 @@ mod tests {
         let filler = MAX_NODES - surface.len();
         for i in 0..filler {
             surface
-                .apply_op(Op::Add {
-                    id: format!("f{i}"),
-                    parent: "main".into(),
-                    before: None,
-                    node: Node::new(format!("f{i}"), "text"),
-                })
+                .apply_op(
+                    Op::Add {
+                        id: format!("f{i}"),
+                        parent: "main".into(),
+                        before: None,
+                        node: Node::new(format!("f{i}"), "text"),
+                    },
+                    Instant::now(),
+                )
                 .unwrap();
         }
         assert_eq!(surface.len(), MAX_NODES);
         assert_eq!(
-            surface.apply_op(Op::Add {
-                id: "over".into(),
-                parent: "main".into(),
-                before: None,
-                node: Node::new("over", "text"),
-            }),
+            surface.apply_op(
+                Op::Add {
+                    id: "over".into(),
+                    parent: "main".into(),
+                    before: None,
+                    node: Node::new("over", "text"),
+                },
+                Instant::now()
+            ),
             Err(OpError::TooManyNodes)
         );
         assert!(surface.node("over").is_none());
@@ -1643,21 +1737,27 @@ mod tests {
         );
         open_inline(&mut doc, "s1");
         assert!(
-            doc.apply(&msg(Verb::Close, &json!({"id": "s1"})))
+            doc.apply(&msg(Verb::Close, &json!({"id": "s1"})), Instant::now())
                 .errors
                 .is_empty()
         );
         let a = frame(&mut doc, "s1", 9, json!([]));
         assert!(a.acks.is_empty() && a.errors.len() == 1);
-        let bad = doc.apply(&Message {
-            verb: Verb::Frame,
-            params: vec![],
-            body: b"{nope".to_vec(),
-        });
+        let bad = doc.apply(
+            &Message {
+                verb: Verb::Frame,
+                params: vec![],
+                body: b"{nope".to_vec(),
+            },
+            Instant::now(),
+        );
         assert!(
             matches!(&bad.errors[0], Event::Error { msg, op: None, sf: None, .. } if msg.starts_with("malformed f body"))
         );
-        let bad = doc.apply(&msg(Verb::Frame, &json!({"sf": "s1", "ops": []})));
+        let bad = doc.apply(
+            &msg(Verb::Frame, &json!({"sf": "s1", "ops": []})),
+            Instant::now(),
+        );
         assert!(
             matches!(&bad.errors[0], Event::Error { msg, .. } if msg.starts_with("malformed f body"))
         );
@@ -1666,10 +1766,13 @@ mod tests {
     #[test]
     fn listen_false_surfaces_get_no_acks_and_no_errors() {
         let mut doc = Document::new();
-        doc.apply(&msg(
-            Verb::Open,
-            &json!({"id": "q", "mode": "screen", "listen": false}),
-        ));
+        doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": "q", "mode": "screen", "listen": false}),
+            ),
+            Instant::now(),
+        );
         let a = frame(
             &mut doc,
             "q",
@@ -1678,10 +1781,13 @@ mod tests {
         );
         assert_eq!(a, Applied::default());
         assert!(doc.surface("q").unwrap().node("main").is_some());
-        let gone = doc.apply(&msg(
-            Verb::Open,
-            &json!({"id": "zz", "adopt": true, "listen": false}),
-        ));
+        let gone = doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": "zz", "adopt": true, "listen": false}),
+            ),
+            Instant::now(),
+        );
         assert_eq!(gone, Applied::default());
     }
 
@@ -1700,7 +1806,10 @@ mod tests {
                 ["focus", "ed"],
             ]),
         );
-        doc.apply(&msg(Verb::Close, &json!({"id": "s1", "keep": true})));
+        doc.apply(
+            &msg(Verb::Close, &json!({"id": "s1", "keep": true})),
+            Instant::now(),
+        );
         assert!(doc.surface("s1").is_none(), "closed surfaces are not open");
         let s = &doc.surfaces()[0];
         assert!(!s.is_open());
@@ -1709,12 +1818,18 @@ mod tests {
         assert_eq!(s.focus(), None);
         // keep:false removes; a screen surface is discarded whatever `keep` says.
         open_inline(&mut doc, "s2");
-        doc.apply(&msg(Verb::Close, &json!({"id": "s2", "keep": false})));
+        doc.apply(
+            &msg(Verb::Close, &json!({"id": "s2", "keep": false})),
+            Instant::now(),
+        );
         assert_eq!(doc.surfaces().len(), 1);
-        doc.apply(&msg(Verb::Open, &json!({"id": "sc", "mode": "screen"})));
-        doc.apply(&msg(Verb::Close, &json!({"id": "sc"})));
+        doc.apply(
+            &msg(Verb::Open, &json!({"id": "sc", "mode": "screen"})),
+            Instant::now(),
+        );
+        doc.apply(&msg(Verb::Close, &json!({"id": "sc"})), Instant::now());
         assert_eq!(doc.surfaces().len(), 1);
-        let a = doc.apply(&msg(Verb::Close, &json!({"id": "sc"})));
+        let a = doc.apply(&msg(Verb::Close, &json!({"id": "sc"})), Instant::now());
         assert!(matches!(&a.errors[0], Event::Error { .. }));
     }
 
@@ -1722,11 +1837,20 @@ mod tests {
     fn a_new_inline_open_replaces_the_live_one_and_discards_screens_but_not_flow() {
         let mut doc = Document::new();
         open_inline(&mut doc, "s1");
-        doc.apply(&msg(Verb::Open, &json!({"id": "sc", "mode": "screen"})));
-        doc.apply(&msg(Verb::Open, &json!({"id": "fl", "mode": "flow"})));
+        doc.apply(
+            &msg(Verb::Open, &json!({"id": "sc", "mode": "screen"})),
+            Instant::now(),
+        );
+        doc.apply(
+            &msg(Verb::Open, &json!({"id": "fl", "mode": "flow"})),
+            Instant::now(),
+        );
         assert_eq!(doc.surfaces().len(), 3);
         // A screen open never touches the inline surface.
-        doc.apply(&msg(Verb::Open, &json!({"id": "sc2", "mode": "screen"})));
+        doc.apply(
+            &msg(Verb::Open, &json!({"id": "sc2", "mode": "screen"})),
+            Instant::now(),
+        );
         assert!(doc.surface("s1").unwrap().is_open());
         assert!(doc.surface("sc").is_none() && doc.surface("sc2").is_some());
         // A new inline open closes the old inline (kept), discards the screen, leaves flow.
@@ -1754,11 +1878,14 @@ mod tests {
                 ["add", "ed", "dock", null, {"id": "ed", "k": "editor"}],
             ]),
         );
-        doc.apply(&msg(Verb::Close, &json!({"id": "s1"})));
-        let a = doc.apply(&msg(
-            Verb::Open,
-            &json!({"id": "s1", "adopt": true, "title": "again"}),
-        ));
+        doc.apply(&msg(Verb::Close, &json!({"id": "s1"})), Instant::now());
+        let a = doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": "s1", "adopt": true, "title": "again"}),
+            ),
+            Instant::now(),
+        );
         assert_eq!(a, Applied::default());
         let s = doc.surface("s1").unwrap();
         assert_eq!(s.title(), Some("again"));
@@ -1777,10 +1904,16 @@ mod tests {
         assert!(a.errors.is_empty());
         // Adopting the live id again does nothing; an unknown id is `gone`.
         assert_eq!(
-            doc.apply(&msg(Verb::Open, &json!({"id": "s1", "adopt": true}))),
+            doc.apply(
+                &msg(Verb::Open, &json!({"id": "s1", "adopt": true})),
+                Instant::now()
+            ),
             Applied::default()
         );
-        let a = doc.apply(&msg(Verb::Open, &json!({"id": "other", "adopt": true})));
+        let a = doc.apply(
+            &msg(Verb::Open, &json!({"id": "other", "adopt": true})),
+            Instant::now(),
+        );
         assert_eq!(
             a.errors,
             [Event::Gone {
@@ -1799,15 +1932,18 @@ mod tests {
             json!({"id": ""}),
             json!({"id": "a", "mode": "warp"}),
         ] {
-            let a = doc.apply(&msg(Verb::Open, &body));
+            let a = doc.apply(&msg(Verb::Open, &body), Instant::now());
             assert_eq!(a.errors.len(), 1, "{body}");
         }
         assert!(doc.surfaces().is_empty());
-        let a = doc.apply(&Message {
-            verb: Verb::Open,
-            params: vec![],
-            body: b"[1]".to_vec(),
-        });
+        let a = doc.apply(
+            &Message {
+                verb: Verb::Open,
+                params: vec![],
+                body: b"[1]".to_vec(),
+            },
+            Instant::now(),
+        );
         assert!(
             matches!(&a.errors[0], Event::Error { msg, .. } if msg.starts_with("malformed o body"))
         );
@@ -1836,17 +1972,20 @@ mod tests {
         let sheet = |name: &str, css: String| {
             msg(Verb::Style, &json!({"sf": "s1", "name": name, "css": css}))
         };
-        assert_eq!(doc.apply(&sheet("a", ".x{}".into())), Applied::default());
-        doc.apply(&sheet("a", ".y{}".into()));
-        doc.apply(&sheet("b", ".z{}".into()));
+        assert_eq!(
+            doc.apply(&sheet("a", ".x{}".into()), Instant::now()),
+            Applied::default()
+        );
+        doc.apply(&sheet("a", ".y{}".into()), Instant::now());
+        doc.apply(&sheet("b", ".z{}".into()), Instant::now());
         let styles: Vec<_> = doc.surface("s1").unwrap().styles().collect();
         assert_eq!(styles, [("a", ".y{}"), ("b", ".z{}")]);
-        let big = doc.apply(&sheet("c", "x".repeat(MAX_STYLE_BYTES)));
+        let big = doc.apply(&sheet("c", "x".repeat(MAX_STYLE_BYTES)), Instant::now());
         assert_eq!(big.errors.len(), 1);
         assert_eq!(doc.surface("s1").unwrap().styles().count(), 2);
         // Replacing a sheet counts only the new size.
         assert!(
-            doc.apply(&sheet("a", "x".repeat(MAX_STYLE_BYTES - 4)))
+            doc.apply(&sheet("a", "x".repeat(MAX_STYLE_BYTES - 4)), Instant::now())
                 .errors
                 .is_empty()
         );
@@ -1864,13 +2003,16 @@ mod tests {
             body: body.as_bytes().to_vec(),
         };
         // A wrong `id` parameter is ignored: Tern hashes what arrives.
-        let a = doc.apply(&blob_msg(
-            vec![
-                ("id".into(), "00".into()),
-                ("mime".into(), "text/plain".into()),
-            ],
-            &b64,
-        ));
+        let a = doc.apply(
+            &blob_msg(
+                vec![
+                    ("id".into(), "00".into()),
+                    ("mime".into(), "text/plain".into()),
+                ],
+                &b64,
+            ),
+            Instant::now(),
+        );
         assert_eq!(a, Applied::default());
         let stored = doc.blob(&id).unwrap();
         assert_eq!(
@@ -1881,7 +2023,7 @@ mod tests {
             doc.blobs_have(&["nope".into(), id.to_uppercase(), id.clone()]),
             [id.to_uppercase(), id.clone()]
         );
-        let bad = doc.apply(&blob_msg(vec![], "!!!not base64"));
+        let bad = doc.apply(&blob_msg(vec![], "!!!not base64"), Instant::now());
         assert!(
             matches!(&bad.errors[0], Event::Error { msg, .. } if msg.starts_with("blob is not valid base64"))
         );
@@ -1911,11 +2053,14 @@ mod tests {
     fn oversized_blobs_are_rejected() {
         let mut doc = Document::new();
         let body = STANDARD.encode(vec![0u8; MAX_BLOB + 1]);
-        let a = doc.apply(&Message {
-            verb: Verb::Blob,
-            params: vec![],
-            body: body.into_bytes(),
-        });
+        let a = doc.apply(
+            &Message {
+                verb: Verb::Blob,
+                params: vec![],
+                body: body.into_bytes(),
+            },
+            Instant::now(),
+        );
         assert!(
             matches!(&a.errors[0], Event::Error { msg, .. } if msg == "blob is larger than 16 MiB")
         );
@@ -1938,8 +2083,153 @@ mod tests {
             br#"{"sf":"s1","s":1,"ops":[["add","main","s1",null,{"id":"main","k":"col"}],["add","t","main",null,{"id":"t","k":"text","p":{"text":"hi"}}]]}"#,
         ));
         for m in splitter.feed(&wire, std::time::Instant::now()) {
-            doc.apply(&m);
+            doc.apply(&m, Instant::now());
         }
         assert_eq!(text_of(&doc, "s1", "t").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn changed_at_is_the_receive_time_of_the_last_change_to_that_node() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let apply = |doc: &mut Document, ms: u64, verb: Verb, body: Value| {
+            doc.apply(&msg(verb, &body), at(ms))
+        };
+        let mut doc = Document::new();
+        apply(
+            &mut doc,
+            0,
+            Verb::Open,
+            json!({"id": "s1", "mode": "inline"}),
+        );
+        apply(
+            &mut doc,
+            10,
+            Verb::Frame,
+            json!({"sf": "s1", "s": 1, "ops": [
+                ["add", "main", "s1", null, {"id": "main", "k": "col", "c": [
+                    {"id": "a", "k": "text", "p": {"text": "a"}},
+                    {"id": "b", "k": "text", "p": {"text": "b"}},
+                    {"id": "c", "k": "text", "p": {"text": "c"}},
+                ]}],
+            ]}),
+        );
+        let stamp = |doc: &Document, id: &str| {
+            doc.surface("s1")
+                .unwrap()
+                .node(id)
+                .unwrap()
+                .changed_at()
+                .duration_since(t0)
+                .as_millis()
+        };
+        assert_eq!(stamp(&doc, "s1"), 0, "the root stamps at the open");
+        assert_eq!(
+            (stamp(&doc, "main"), stamp(&doc, "a"), stamp(&doc, "c")),
+            (10, 10, 10),
+            "an add stamps the whole added subtree"
+        );
+        // set / text / splice stamp their target only; siblings and ancestors keep theirs.
+        apply(
+            &mut doc,
+            20,
+            Verb::Frame,
+            json!({"sf": "s1", "s": 2, "ops": [["set", "a", {"tone": "info"}]]}),
+        );
+        apply(
+            &mut doc,
+            30,
+            Verb::Frame,
+            json!({"sf": "s1", "s": 3, "ops": [["text", "b", "append", "!"]]}),
+        );
+        apply(
+            &mut doc,
+            40,
+            Verb::Frame,
+            json!({"sf": "s1", "s": 4, "ops": [["splice", "c", 0, 1, "C"]]}),
+        );
+        assert_eq!(
+            (stamp(&doc, "a"), stamp(&doc, "b"), stamp(&doc, "c")),
+            (20, 30, 40)
+        );
+        assert_eq!((stamp(&doc, "main"), stamp(&doc, "s1")), (10, 0));
+        // A rejected op stamps nothing; a move or settle changes no props.
+        let a = apply(
+            &mut doc,
+            50,
+            Verb::Frame,
+            json!({"sf": "s1", "s": 5, "ops": [
+                ["splice", "a", 9, 0, "x"], ["settle", "b"], ["move", "c", "main", "a"],
+            ]}),
+        );
+        assert_eq!(a.errors.len(), 1);
+        assert_eq!(
+            (stamp(&doc, "a"), stamp(&doc, "b"), stamp(&doc, "c")),
+            (20, 30, 40)
+        );
+    }
+
+    #[test]
+    fn revision_counts_only_messages_that_changed_something() {
+        let t = Instant::now();
+        let mut doc = Document::new();
+        assert_eq!(doc.revision(), 0);
+        let mut last = doc.revision();
+        let mut step = |doc: &mut Document, m: Message| {
+            doc.apply(&m, t);
+            let moved = doc.revision() != last;
+            last = doc.revision();
+            moved
+        };
+        // Nothing to apply: malformed, unknown surface, unknown verb, reply/event, bad query.
+        assert!(!step(&mut doc, msg(Verb::Open, &json!({"nope": 1}))));
+        assert!(!step(
+            &mut doc,
+            msg(Verb::Frame, &json!({"sf": "x", "s": 1, "ops": []}))
+        ));
+        assert!(!step(&mut doc, msg(Verb::Unknown(b'z'), &json!({}))));
+        assert!(!step(&mut doc, msg(Verb::Event, &json!({"ev": "ack"}))));
+        assert!(!step(
+            &mut doc,
+            msg(Verb::Query, &json!({"q": "hello", "v": [2]}))
+        ));
+        assert!(!step(
+            &mut doc,
+            msg(Verb::Query, &json!({"q": "blobs", "ids": []}))
+        ));
+        assert!(!step(&mut doc, msg(Verb::Close, &json!({"id": "x"}))));
+        // Each of these changes the document.
+        assert!(step(
+            &mut doc,
+            msg(
+                Verb::Query,
+                &json!({"q": "hello", "v": [1], "app": "omp", "ver": "1", "features": ["send"]})
+            )
+        ));
+        assert!(step(
+            &mut doc,
+            msg(Verb::Open, &json!({"id": "s1", "mode": "inline"}))
+        ));
+        assert!(step(
+            &mut doc,
+            msg(Verb::Frame, &json!({"sf": "s1", "s": 1, "ops": []}))
+        ));
+        assert!(step(
+            &mut doc,
+            msg(Verb::Style, &json!({"sf": "s1", "name": "a", "css": "x"}))
+        ));
+        assert!(step(
+            &mut doc,
+            Message {
+                verb: Verb::Blob,
+                params: vec![],
+                body: STANDARD.encode(b"x").into_bytes(),
+            }
+        ));
+        assert!(step(&mut doc, msg(Verb::Close, &json!({"id": "s1"}))));
+        let program = doc.program().unwrap();
+        assert_eq!(program.app.as_deref(), Some("omp"));
+        assert!(program.supports("send") && !program.supports("edit"));
     }
 }

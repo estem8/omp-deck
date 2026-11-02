@@ -5,10 +5,11 @@
 //! The gateway owns the control sockets; this window only subscribes to the active session's
 //! `Topic::Live` and sends `Mutation::Ctl` commands, whose replies arrive as closures.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use deck_core::config::SessionView;
 use deck_core::ctl::{CtlCommand, CtlReply, LiveSnapshot};
 use deck_core::sessions::SessionEntry;
 use deck_service::controller::{SessionKey, SessionTarget};
@@ -122,7 +123,7 @@ impl App {
             backend: self.backends_available() && t.mux_name.is_some(),
             has_session_file: t.session_path().is_some(),
             extension: self.gw.gateway().is_some_and(|g| g.live_control),
-            idle: Activity::from_title(t.terminal().title()) == Activity::Idle,
+            idle: Activity::of_terminal(t.terminal()) == Activity::Idle,
         })
     }
 
@@ -355,11 +356,13 @@ impl App {
             );
             return;
         }
-        self.restart_tab_in_place(uid);
+        self.restart_tab_in_place(uid, None);
     }
 
-    /// `Mutation::Restart` of the tab's session; its view is replaced by one on the result.
-    fn restart_tab_in_place(&mut self, uid: u64) {
+    /// `Mutation::Restart` of the tab's session, in `view` (`None`: the view it runs in);
+    /// its view is replaced by one on the result. Restarting into the other view is how a tab
+    /// switches between the terminal and the chat view.
+    pub(super) fn restart_tab_in_place(&mut self, uid: u64, view: Option<SessionView>) {
         let Some(target) = self
             .tabs
             .iter()
@@ -370,14 +373,22 @@ impl App {
         };
         self.toasts.info(&self.ctx, "Restarting session…");
         self.gw
-            .mutate(Mutation::Restart(target), move |app, result| {
+            .mutate(Mutation::Restart { target, view }, move |app, result| {
+                if matches!(&result, Ok(Done::Session(_, SessionView::Terminal)))
+                    && view == Some(SessionView::Chat)
+                {
+                    app.toasts.info(
+                        &app.ctx,
+                        "Opened in terminal view because the OmpDeck session host is unavailable",
+                    );
+                }
                 app.on_tab_restarted(uid, result);
             });
     }
 
     fn on_tab_restarted(&mut self, uid: u64, result: Result<Done, String>) {
-        let target = match result {
-            Ok(Done::Session(target)) => target,
+        let (target, view) = match result {
+            Ok(Done::Session(target, view)) => (target, view),
             Ok(other) => {
                 self.toasts.error(
                     &self.ctx,
@@ -397,8 +408,55 @@ impl App {
         };
         let term = self.open_view(&target);
         self.tabs[i].reattach(target, term);
+        self.tabs[i].set_view(view);
         self.dirty = true;
         self.focus_pending = true;
+    }
+
+    pub(super) fn request_switch_view(&mut self, uid: u64, view: SessionView) {
+        let Some(tab) = self.tabs.iter().find(|t| t.uid == uid) else {
+            return;
+        };
+        if let Some(why) = crate::sidebar::view_switch_reason(tab, view, self.host_available()) {
+            self.toasts.info(&self.ctx, why);
+            return;
+        }
+        let Some(session) = tab.session_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let label = if view == SessionView::Chat {
+            "chat view"
+        } else {
+            "terminal view"
+        };
+        self.confirm = Some((
+            Confirm {
+                title: format!("Switch to {label}?"),
+                body: format!(
+                    "Stops the omp process behind “{}” and resumes the same conversation in {label}. The tab keeps its place. Switching while omp is working would interrupt its turn.",
+                    tab.label(&self.labels)
+                ),
+                confirm_label: "Restart and switch".to_owned(),
+                danger: false,
+            },
+            PendingConfirm::SwitchView { uid, session, view },
+        ));
+    }
+
+    pub(super) fn execute_switch_view(&mut self, uid: u64, session: &Path, view: SessionView) {
+        let Some(tab) = self.tabs.iter().find(|t| t.uid == uid) else {
+            return;
+        };
+        if tab.session_path() != Some(session) {
+            self.toasts
+                .info(&self.ctx, "Switch cancelled: the session changed");
+            return;
+        }
+        if let Some(why) = crate::sidebar::view_switch_reason(tab, view, self.host_available()) {
+            self.toasts.info(&self.ctx, why);
+            return;
+        }
+        self.restart_tab_in_place(uid, Some(view));
     }
 
     /// Sidebar "Restart session": ask first (an open tab may be mid-turn).
@@ -412,7 +470,7 @@ impl App {
                 && t.session_path() == Some(entry.path.as_path())
             {
                 t.mux_name.clone().map(|n| {
-                    let busy = Activity::from_title(t.terminal().title()) != Activity::Idle;
+                    let busy = Activity::of_terminal(t.terminal()) != Activity::Idle;
                     (t.uid, n, busy)
                 })
             } else {
@@ -467,7 +525,7 @@ impl App {
         });
         match (target.uid, at) {
             (Some(uid), Some(at)) if self.tabs.get(at).is_some_and(|t| t.uid == uid) => {
-                self.restart_tab_in_place(uid);
+                self.restart_tab_in_place(uid, None);
             }
             (None, None) => {
                 self.restart_detached(ClosedTab {
@@ -475,6 +533,7 @@ impl App {
                     cwd: target.cwd,
                     session_path: Some(target.session),
                     title: target.title,
+                    view: self.cfg.session_view,
                 });
             }
             _ => self
@@ -498,14 +557,17 @@ impl App {
             argv: crate::tabs::omp_argv(tab.session_path()),
             role: SessionRole::Session,
             copy_of: None,
+            view: self.cfg.session_view,
         });
         self.gw.mutate(attach, move |app, attached| {
             let restarted = match attached {
-                Ok(Done::Session(target)) => {
-                    app.gw
-                        .mutate(Mutation::Restart(target), move |app, result| {
+                Ok(Done::Session(target, _)) => {
+                    app.gw.mutate(
+                        Mutation::Restart { target, view: None },
+                        move |app, result| {
                             app.finish_restart_detached(slot, tab, result);
-                        });
+                        },
+                    );
                     return;
                 }
                 Ok(other) => Err(format!("unexpected answer {other:?}")),
@@ -523,7 +585,7 @@ impl App {
     ) {
         self.spawn.release(&slot);
         match result {
-            Ok(Done::Session(_)) => {
+            Ok(Done::Session(..)) => {
                 // Opens (or focuses) the restarted session through the normal path.
                 self.open_resolved(tab);
             }

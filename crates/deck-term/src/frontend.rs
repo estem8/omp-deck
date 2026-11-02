@@ -199,7 +199,7 @@ mod tests {
     use crate::input::{Key, Mods};
     use crate::remote::RemoteEvent;
     use crate::remote::tests::{Log, Sent, connect};
-    use crate::{TermOptions, Terminal, wait_detached};
+    use crate::{BlockedKind, RunPhase, RunState, TermOptions, Terminal, wait_detached};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -840,5 +840,119 @@ mod tests {
         assert!(!rest.contains(&Cmd::Kill), "{rest:?}");
         assert!(!owner.is_exited());
         assert!(!log.lock().expect("log").contains(&Sent::Kill));
+    }
+
+    #[test]
+    fn a_frontend_joining_late_holds_the_owners_document_and_sends_events_through_it() {
+        use crate::tsp::TspRefused;
+        use crate::tsp::tests::{doc_json, event, frame1, frame2_chunks, hello, open, send, text};
+
+        let (mut owner, host, log) = connect();
+        let mut head = hello();
+        head.extend(open());
+        head.extend(frame1());
+        let chunks = frame2_chunks();
+        send(&host, &head);
+        send(&host, &chunks[0]);
+        until_owner(&mut owner, "the first frame", |t| {
+            text(t).as_deref() == Some("hello")
+        });
+
+        // The frontend joins inside a chunked message: it stays stale until that ends.
+        let mut pair = Pair::new(owner);
+        std::thread::sleep(Duration::from_millis(200));
+        pair.pump();
+        assert!(
+            pair.front.is_stale(),
+            "no snapshot half way through a frame"
+        );
+        assert!(!pair.front.tsp().live());
+        assert_eq!(pair.front.send_tsp(&event()), Err(TspRefused::Detached));
+        for chunk in &chunks[1..] {
+            send(&host, chunk);
+        }
+        pair.until("the replayed document", |p| {
+            !p.front.is_stale() && text(&p.front).as_deref() == Some("hello and more of it")
+        });
+        assert!(pair.front.tsp().live());
+        assert_eq!(doc_json(&pair.front), doc_json(&pair.owner));
+
+        // Live output after the join keeps them equal, and moves the revision.
+        let rev = pair.front.tsp().revision();
+        send(
+            &host,
+            &deck_tsp::stream::encode_message(
+                deck_tsp::stream::Verb::Frame,
+                &[],
+                br#"{"sf":"s1","s":3,"ops":[["text","t","append","!"]]}"#,
+            ),
+        );
+        pair.until("the append", |p| {
+            text(&p.front).as_deref() == Some("hello and more of it!")
+        });
+        assert!(pair.front.tsp().revision() > rev);
+        assert_eq!(doc_json(&pair.front), doc_json(&pair.owner));
+
+        // Neither side answered the program; the frontend's event reaches it once, exact.
+        assert_eq!(host_inputs(&log), b"");
+        pair.front.send_tsp(&event()).expect("accepted");
+        let expected =
+            deck_tsp::terminal::encode_event(&event(), deck_tsp::terminal::InputEncoding::native());
+        pair.until("the event at the host", |_| host_inputs(&log) == expected);
+        assert_eq!(pair.inputs(), vec![expected.clone()]);
+
+        // The owner's hold reaches the frontend and refuses the event there.
+        pair.owner
+            .hold_input_until(Instant::now() + Duration::from_secs(3600));
+        pair.until("the hold", |p| p.front.input_held());
+        assert_eq!(pair.front.send_tsp(&event()), Err(TspRefused::Held));
+
+        // A lost link: stale, detached.
+        pair.ctl.send(Ctl::Disconnect).expect("bridge alive");
+        pair.until("stale", |p| p.front.is_stale());
+        assert_eq!(pair.front.send_tsp(&event()), Err(TspRefused::Detached));
+        assert_eq!(host_inputs(&log), expected, "refusals wrote nothing");
+    }
+
+    #[test]
+    fn a_frontend_joining_mid_turn_learns_omp_run_state_and_follows_it() {
+        let (mut owner, host, _log) = connect();
+        // The turn started before the frontend joined; a title omp drops under TSP is absent.
+        output(&host, b"\x1b]7501;state=work");
+        output(&host, b"ing:app=omp\x1b\\M");
+        until_owner(&mut owner, "M", |t| screen(t).starts_with('M'));
+        assert_eq!(owner.run_state(), Some(RunState::new(RunPhase::Working)));
+
+        let mut pair = Pair::new(owner);
+        pair.until("the replayed state", |p| {
+            p.front.run_state() == Some(RunState::new(RunPhase::Working))
+        });
+
+        // Live transitions reach it through the output stream.
+        output(
+            &host,
+            b"\x1b]7501;state=blocked:kind=permission:app=omp:msg=T2s=\x07",
+        );
+        let blocked = RunState {
+            state: RunPhase::Blocked {
+                kind: Some(BlockedKind::Permission),
+            },
+            msg: Some("Ok".into()),
+        };
+        pair.until("blocked", |p| p.front.run_state() == Some(blocked.clone()));
+        output(
+            &host,
+            b"\x1b]7501;state=done:app=omp\x07\x1b]7501;state=idle:app=omp\x07",
+        );
+        pair.until("idle", |p| {
+            p.front.run_state() == Some(RunState::new(RunPhase::Idle))
+        });
+        output(&host, b"\x1b]7501;state=clear\x1b\\");
+        pair.until("cleared", |p| p.front.run_state().is_none());
+        assert_eq!(pair.owner.run_state(), None);
+
+        // A frontend joining after the clear has nothing to learn.
+        let late = Pair::new(pair.owner);
+        assert_eq!(late.front.run_state(), None);
     }
 }

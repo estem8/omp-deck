@@ -13,6 +13,7 @@
 //!   and error events, plus the encoders for events written to the child's input.
 
 pub mod document;
+pub mod mirror;
 pub mod stream;
 pub mod terminal;
 pub mod wire;

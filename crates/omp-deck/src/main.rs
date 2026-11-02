@@ -14,6 +14,7 @@ mod backup_view;
 mod badge;
 mod card;
 mod changes_view;
+mod chat_view;
 mod cli;
 mod clipboard_bridge;
 mod col_alloc;

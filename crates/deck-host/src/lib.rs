@@ -16,6 +16,7 @@ mod logfile;
 mod namespace;
 pub mod protocol;
 pub mod pty;
+pub mod run_state;
 pub mod snapshot;
 mod spawn;
 pub mod transport;
@@ -29,6 +30,7 @@ pub use client::{
 pub use error::{Error, Result};
 pub use namespace::{Namespace, valid_namespace, valid_session_name};
 pub use protocol::{AttachParams, Grid, HostInfo, PROTOCOL, Palette, SessionSpec};
+pub use run_state::{BlockedKind, RunPhase, RunState, TspFacts};
 pub use spawn::{Launcher, launch_detached};
 
 /// Version of this crate, reported in `Hello` and [`HostInfo::host_version`].

@@ -51,7 +51,7 @@ pub struct Observation<'a> {
     pub project: &'a str,
     /// A view shows the session (the active tab, or any pane of a split).
     pub visible: bool,
-    /// The terminal title is omp's ([`tracker::Sighting::omp_title`]).
+    /// omp's state is known ([`tracker::Sighting::omp_title`]).
     pub omp_title: bool,
 }
 

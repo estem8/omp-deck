@@ -43,6 +43,16 @@
 //! omp is no longer idle, so a turn that begins mid-sequence is never interrupted by our `Esc` or
 //! submitted by our `\r`; the caller drops the user's own keystrokes while a job is in flight
 //! ([`Poll::hold_for`]); no byte follows a lone `Esc` within [`AFTER_ESC`].
+//!
+//! TSP sessions ([`Env::tsp`] set, chat view): omp's composer is not on the grid, so every step
+//! observes the TSP document instead ([`TspComposer`]: the dock's sendable `editor` in focus, an
+//! `omp.editor.ask*` dialog or a lost focus reading as [`Composer::Missing`], attachments as chips,
+//! the autocomplete overlay as the popup). A slash command and a plain [`ComposeMode::Send`] go as
+//! one [`Write::Send`] (the `send` event, when the program's hello lists it): omp runs it through
+//! its ordinary submit path, displacing a confirmed draft into its recall history, so there is no
+//! Ctrl+C, paste, popup `Esc` or Enter. Inserts, steering, follow-ups, attachments, Stop and hotkeys
+//! keep the PTY sequence above (omp edits its own editor), and a program without `send` falls back
+//! to it for every job. As on the grid, [`End::Completed`] means every byte was handed out.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -50,7 +60,7 @@ use std::time::{Duration, Instant};
 use deck_term::ScreenText;
 use deck_term::input::{Key, Mods};
 
-use crate::composer::{self, Composer};
+use crate::composer::{self, Composer, TspComposer};
 use crate::statusfmt::Activity;
 
 /// omp exits on two Ctrl+C within 500 ms; keep clear of that.
@@ -240,6 +250,10 @@ pub struct Env<'a> {
     /// (`deck_term::Terminal::paste_bytes`); `None` when omp has not enabled bracketed paste.
     /// Only [`Payload::Text`] jobs use it.
     pub paste: &'a dyn Fn(&str) -> Option<Vec<u8>>,
+    /// The composer as omp's TSP document shows it (`None` = classic grid session). A session
+    /// whose omp speaks TSP has no composer on its grid: the document is the only place that says
+    /// what the composer holds, whether a dialog took it, and where `send` goes.
+    pub tsp: Option<&'a dyn Fn() -> TspComposer>,
 }
 
 /// One piece of input for the tab's terminal.
@@ -249,6 +263,14 @@ pub enum Write {
     Bytes(Vec<u8>),
     /// A key stroke, to be encoded like the user's own key (`deck_term::Terminal::send_key`).
     Key(Key, Mods),
+    /// A TSP `send` event: submits `text` as its own prompt through the composer's ordinary
+    /// submission path (`deck_term::Terminal::inject_tsp`). A draft is displaced into omp's recall
+    /// history instead of being cleared with Ctrl+C.
+    Send {
+        surface: String,
+        editor: String,
+        text: String,
+    },
 }
 
 const ESC_KEY: Write = Write::Key(Key::Escape, Mods::NONE);
@@ -616,6 +638,66 @@ fn write(a: &mut Active, out: &mut Poll, w: Write) {
     out.writes.push(w);
 }
 
+/// What the job's step sees of omp's composer: the grid's, or the TSP document's.
+struct Obs {
+    composer: Composer,
+    /// What sits below/over the composer: the rows under it (`None` = no composer found), or
+    /// (TSP) one marker row while the autocomplete popup is open. Compared with
+    /// [`composer::rows_below_changed`].
+    below: Option<Vec<String>>,
+    /// Changes whenever the composer shows something new (its draft, or the attachments).
+    shape: String,
+    /// The composer shows something the job's paste can have produced.
+    visible: bool,
+    tsp: Option<TspComposer>,
+}
+
+fn observe(env: &Env<'_>) -> Obs {
+    if let Some(tsp) = env.tsp {
+        let t = tsp();
+        return Obs {
+            composer: t.state.clone(),
+            below: Some(if t.popup {
+                vec!["autocomplete".to_owned()]
+            } else {
+                Vec::new()
+            }),
+            shape: t.fingerprint(),
+            visible: t.state != Composer::Missing,
+            tsp: Some(t),
+        };
+    }
+    let screen = (env.screen)();
+    let composer = composer::inspect(&screen);
+    Obs {
+        below: composer::rows_below(&screen),
+        shape: match &composer {
+            Composer::Draft(d) => d.clone(),
+            _ => String::new(),
+        },
+        visible: matches!(composer, Composer::Draft(_)),
+        composer,
+        tsp: None,
+    }
+}
+
+/// The text a job submits as one TSP `send` event, when the program accepts it: a slash command
+/// or a plain Send (steering, follow-ups and attachments need the composer's own keys).
+fn atomic_text(payload: &Payload, tsp: Option<&TspComposer>) -> Option<String> {
+    if !tsp.is_some_and(|t| t.can_send) {
+        return None;
+    }
+    match payload {
+        Payload::Slash(text) => Some(text.clone()),
+        Payload::Text {
+            attach: None,
+            text,
+            mode: ComposeMode::Send,
+        } => Some(text.clone()),
+        _ => None,
+    }
+}
+
 fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut Poll) -> Step {
     let now = env.now;
     let wait_until = |t: Instant| Step::Wait(t.saturating_duration_since(now));
@@ -658,32 +740,32 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             let Some(bytes) = (env.paste)(first) else {
                 return Step::Dropped(End::NoPaste);
             };
-            let screen = (env.screen)();
-            let before = match composer::inspect(&screen) {
-                Composer::Missing => return Step::Dropped(End::DialogOpen),
-                Composer::Empty => String::new(),
-                Composer::Draft(draft) => draft,
-            };
+            let obs = observe(env);
+            if obs.composer == Composer::Missing {
+                return Step::Dropped(End::DialogOpen);
+            }
             let single = attach.is_none() || text.is_empty();
-            let baseline = composer::rows_below(&screen).unwrap_or_default();
             write(a, out, Write::Bytes(bytes));
             if single {
                 return Step::Done;
             }
             a.stage = Stage::Attached {
                 at: now,
-                before,
-                baseline,
+                before: obs.shape,
+                baseline: obs.below.unwrap_or_default(),
             };
             Step::Wait(SCREEN_POLL)
         }
         (Payload::Slash(_) | Payload::Text { .. }, Stage::Start) => {
-            if let Payload::Text { attach, text, .. } = &a.job.payload
+            let obs = observe(env);
+            let atomic = atomic_text(&a.job.payload, obs.tsp.as_ref()).is_some();
+            if !atomic
+                && let Payload::Text { attach, text, .. } = &a.job.payload
                 && (env.paste)(attach.as_deref().unwrap_or(text)).is_none()
             {
                 return Step::Dropped(End::NoPaste);
             }
-            match composer::inspect(&(env.screen)()) {
+            match obs.composer {
                 Composer::Missing => Step::Dropped(End::DialogOpen),
                 Composer::Draft(draft) => {
                     out.confirm = Some(Confirm {
@@ -716,6 +798,12 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
         ) => Step::Done,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::AwaitConfirm) => Step::Blocked,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::ClearPending) => {
+            // A `send` displaces the draft by itself: no Ctrl+C.
+            let tsp = env.tsp.map(|f| f());
+            if atomic_text(&a.job.payload, tsp.as_ref()).is_some() {
+                a.stage = Stage::Cleared(now);
+                return Step::Continue;
+            }
             let last = [*ctrl_c, env.last_ctrl_c].into_iter().flatten().max();
             match last {
                 Some(t) if now < t + CTRL_C_GAP => wait_until(t + CTRL_C_GAP),
@@ -732,16 +820,40 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
             if now < until {
                 return wait_until(until);
             }
+            let obs = observe(env);
+            if let Some(text) = atomic_text(&a.job.payload, obs.tsp.as_ref()) {
+                if text.trim().is_empty() {
+                    return Step::Dropped(End::Aborted);
+                }
+                // No composer to address (an ask or dialog took it): wait a moment for it to come
+                // back, else the job is refused as with any open dialog.
+                let Some((surface, editor)) = obs.tsp.and_then(|t| t.target) else {
+                    return if now >= until + SHOW_TIMEOUT {
+                        Step::Dropped(End::DialogOpen)
+                    } else {
+                        Step::Wait(SCREEN_POLL)
+                    };
+                };
+                write(
+                    a,
+                    out,
+                    Write::Send {
+                        surface,
+                        editor,
+                        text,
+                    },
+                );
+                return Step::Done;
+            }
             // Pasting onto a draft omp has not cleared yet would submit the two of them as one.
-            let screen = (env.screen)();
-            if composer::inspect(&screen) != Composer::Empty {
+            if obs.composer != Composer::Empty {
                 return if now >= until + SHOW_TIMEOUT {
                     Step::Stalled
                 } else {
                     Step::Wait(SCREEN_POLL)
                 };
             }
-            let baseline = composer::rows_below(&screen).unwrap_or_default();
+            let baseline = obs.below.unwrap_or_default();
             let (bytes, attaching) = match &a.job.payload {
                 Payload::Slash(text) => ([PASTE_START, text.as_bytes(), PASTE_END].concat(), false),
                 Payload::Text { attach, text, .. } => {
@@ -784,21 +896,26 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
 }
 
 /// The composer shows the job's paste: the command itself (omp may draw an argument hint after
-/// it, and wraps long lines), or any text for a review (omp collapses long pastes into a marker).
-fn shows_paste(payload: &Payload, screen: &ScreenText) -> bool {
-    let Composer::Draft(draft) = composer::inspect(screen) else {
-        return false;
-    };
+/// it, and wraps long lines), or any text for a review (omp collapses long pastes into a marker;
+/// under TSP an attachment-only paste shows as chips with no text).
+fn shows_paste(payload: &Payload, obs: &Obs) -> bool {
     match payload {
         Payload::Slash(text) => {
+            let Composer::Draft(draft) = &obs.composer else {
+                return false;
+            };
             let squash = |s: &str| -> String {
                 s.chars()
                     .filter(|c| !c.is_whitespace() && *c != '↵')
                     .collect()
             };
-            squash(&draft).starts_with(&squash(text))
+            squash(draft).starts_with(&squash(text))
         }
-        _ => true,
+        _ => {
+            obs.visible
+                && (matches!(obs.composer, Composer::Draft(_))
+                    || obs.tsp.as_ref().is_some_and(|t| t.chips > 0))
+        }
     }
 }
 
@@ -814,10 +931,8 @@ fn after_attach(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     else {
         return Step::Done;
     };
-    let shown = match composer::inspect(&(env.screen)()) {
-        Composer::Draft(draft) => draft != *before,
-        Composer::Empty | Composer::Missing => false,
-    };
+    let obs = observe(env);
+    let shown = obs.visible && obs.shape != *before;
     if !shown {
         return if now >= *at + SHOW_TIMEOUT {
             Step::Stalled
@@ -864,8 +979,8 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     else {
         return Step::Done;
     };
-    let screen = (env.screen)();
-    if !shows_paste(&a.job.payload, &screen) {
+    let obs = observe(env);
+    if !shows_paste(&a.job.payload, &obs) {
         return if now >= *at + SHOW_TIMEOUT {
             Step::Stalled
         } else {
@@ -880,7 +995,7 @@ fn after_paste(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
         ComposeMode::Send | ComposeMode::Steer | ComposeMode::Insert => ENTER_KEY,
     };
     let popup = if env.activity == Activity::Idle {
-        let below = composer::rows_below(&screen).unwrap_or_default();
+        let below = obs.below.unwrap_or_default();
         match settle {
             Some((rows, since)) if !composer::rows_below_changed(rows, &below) => {
                 let due = *since + SETTLE;
@@ -922,7 +1037,8 @@ fn after_escape(a: &mut Active, env: &Env<'_>, out: &mut Poll) -> Step {
     if now < due {
         return Step::Wait(due - now);
     }
-    if composer::rows_below(&(env.screen)())
+    if observe(env)
+        .below
         .is_some_and(|rows| composer::rows_below_changed(popup, &rows))
     {
         write(a, out, ENTER_KEY);
@@ -1048,6 +1164,7 @@ mod tests {
                 last_ctrl_c: self.last_ctrl_c,
                 screen: &f,
                 paste: &|t| paste_ok.then(|| [PASTE_START, t.as_bytes(), PASTE_END].concat()),
+                tsp: None,
             });
             for w in &p.writes {
                 self.apply(w);
@@ -1080,7 +1197,7 @@ mod tests {
                 // Like omp: Ctrl+C empties the composer but leaves a stale popup on screen;
                 // Ctrl+Q queues the draft as a follow-up.
                 Write::Key(Key::Char('c' | 'q'), m) if m.ctrl => self.draft.clear(),
-                Write::Key(..) => {}
+                Write::Key(..) | Write::Send { .. } => {}
             }
         }
     }
@@ -1945,5 +2062,326 @@ mod tests {
         let (writes, ended) = drain_ended(&mut fx, &mut inj);
         assert_eq!(writes, vec![paste(ATTACH)]);
         assert_eq!(ended, vec![("Send prompt".to_owned(), End::Stalled)]);
+    }
+
+    /// A scripted omp that speaks TSP: its composer is only in the document (the grid is blank).
+    struct TspFixture {
+        base: Instant,
+        activity: Activity,
+        /// `None` = no composer to address (an ask or dialog took it).
+        text: Option<String>,
+        can_send: bool,
+        chips: usize,
+        popup: bool,
+        /// The next paste is an attachment drop: it adds a chip, not text.
+        paste_is_chip: bool,
+        sent: Vec<String>,
+        submitted: Vec<String>,
+        ctrl_c: bool,
+    }
+
+    impl TspFixture {
+        fn new() -> TspFixture {
+            TspFixture {
+                base: Instant::now(),
+                activity: Activity::Idle,
+                text: Some(String::new()),
+                can_send: true,
+                chips: 0,
+                popup: false,
+                paste_is_chip: false,
+                sent: Vec::new(),
+                submitted: Vec::new(),
+                ctrl_c: false,
+            }
+        }
+
+        fn composer(&self) -> TspComposer {
+            let state = match &self.text {
+                None => Composer::Missing,
+                Some(t) if t.trim().is_empty() => Composer::Empty,
+                Some(t) => Composer::Draft(t.clone()),
+            };
+            TspComposer {
+                target: self
+                    .text
+                    .as_ref()
+                    .map(|_| ("s:1".to_owned(), "3.line/input".to_owned())),
+                state,
+                can_send: self.can_send,
+                chips: self.chips,
+                popup: self.popup,
+            }
+        }
+
+        fn poll(&mut self, inj: &mut Injector, ms: u64) -> Poll {
+            let c = self.composer();
+            let tsp = move || c.clone();
+            let p = inj.poll(&Env {
+                now: self.base + Duration::from_millis(ms),
+                activity: self.activity,
+                last_ctrl_c: None,
+                screen: &|| ScreenText::default(),
+                paste: &|t| Some([PASTE_START, t.as_bytes(), PASTE_END].concat()),
+                tsp: Some(&tsp),
+            });
+            for w in &p.writes {
+                self.apply(w);
+            }
+            p
+        }
+
+        fn apply(&mut self, w: &Write) {
+            let text = self.text.get_or_insert_with(String::new);
+            match w {
+                Write::Bytes(b) => {
+                    let inner = &b[PASTE_START.len()..b.len() - PASTE_END.len()];
+                    if self.paste_is_chip {
+                        self.chips += 1;
+                        self.paste_is_chip = false;
+                    } else {
+                        text.push_str(&String::from_utf8_lossy(inner));
+                        self.popup = text.starts_with('/');
+                    }
+                }
+                Write::Send { text: t, .. } => {
+                    // Like omp: the displaced draft goes to recall, the text is its own prompt.
+                    self.sent.push(t.clone());
+                    text.clear();
+                    self.chips = 0;
+                }
+                Write::Key(Key::Enter, _) => {
+                    self.submitted.push(text.clone());
+                    text.clear();
+                    self.chips = 0;
+                    self.popup = false;
+                }
+                Write::Key(Key::Escape, _) => self.popup = false,
+                Write::Key(Key::Char('c'), m) if m.ctrl => {
+                    self.ctrl_c = true;
+                    text.clear();
+                }
+                Write::Key(..) => {}
+            }
+        }
+
+        /// Polls every 10 ms until the injector is idle; every write and every ended job.
+        fn drain(&mut self, inj: &mut Injector) -> (Vec<Write>, Vec<(String, End)>) {
+            let (mut writes, mut ended) = (Vec::new(), Vec::new());
+            let mut t = 0;
+            while inj.is_busy() && t < 10_000 {
+                let p = self.poll(inj, t);
+                writes.extend(p.writes);
+                ended.extend(p.ended.into_iter().map(|e| (e.label, e.end)));
+                t += 10;
+            }
+            (writes, ended)
+        }
+    }
+
+    fn send_event(text: &str) -> Write {
+        Write::Send {
+            surface: "s:1".to_owned(),
+            editor: "3.line/input".to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tsp_send_is_one_event_into_the_editor_not_a_paste() {
+        let mut fx = TspFixture::new();
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Rename", "/rename new title", Requires::Idle));
+        inj.push(Job::text("Prompt", "Reply with ok.", true));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(
+            writes,
+            vec![
+                send_event("/rename new title"),
+                send_event("Reply with ok.")
+            ]
+        );
+        assert_eq!(
+            ended,
+            vec![
+                ("Rename".to_owned(), End::Completed),
+                ("Prompt".to_owned(), End::Completed)
+            ]
+        );
+        assert!(!fx.ctrl_c);
+    }
+
+    #[test]
+    fn tsp_draft_asks_first_and_a_clear_answer_sends_without_ctrl_c() {
+        let mut fx = TspFixture::new();
+        fx.text = Some("half typed".to_owned());
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        let first = fx.poll(&mut inj, 0);
+        assert!(first.writes.is_empty());
+        assert_eq!(
+            first.confirm.map(|c| c.draft),
+            Some("half typed".to_owned())
+        );
+        inj.answer(true);
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![send_event("/compact")]);
+        assert_eq!(ended, vec![("Compact".to_owned(), End::Completed)]);
+        assert!(!fx.ctrl_c, "a send displaces the draft by itself");
+        // Declining drops the job and leaves the draft alone.
+        let mut fx = TspFixture::new();
+        fx.text = Some("half typed".to_owned());
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        fx.poll(&mut inj, 0);
+        inj.answer(false);
+        let (writes, _) = fx.drain(&mut inj);
+        assert!(writes.is_empty());
+        assert_eq!(fx.text.as_deref(), Some("half typed"));
+    }
+
+    #[test]
+    fn tsp_job_is_refused_while_an_ask_holds_the_composer() {
+        let mut fx = TspFixture::new();
+        fx.text = None;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        inj.push(Job::text("Note", "text", false));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert!(writes.is_empty());
+        assert_eq!(
+            ended,
+            vec![
+                ("Compact".to_owned(), End::DialogOpen),
+                ("Note".to_owned(), End::DialogOpen)
+            ]
+        );
+    }
+
+    #[test]
+    fn tsp_ask_opening_after_the_confirmation_drops_the_send_unwritten() {
+        let mut fx = TspFixture::new();
+        fx.text = Some("draft".to_owned());
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        fx.poll(&mut inj, 0);
+        fx.text = None;
+        inj.answer(true);
+        let (writes, ended) = fx.drain(&mut inj);
+        assert!(writes.is_empty());
+        assert_eq!(ended, vec![("Compact".to_owned(), End::DialogOpen)]);
+    }
+
+    #[test]
+    fn tsp_busy_refuses_idle_jobs_and_idle_refuses_steering() {
+        let mut fx = TspFixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::text("Prompt", "hi", true));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert!(writes.is_empty());
+        assert_eq!(
+            ended,
+            vec![("Prompt".to_owned(), End::Refused(Requires::Idle))]
+        );
+        fx.activity = Activity::Idle;
+        inj.push(Job::compose("Steer", None, "now", ComposeMode::Steer));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert!(writes.is_empty());
+        assert_eq!(
+            ended,
+            vec![("Steer".to_owned(), End::Refused(Requires::Busy))]
+        );
+    }
+
+    #[test]
+    fn tsp_insert_pastes_at_the_cursor_and_keeps_the_draft() {
+        let mut fx = TspFixture::new();
+        fx.text = Some("mine ".to_owned());
+        let mut inj = Injector::default();
+        inj.push(Job::text("Insert", "added", false));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![paste("added")]);
+        assert_eq!(ended, vec![("Insert".to_owned(), End::Completed)]);
+        assert_eq!(fx.text.as_deref(), Some("mine added"));
+        assert!(fx.sent.is_empty() && fx.submitted.is_empty());
+    }
+
+    #[test]
+    fn tsp_steering_pastes_waits_for_the_document_then_presses_the_key() {
+        let mut fx = TspFixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Steer",
+            None,
+            "use sqlite",
+            ComposeMode::Steer,
+        ));
+        inj.push(Job::compose(
+            "Later",
+            None,
+            "and tests",
+            ComposeMode::FollowUp,
+        ));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(
+            writes,
+            vec![
+                paste("use sqlite"),
+                ENTER_KEY,
+                paste("and tests"),
+                FOLLOW_UP_KEY
+            ]
+        );
+        assert_eq!(ended.len(), 2);
+        assert!(ended.iter().all(|(_, e)| *e == End::Completed));
+    }
+
+    #[test]
+    fn tsp_without_send_in_the_hello_falls_back_to_paste_and_enter() {
+        let mut fx = TspFixture::new();
+        fx.can_send = false;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Rename", "/rename x", Requires::Idle));
+        let (writes, _) = fx.drain(&mut inj);
+        // The document's autocomplete popup is closed with Esc before the Enter, as on the grid.
+        assert_eq!(writes, vec![paste("/rename x"), ESC_KEY, ENTER_KEY]);
+        assert_eq!(fx.submitted, vec!["/rename x".to_owned()]);
+    }
+
+    #[test]
+    fn tsp_attachments_are_pasted_first_and_shown_as_chips_before_the_text() {
+        let mut fx = TspFixture::new();
+        fx.paste_is_chip = true;
+        let mut inj = Injector::default();
+        inj.push(Job::compose(
+            "Prompt",
+            Some("'/tmp/a.png'"),
+            "look at this",
+            ComposeMode::Send,
+        ));
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(
+            writes,
+            vec![paste("'/tmp/a.png'"), paste("look at this"), ENTER_KEY]
+        );
+        assert_eq!(ended, vec![("Prompt".to_owned(), End::Completed)]);
+        assert_eq!(fx.submitted, vec!["look at this".to_owned()]);
+        assert!(fx.sent.is_empty(), "a send would drop the attachments");
+    }
+
+    #[test]
+    fn tsp_stop_still_uses_escape_and_keys_pass_through() {
+        let mut fx = TspFixture::new();
+        fx.activity = Activity::Busy;
+        let mut inj = Injector::default();
+        inj.push(Job::stop());
+        let (writes, _) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![ESC_KEY, ESC_KEY]);
+        let mut inj = Injector::default();
+        inj.push(plan_job("Plan"));
+        let (writes, _) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![Write::Key(Key::Char('p'), ALT_SHIFT)]);
     }
 }

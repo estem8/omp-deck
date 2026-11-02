@@ -163,6 +163,21 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   </details>
 
+- **Chat view**: Read and drive an omp session as a native conversation instead of a terminal.
+
+  <details><summary>More</summary>
+
+  Sessions open in the terminal by default. Settings → General → "Open sessions in" switches the default to Chat,
+  and "Open in chat view" / "New chat session" in the sidebar menus open one on demand. omp then describes its UI to
+  OmpDeck (omp's Tern Surface Protocol), which draws it natively: your messages as bubbles, replies as formatted
+  text, tool calls as cards with output, thinking, todos, approvals, questions, the model picker and slash
+  commands, in the colors of the active style. You still type into omp's own composer. "Switch to chat / terminal
+  view" on an open tab restarts that session in the other view, only while omp is idle. Chat sessions always run in
+  the OmpDeck session host (not tmux), which keeps the conversation while no window shows it and restores it when you
+  reopen the tab.
+
+  </details>
+
 - **Session tree**: Browse conversation branches, fork and navigate with recorded cost context.
 
   <details><summary>More</summary>

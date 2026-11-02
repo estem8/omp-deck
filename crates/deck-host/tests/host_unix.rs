@@ -421,9 +421,26 @@ fn child_exiting_at_launch_is_still_served_with_final_screen_and_code() {
 #[test]
 fn unseen_exit_lingers_until_killed() {
     let ns = TestNs::new();
-    deck_host::start(&ns.0, &spec("gone", "/bin/sh", &["-c", "exit 2"]), 80, 24).unwrap();
+    deck_host::start(
+        &ns.0,
+        &spec(
+            "gone",
+            "/bin/sh",
+            &[
+                "-c",
+                "printf '\\033]0;π ⠦ busy\\007\\033]7501;state=working\\007'; exit 2",
+            ],
+        ),
+        80,
+        24,
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(ns.0.has("gone"));
+    let info = ns.0.info("gone").unwrap();
+    assert_eq!(info.run_state, None);
+    assert_eq!(info.title, None);
+    assert_eq!(info.tsp_facts, None);
     ns.0.kill("gone").unwrap();
     assert!(!ns.0.has("gone"));
 }

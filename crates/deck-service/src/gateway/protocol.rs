@@ -28,7 +28,7 @@ use deck_core::backup::{
     RestoreReport,
 };
 use deck_core::changes::{ChangedFile, Changes, DiffSide, FileDiff};
-use deck_core::config::GatewayMode;
+use deck_core::config::{GatewayMode, SessionView};
 use deck_core::ctl::{CtlCommand, LiveSnapshot};
 use deck_core::fleet::{FleetSnapshot, FleetTarget};
 use deck_core::inventory::{InventoryEntry, SessionStats};
@@ -713,6 +713,10 @@ pub struct ControllerInfo {
     pub views: usize,
     /// A controlling view owns geometry.
     pub controlled: bool,
+    /// The view the session actually runs in: `Chat` only for a host session started in TSP
+    /// mode (a Chat request on a backend that cannot carry TSP runs as `Terminal`).
+    #[serde(default)]
+    pub view: SessionView,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1014,8 +1018,13 @@ pub enum ServerConnectOutcome {
 pub enum Mutation {
     /// Open (attach or create) a session; the result is its target.
     Launch(LaunchSpec),
-    /// Kill and relaunch the session with the same identity request.
-    Restart(SessionTarget),
+    /// Kill and relaunch the session with the same identity request, in `view` (`None`: the
+    /// view it runs in now). `Some(other)` is "switch view": the same session file resumed in
+    /// the other mode.
+    Restart {
+        target: SessionTarget,
+        view: Option<SessionView>,
+    },
     /// Graceful stop of this session's backend process only.
     Stop(SessionTarget),
     /// Kill this session's process only.
@@ -1379,7 +1388,7 @@ impl Mutation {
     pub fn label(&self) -> &'static str {
         match self {
             Mutation::Launch(_) => "launch",
-            Mutation::Restart(_) => "restart",
+            Mutation::Restart { .. } => "restart",
             Mutation::Stop(_) => "stop",
             Mutation::Kill(_) => "kill",
             Mutation::KillNames { .. } => "kill-names",
@@ -1467,7 +1476,7 @@ impl Mutation {
     /// The session it addresses, if any (journal target; stale checks).
     pub fn target(&self) -> Option<&SessionTarget> {
         match self {
-            Mutation::Restart(t)
+            Mutation::Restart { target: t, .. }
             | Mutation::Stop(t)
             | Mutation::Kill(t)
             | Mutation::Close { target: t, .. }
@@ -1526,6 +1535,11 @@ pub struct LaunchSpec {
     /// `omp --fork` copy of the session with this id: the gateway finds the new file and
     /// reports [`ServerEvent::CopyResult`].
     pub copy_of: Option<String>,
+    /// The view to open the session in. `Chat` runs omp in TSP mode on the session host; a
+    /// session that is already alive keeps the mode it was created with. The effective view
+    /// is reported by [`Done::Session`] and [`ControllerInfo::view`].
+    #[serde(default)]
+    pub view: SessionView,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1580,8 +1594,9 @@ impl Outcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Done {
     Unit,
-    /// A session opened (or restarted): its target.
-    Session(SessionTarget),
+    /// A session opened (or restarted): its target and the view it runs in (see
+    /// [`ControllerInfo::view`]; `Terminal` when `Chat` was asked for but unavailable).
+    Session(SessionTarget, SessionView),
     /// The injected request reached its final delivery (see the controller record).
     Submitted(RequestRecord),
     /// `answer` applied (`false`: no such outstanding confirmation).

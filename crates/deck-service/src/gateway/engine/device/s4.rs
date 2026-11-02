@@ -1862,6 +1862,7 @@ impl Engine {
                     argv: crate::gateway::engine::sessions::omp_argv(None),
                     role: SessionRole::Session,
                     copy_of: None,
+                    view: self.cfg.session_view,
                 })
             }
             Op::RunningKill { ids } => {

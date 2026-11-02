@@ -322,6 +322,16 @@ pub struct HostInfo {
     /// Current terminal title (OSC 0/2); `None` when none was set or from an older daemon.
     #[serde(default)]
     pub title: Option<String>,
+    /// The session was created with [`SessionSpec::tsp`] (older daemons: `false`).
+    #[serde(default)]
+    pub tsp: bool,
+    /// omp's run status from its OSC 7501 reports (`None`: none held, or from an older daemon).
+    #[serde(default)]
+    pub run_state: Option<crate::run_state::RunState>,
+    /// What omp's TSP document shows of its run (`None`: not a TSP session, no omp surface yet,
+    /// or an older daemon).
+    #[serde(default)]
+    pub tsp_facts: Option<crate::run_state::TspFacts>,
 }
 
 #[cfg(test)]
@@ -395,5 +405,18 @@ mod tests {
             "attached":false,"cols":80,"rows":24}"#;
         let info: HostInfo = parse(old).unwrap();
         assert_eq!(info.title, None);
+    }
+
+    #[test]
+    fn info_carries_run_state_and_tolerates_its_absence() {
+        use crate::run_state::{RunPhase, RunState};
+        let old = br#"{"name":"n","protocol":1,"host_version":"0","daemon_pid":1,"child_pid":2,
+            "child_started_unix_ms":3,"cwd":"/","argv":[],"tty":null,"term_session_id":null,
+            "attached":false,"cols":80,"rows":24}"#;
+        let mut info: HostInfo = parse(old).unwrap();
+        assert_eq!(info.run_state, None);
+        info.run_state = Some(RunState::new(RunPhase::Working));
+        let wire = serde_json::to_vec(&info).unwrap();
+        assert_eq!(parse::<HostInfo>(&wire).unwrap(), info);
     }
 }
