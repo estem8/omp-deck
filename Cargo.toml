@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-service", "crates/deck-remote", "crates/deck-relay", "crates/omp-deck"]
+members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/deck-tsp", "crates/deck-service", "crates/deck-remote", "crates/deck-relay", "crates/omp-deck"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,7 @@ readme = "README.md"
 [workspace.dependencies]
 deck-core = { path = "crates/deck-core" }
 deck-host = { path = "crates/deck-host" }
+deck-tsp = { path = "crates/deck-tsp" }
 deck-term = { path = "crates/deck-term" }
 deck-service = { path = "crates/deck-service" }
 deck-remote = { path = "crates/deck-remote", default-features = false }

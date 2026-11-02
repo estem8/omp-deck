@@ -1171,6 +1171,7 @@ name = "deck-host"
 version = "0.24.1"
 dependencies = [
  "alacritty_terminal",
+ "deck-tsp",
  "dirs",
  "getrandom 0.4.3",
  "libc",
@@ -1236,6 +1237,7 @@ dependencies = [
  "deck-remote",
  "deck-service",
  "deck-term",
+ "deck-tsp",
  "dirs",
  "env_logger",
  "futures-lite",
@@ -1281,6 +1283,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "deck-tsp"
+version = "0.24.1"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

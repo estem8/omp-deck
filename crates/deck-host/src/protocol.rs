@@ -9,6 +9,10 @@
 //! (current grid), `Snapshot`… `SnapshotEnd`, then live `Output`/`Resized` in host order, then
 //! `Exited` and end of stream. A daemon predating `Observe` closes the connection on the
 //! unknown kind; clients report that, there is no fallback.
+//!
+//! `TspPeek` (additive, no payload) asks a session started with [`SessionSpec::tsp`] for its
+//! TSP document: `Snapshot`… `SnapshotEnd` carrying one JSON document (see
+//! `deck_tsp::document::Document`'s `Serialize`), or `Error` when the session is not a TSP one.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -48,6 +52,9 @@ pub enum Kind {
     /// connection may afterwards send only `Ping` and `Detach`; anything else makes the daemon
     /// drop the subscription and close the connection immediately, without a reply.
     Observe = 0x0b,
+    /// TSP document request: no payload, answered with `Snapshot`… `SnapshotEnd` (the JSON
+    /// document) or `Error` for a session without TSP.
+    TspPeek = 0x0c,
     // Daemon -> client (`Info` reuses 0x08 with a `HostInfo` payload).
     Snapshot = 0x21,
     SnapshotEnd = 0x22,
@@ -75,6 +82,7 @@ impl Kind {
             0x09 => Kind::Ping,
             0x0a => Kind::Peek,
             0x0b => Kind::Observe,
+            0x0c => Kind::TspPeek,
             0x21 => Kind::Snapshot,
             0x22 => Kind::SnapshotEnd,
             0x23 => Kind::Output,
@@ -276,6 +284,10 @@ pub struct SessionSpec {
     /// Applied after `env_remove` on top of the daemon's inherited environment.
     pub env_set: Vec<(String, String)>,
     pub env_remove: Vec<String>,
+    /// Act as a TSP terminal for the program (see `docs/notes/tsp.md`): answer its `hello`
+    /// query, apply its surface messages to a document and ack frames, even detached.
+    #[serde(default)]
+    pub tsp: bool,
 }
 
 /// The spec file a client writes for `serve --spec`.

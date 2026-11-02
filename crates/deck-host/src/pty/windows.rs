@@ -441,6 +441,7 @@ mod tests {
                 ("path".into(), r"C:\x".into()),
             ],
             env_remove: vec!["windir".into()],
+            tsp: false,
         };
         let (block, path, _) = environment(&spec);
         assert_eq!(path.as_deref(), Some(r"C:\x"));

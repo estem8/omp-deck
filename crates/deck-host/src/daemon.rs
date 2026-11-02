@@ -20,6 +20,12 @@
 //!   reader and the controller never wait for an observer. Output chunks are shared via `Arc`.
 //! - Session end queues `Exited` and then closes every observer; shutdown waits at most
 //!   `SHUTDOWN_GRACE` for their writers.
+//!
+//! TSP: a session spawned with `SessionSpec::tsp` also runs a `deck_tsp` terminal beside the
+//! alacritty parser (which swallows APC). Under the core lock, `Core::feed` hands every output
+//! chunk to it and queues its reply bytes (hello reply, acks, errors) ahead of the alacritty
+//! query replies of the same chunk, so the `hello` answer precedes the DA1 answer. Acks are
+//! produced here, attached or not, so a detached omp never stalls on the frame window.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -170,6 +176,15 @@ fn start(
             next_client: 1,
             ever_attached: false,
             replies: Vec::new(),
+            tsp: request.spec.tsp.then(|| {
+                deck_tsp::terminal::Responder::new(deck_tsp::terminal::TermInfo {
+                    cols: u32::from(size.cols),
+                    dark: palette_is_dark(&request.palette),
+                    reduce_motion: false,
+                    hour12: false,
+                    input: deck_tsp::terminal::InputEncoding::native(),
+                })
+            }),
         }),
         sync_cv: Condvar::new(),
         status: Mutex::new(Status {
@@ -510,6 +525,8 @@ struct Core {
     /// Query replies collected while locked; pushed to the PTY after unlocking
     /// ([`Shared::send_replies`]).
     replies: Vec<u8>,
+    /// The TSP terminal of a `SessionSpec::tsp` session.
+    tsp: Option<deck_tsp::terminal::Responder>,
 }
 
 struct Status {
@@ -615,7 +632,22 @@ impl Core {
     fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
         self.scanner.advance(bytes);
+        // Before `answer_queries`: the hello reply must precede the DA1 reply to the query
+        // that follows it in the same output.
+        if let Some(tsp) = &mut self.tsp {
+            let out = tsp.on_output(bytes, Instant::now());
+            self.replies.extend_from_slice(&out);
+        }
         self.answer_queries();
+    }
+
+    /// Records the controller's palette; a light/dark flip is reported to a live TSP program.
+    fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+        if let Some(tsp) = &mut self.tsp {
+            let out = tsp.theme(palette_is_dark(&palette));
+            self.replies.extend_from_slice(&out);
+        }
     }
 
     /// Appends replies to queued terminal queries to `self.replies`.
@@ -695,6 +727,10 @@ impl Core {
             }
             self.term.resize(term_size(self.size));
             self.scanner.resize(rows);
+            if let Some(tsp) = &mut self.tsp {
+                let out = tsp.resize(u32::from(self.size.cols));
+                self.replies.extend_from_slice(&out);
+            }
         }
         // Under the core lock like output, so observers apply it between the same bytes.
         if self.size != before && !self.observers.is_empty() {
@@ -716,6 +752,15 @@ impl Core {
         let side = self.scanner.state().clone();
         snapshot::encode(&mut self.term, &side, history_lines as usize)
     }
+}
+
+/// Whether the controller's background is dark (relative luminance below one half); what a TSP
+/// program is told as `dark`.
+fn palette_is_dark(palette: &Palette) -> bool {
+    let [r, g, b] = palette.0[Palette::BACKGROUND];
+    // Rec. 709 weights on the gamma-encoded bytes: enough to tell a light theme from a dark one.
+    let luminance = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+    luminance < 127.5
 }
 
 /// Color for a query the child's own overrides do not answer: the client's palette, else the
@@ -985,6 +1030,20 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
                 }
                 conn.reply(Kind::SnapshotEnd, &[])?;
             }
+            Kind::TspPeek => {
+                let core = shared.core();
+                let Some(tsp) = &core.tsp else {
+                    drop(core);
+                    conn.reply_json(Kind::Error, &"not a TSP session")?;
+                    continue;
+                };
+                let document = serde_json::to_vec(tsp.document());
+                drop(core);
+                for chunk in document?.chunks(SNAPSHOT_CHUNK) {
+                    conn.reply(Kind::Snapshot, chunk)?;
+                }
+                conn.reply(Kind::SnapshotEnd, &[])?;
+            }
             Kind::Attach => {
                 let params: AttachParams = protocol::parse(&conn.payload)?;
                 attach(conn, &params)?;
@@ -1011,13 +1070,15 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
                 let mut core = shared.core();
                 if conn.is_current(&core) {
                     core.resize(&shared.child, p.cols, p.rows, p.cell_width, p.cell_height);
+                    shared.send_replies(core);
                 }
             }
             Kind::Palette => {
                 let palette: Palette = protocol::parse(&conn.payload)?;
                 let mut core = shared.core();
                 if conn.is_current(&core) {
-                    core.palette = palette;
+                    core.set_palette(palette);
+                    shared.send_replies(core);
                 }
             }
             Kind::Detach => {
@@ -1058,7 +1119,7 @@ fn attach(conn: &mut Conn<'_>, params: &AttachParams) -> Result<()> {
         params.cell_width,
         params.cell_height,
     );
-    core.palette = params.palette;
+    core.set_palette(params.palette);
     let snapshot = core.snapshot(params.history_lines);
     if let Some(old) = core.client.take() {
         // The old writer sends this, then sees the queue closed and ends its stream.

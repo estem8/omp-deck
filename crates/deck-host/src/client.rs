@@ -240,6 +240,26 @@ pub fn peek(ns: &Namespace, name: &str, history_lines: u32) -> Result<(HostInfo,
     Ok((info, snapshot))
 }
 
+/// The TSP document of a `SessionSpec::tsp` session as JSON (`deck_tsp::document::Document`'s
+/// serialization), without attaching. Fails with a remote error for a non-TSP session.
+pub fn tsp_peek(ns: &Namespace, name: &str) -> Result<serde_json::Value> {
+    let mut conn = ns.connect(name, ATTACH_TIMEOUT)?;
+    conn.check_protocol()?;
+    conn.send(Kind::TspPeek, &[])?;
+    let mut document = Vec::new();
+    loop {
+        match conn.recv()? {
+            Some(Kind::Snapshot) => document.extend_from_slice(&conn.payload),
+            Some(Kind::SnapshotEnd) => break,
+            Some(Kind::Error) => return Err(remote_error(&conn.payload)),
+            Some(Kind::Exited) | None => return Err(Error::NotRunning(name.to_owned())),
+            Some(_) => {}
+        }
+    }
+    serde_json::from_slice(&document)
+        .map_err(|e| Error::Protocol(format!("TSP document is not JSON: {e}")))
+}
+
 /// What an attached client receives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {

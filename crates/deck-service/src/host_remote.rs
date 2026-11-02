@@ -484,6 +484,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             env_set: Vec::new(),
             env_remove: Vec::new(),
+            tsp: false,
         }
     }
 

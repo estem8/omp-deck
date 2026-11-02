@@ -27,6 +27,7 @@ fn spec(name: &str, program: &str, args: &[&str]) -> SessionSpec {
             ("TERM".into(), "xterm-256color".into()),
         ],
         env_remove: vec!["ENV".into(), "BASH_ENV".into()],
+        tsp: false,
     }
 }
 

@@ -18,12 +18,14 @@ use deck_host::{Namespace, SessionSpec};
 const USAGE: &str = "\
 usage: omp-deck-host <command> [--ns <namespace>] ...
   serve --name <name> --spec <file> [--foreground]   run a session daemon
-  new <name> [--cwd <dir>] [--env K=V]... [--size <cols>x<rows>] -- <program> [args...]
-                                                     start a detached session
+  new <name> [--cwd <dir>] [--env K=V]... [--size <cols>x<rows>] [--tsp] -- <program> [args...]
+                                                     start a detached session (--tsp: the host
+                                                     acts as a TSP terminal for the program)
   ls                                                 list live sessions
   info <name>                                        session details (JSON)
   kill <name>                                        kill a session and its process tree
   dump <name> [--history <rows>]                     print a session's screen as text
+  tsp <name> [--follow]                              print a TSP session's document as an outline
 --ns defaults to omp-deck.";
 
 struct Args {
@@ -38,6 +40,8 @@ struct Args {
     size: (u16, u16),
     history: u32,
     program: Vec<String>,
+    tsp: bool,
+    follow: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -55,6 +59,8 @@ fn parse_args() -> Result<Args, String> {
         size: (80, 24),
         history: 0,
         program: Vec::new(),
+        tsp: false,
+        follow: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>, flag: &str| {
         it.next().ok_or_else(|| format!("{flag} needs a value"))
@@ -65,6 +71,8 @@ fn parse_args() -> Result<Args, String> {
             "--name" => args.name = Some(value(&mut it, "--name")?),
             "--spec" => args.spec = Some(value(&mut it, "--spec")?.into()),
             "--foreground" => args.foreground = true,
+            "--tsp" => args.tsp = true,
+            "--follow" => args.follow = true,
             "--cwd" => args.cwd = Some(value(&mut it, "--cwd")?.into()),
             "--env" => {
                 let kv = value(&mut it, "--env")?;
@@ -150,6 +158,24 @@ fn run(args: &Args) -> Result<(), String> {
             );
             Ok(())
         }
+        "tsp" => {
+            let name = one_name(args)?;
+            let mut last = String::new();
+            loop {
+                let outline = render_outline(&deck_host::tsp_peek(&ns, name).map_err(err)?);
+                if outline != last {
+                    if args.follow && !last.is_empty() {
+                        println!("--");
+                    }
+                    print!("{outline}");
+                    last = outline;
+                }
+                if !args.follow {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
         "new" => {
             let name = one_name(args)?;
             let (program, rest) = args
@@ -175,6 +201,7 @@ fn run(args: &Args) -> Result<(), String> {
                 cwd,
                 env_set,
                 env_remove: Vec::new(),
+                tsp: args.tsp,
             };
             deck_host::start(&ns, &spec, args.size.0, args.size.1).map_err(err)
         }
@@ -218,6 +245,79 @@ fn render_text(snapshot: &[u8], cols: u16, rows: u16, history: usize) -> String 
     out
 }
 
+/// Longest text shown per node in the outline.
+const OUTLINE_TEXT: usize = 80;
+
+/// A TSP document (`deck_host::tsp_peek`) as an indented outline: one block per surface, one
+/// line per node with its kind, id, role, sendable flag and the start of its text.
+fn render_outline(document: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    fn node(out: &mut String, n: &serde_json::Value, depth: usize) {
+        let kind = n["k"].as_str().unwrap_or("?");
+        let id = n["id"].as_str().unwrap_or("?");
+        let _ = write!(out, "{:indent$}{kind} #{id}", "", indent = depth * 2);
+        let p = &n["p"];
+        if let Some(role) = p["role"].as_str() {
+            let _ = write!(out, " role={role}");
+        }
+        if let Some(sendable) = p["sendable"].as_bool() {
+            let _ = write!(out, " sendable={sendable}");
+        }
+        // `text` for markdown/plain nodes, concatenated `spans` for styled `text` nodes.
+        let text = match p["text"].as_str() {
+            Some(t) => t.to_owned(),
+            None => p["spans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s["t"].as_str())
+                .collect(),
+        };
+        if !text.is_empty() {
+            let mut shown: String = text.chars().take(OUTLINE_TEXT).collect();
+            if text.chars().nth(OUTLINE_TEXT).is_some() {
+                shown.push('…');
+            }
+            let _ = write!(out, " {shown:?}");
+        }
+        out.push('\n');
+        for child in n["c"].as_array().into_iter().flatten() {
+            node(out, child, depth + 1);
+        }
+    }
+
+    let mut out = String::new();
+    for s in document["surfaces"].as_array().into_iter().flatten() {
+        let _ = write!(
+            out,
+            "surface {} {}",
+            s["id"].as_str().unwrap_or("?"),
+            s["mode"].as_str().unwrap_or("?")
+        );
+        if let Some(role) = s["role"].as_str() {
+            let _ = write!(out, " role={role}");
+        }
+        let _ = write!(
+            out,
+            " {} seq={} nodes={}",
+            if s["open"].as_bool() == Some(true) {
+                "open"
+            } else {
+                "closed"
+            },
+            s["seq"],
+            s["nodes"]
+        );
+        if let Some(focus) = s["focus"].as_str() {
+            let _ = write!(out, " focus=#{focus}");
+        }
+        out.push('\n');
+        node(&mut out, &s["root"], 1);
+    }
+    out
+}
+
 /// Release builds use the GUI subsystem: attach to the parent console so CLI output shows
 /// (unless stdout is already redirected).
 #[cfg(all(windows, not(debug_assertions)))]
@@ -252,5 +352,43 @@ fn main() -> ExitCode {
             eprintln!("omp-deck-host {}: {msg}", args.command);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::render_outline;
+
+    #[test]
+    fn outline_lists_surfaces_nodes_and_truncates_text() {
+        let long = "x".repeat(100);
+        let doc = json!({"surfaces": [{
+            "id": "s1", "mode": "inline", "role": "omp.session", "open": true, "seq": 7,
+            "focus": "ed", "nodes": 4,
+            "root": {"id": "s1", "k": "col", "c": [
+                {"id": "main", "k": "col", "c": [
+                    {"id": "m1", "k": "md", "p": {"text": long}},
+                    {"id": "m2", "k": "md", "p": {"text": "multi\nline", "role": "assistant"}},
+                ]},
+                {"id": "dock", "k": "col", "c": [
+                    {"id": "ed", "k": "editor", "p": {"sendable": true, "text": ""}},
+                    {"id": "st", "k": "text", "p": {"spans": [{"t": "no-", "s": "a"}, {"t": "model"}]}},
+                ]},
+            ]}}], "blobs": []});
+        let expected = format!(
+            "surface s1 inline role=omp.session open seq=7 nodes=4 focus=#ed\n\
+             \x20 col #s1\n\
+             \x20   col #main\n\
+             \x20     md #m1 \"{}…\"\n\
+             \x20     md #m2 role=assistant \"multi\\nline\"\n\
+             \x20   col #dock\n\
+             \x20     editor #ed sendable=true\n\
+             \x20     text #st \"no-model\"\n",
+            "x".repeat(80)
+        );
+        assert_eq!(render_outline(&doc), expected);
+        assert_eq!(render_outline(&json!({"surfaces": [], "blobs": []})), "");
     }
 }

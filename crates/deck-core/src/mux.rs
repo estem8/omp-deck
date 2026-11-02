@@ -575,6 +575,7 @@ fn host_spec(
         cwd: effective_cwd(cwd),
         env_set,
         env_remove,
+        tsp: false,
     }
 }
 

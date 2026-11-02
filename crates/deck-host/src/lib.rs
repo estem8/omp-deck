@@ -24,7 +24,7 @@ mod winproc;
 
 pub use client::{
     Attached, AttachedRx, AttachedTx, HostEvent, Observed, ObserverEvent, ObserverRx, ObserverTx,
-    attach, create_or_attach, daemon_exe, observe, peek, start,
+    attach, create_or_attach, daemon_exe, observe, peek, start, tsp_peek,
 };
 pub use error::{Error, Result};
 pub use namespace::{Namespace, valid_namespace, valid_session_name};

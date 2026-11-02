@@ -17,6 +17,7 @@ fn spec(name: &str, program: &str, args: &[&str]) -> SessionSpec {
         cwd: env().root.clone(),
         env_set: vec![("OMP_DECK_TEST".into(), "1".into())],
         env_remove: Vec::new(),
+        tsp: false,
     }
 }
 

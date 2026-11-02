@@ -48,6 +48,7 @@ fn host_running_reports_child_and_daemon_tree_until_killed() {
         cwd: work.clone(),
         env_set: Vec::new(),
         env_remove: Vec::new(),
+        tsp: false,
     };
     let before = SystemTime::now() - Duration::from_secs(2);
     deck_host::start(host.namespace(), &spec, 80, 24).unwrap();

@@ -3275,3 +3275,78 @@ deleted).
   sidebar `BackupMenu { place, off }` and the palette (`project.backup`, `project.restore`, `backup.now`,
   `backup.restore`, `backup.manage`; `sync.*` unchanged) name the active destination; the Sync page's strip shows
   the server or a "Backup settings…" button.
+
+## Native chat view (TSP) step 1: protocol core + host terminal (user, 2026-11-01)
+
+Facts: `docs/notes/tsp.md` (read first). User decisions: build omp's native (TSP) view in OmpDeck in three steps
+(1 protocol core + host, 2 egui renderer, 3 detach/reattach replay); the chat view exists **only on the OmpDeck
+session host** (tmux cannot carry TSP); keep omp's own composer (drive it with `edit`/`send` events, never a private
+text box). Step 1 ships no GUI.
+
+### New crate `crates/deck-tsp` (lib; depends on nothing of ours)
+Deps: serde, serde_json, thiserror, log, sha2, base64 (workspace). Pure, no threads, no I/O, no clocks of its own
+(callers pass `Instant`). Wire types follow omp **v18.15.0** `packages/wire/src/tsp.ts` (fetch the tag; cite it in a
+module comment). Unknown verbs/fields/kinds/ops are tolerated, never fatal.
+- `wire`: `Node { id: String, k: String, p: serde_json::Map<String, Value> /* default empty */, c: Vec<Node> }`,
+  `Op` (all ops of the tag + `Unknown(Value)`), `Frame { sf, s: u64, ops }`, `Open`, `Close`, hello `Query`/`Reply`,
+  `Event` (every event kind of the tag; serialize-only is fine for kinds the terminal never sends).
+- `stream::Splitter`: incremental scanner over PTY **output** bytes; `feed(&mut self, bytes, now: Instant) ->
+  Vec<Message>` where `Message { verb: Verb, params: Vec<(String, String)>, body: Vec<u8> }` (body reassembled from
+  `c`/`m` chunks). Passive: never alters or consumes the stream (callers still feed alacritty). Handles sequences
+  split at any byte, ignores non-`tsp;` APC (kitty `G`), drops a chunk sequence on interruption or after 1 s idle,
+  caps one APC at 262 144 bytes and a reassembled body at 16 MiB + base64 overhead (oversize ⇒ dropped, logged).
+- `document::Document`: per-surface trees from `o`/`f`/`x`/`s`/`b` messages; `apply(&mut self, &Message) ->
+  Applied { acks: Vec<(String /*sf*/, u64 /*s*/)>, errors: Vec<Event> }` (one `error` event per rejected op with its
+  index; the rest of the frame still applies). `splice` uses UTF-16 offsets. Blobs verified (sha256 id) and kept
+  under a byte cap (LRU, 64 MiB). `Serialize` for the whole document (blobs as `{id, mime, len}` only).
+- `terminal::Responder`: the terminal side. `Responder::new(TermInfo { cols, dark, reduce_motion, hour12, input:
+  InputEncoding::{Apc, Osc877} })`; `on_output(&mut self, bytes, now) -> Vec<u8>` = scan + apply + the bytes to
+  write to the child's input, in order: hello reply (to the `hello` query; kinds = the tag's `TSP_KINDS` minus
+  `json`, features limited to what this crate honours — decide from the spec and document), `blobs` query replies,
+  one coalesced `ack` per surface per call, error events. `resize(cols)` / `theme(dark)` return the matching event
+  bytes only once hello was answered (nothing before). `encode_event(&Event, InputEncoding) -> Vec<u8>` for the GUI
+  later. `document(&self) -> &Document`, `live(&self) -> bool` (hello answered).
+
+### deck-host
+- `SessionSpec` gains `#[serde(default)] pub tsp: bool` (old specs ⇒ classic). Only `tsp: true` sessions answer
+  hello; classic sessions are byte-for-byte unchanged.
+- `Core` gains `tsp: Option<deck_tsp::Responder>` (Unix `InputEncoding::Apc`, Windows `Osc877`). `Core::feed`:
+  `processor.advance` → `scanner.advance` → `tsp.on_output` appended to `replies` → `answer_queries` (so the hello
+  reply precedes the DA1 reply of the same chunk). Acks are sent attached or not. PTY resize ⇒ `resize` event;
+  palette change ⇒ `theme` event when darkness flips (dark = client palette bg luminance < 0.5; default dark).
+- Protocol (additive, `PROTOCOL` stays 1): `Kind::TspPeek = 0x0c` (client → daemon, no payload), answered on the
+  same connection with `Snapshot`… `SnapshotEnd` whose concatenated bytes are the document JSON, or `Error("not a
+  TSP session")`. Client fn `tsp_peek(ns, name) -> Result<serde_json::Value>`.
+- CLI `omp-deck-host tsp <name> [--follow]`: prints the document as an indented outline (surface, region, `k`,
+  `p.role`, ≤ 80 chars of text) — the step-1 debug view; `--follow` re-peeks every 500 ms and reprints on change.
+
+### Acceptance (step 1)
+- Unit (deck-tsp): splitter at every split offset, interrupted/idle chunk drop, caps, kitty APC ignored; every op incl.
+  UTF-16 `splice` on surrogate pairs, `set` null delete, `move`, rejected op ⇒ `error` with index while later ops
+  apply; responder emits hello reply then acks, nothing before hello; fixtures recorded from real omp 18.15.0 via
+  `PI_TUI_TSP_RECORD` (committed under `crates/deck-tsp/tests/fixtures/`, scrubbed of home/user/host names) replay
+  into a document whose final tree contains the composer `editor` and the streamed assistant text.
+- Host (no omp): a test child writes hello APC + `ESC[c` and echoes its input: the hello reply arrives before the
+  DA1 reply; a `tsp: false` session gets DA1 only.
+- Live (real omp 18.15.0 + the scripted fake model, sandbox agent dir, `omp-deck-test-*` namespace; lives in
+  `crates/deck-service/tests/` to reuse `support::fake_model`): a `tsp: true` host session goes native; a `send`
+  event submits a prompt; the reply streams (≥ 2 frames grow the assistant text); `tsp_peek` shows it; then with no
+  client attached a second prompt (sent via a short attach + detach) completes and appears in the peeked document
+  (proves detached acking, no "stopped acknowledging" stall in omp's log).
+
+### Step 1 as built (2026-11-02)
+- deck-tsp: `stream::{Splitter::{new, feed, feed_into}, Message, Verb, encode_message, encode_chunked}`,
+  `wire::{Node, Op, Frame, Open, Close, Event, Query, Reply, KINDS}` (45 kinds at v18.15.0),
+  `document::{Document::{apply, surfaces, surface, inline, blobs_have}, Surface, NodeRef, OpError}`,
+  `terminal::{Responder::{new, on_output, resize, theme, motion, document, live, program, info}, TermInfo,
+  InputEncoding::{Apc, Osc877, native}, encode_event, encode_reply, hello_reply, FEATURES}`.
+- Hello reply: `term:"omp-deck"`, kinds = KINDS minus `json`, features `["blobs","settle","adopt","reduce-motion"]`
+  (only what the crate honours; `dock`/`aside`/`scroll`/`styles`/`flow` are renderer decisions for step 2),
+  `apc:65536`, `credits:2`.
+- deck-host: `SessionSpec.tsp`, `Kind::TspPeek = 0x0c`, `tsp_peek`, CLI `new … --tsp`, `tsp <name> [--follow]`.
+  deck-core `mux` and deck-service `host_remote` pass `tsp: false` (classic sessions unchanged).
+- omp only probes outside tmux: TSP sessions need `host_env` (removes `TMUX`/`TMUX_PANE`/…).
+- Proof: `crates/deck-tsp/tests/replay.rs` (real omp 18.15.0 recording, any chunking ⇒ identical document and the
+  recorded acks), `crates/deck-host/tests/tsp_host.rs` (hello before DA1, detached acks, classic untouched),
+  `crates/deck-service/tests/tsp_live.rs` (real omp + fake model: native, `send`, streaming, detached turns, tool turn).
+  Windows: xwin clippy only.
