@@ -473,11 +473,13 @@ button.chip:active {
 }
 .nav i {
   font-style: normal;
-  font: 20px Geist, sans-serif;
+  font-size: 20px;
+  line-height: 26px;
+  /* Geist has no symbol glyphs, so fall back to platform symbol/emoji fonts. */
+  font-family: Geist, "Segoe UI Symbol", "Apple Symbols", "Noto Sans Symbols", "Noto Sans", "DejaVu Sans", "Noto Color Emoji", "Segoe UI Emoji", sans-serif;
   border: 1px solid transparent;
   width: 49px;
   text-align: center;
-  line-height: 26px;
 }
 .nav .selected {
   color: var(--accent);
