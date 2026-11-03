@@ -2195,6 +2195,11 @@ impl App {
         let mut refused = None;
         let pal = Palette::of_ui(ui);
         let font_size = self.terminal_font_size();
+        // A single chat pane under the bar: the bar already shows what the composer would repeat.
+        let bar_shows_session = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.role == TabRole::Session);
         theme::skin::central(ui, pal, true, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
@@ -2213,6 +2218,7 @@ impl App {
                 let out = crate::chat_view::ChatView::new(tab.terminal_mut())
                     .id_salt(uid)
                     .font_size(font_size)
+                    .hide_duplicates(bar_shows_session)
                     .show(ui);
                 refused = out.refused;
                 (out.response, out.open_url)
@@ -3385,8 +3391,11 @@ impl eframe::App for App {
         self.drive_agents();
         self.drive_dashboard();
         self.drive_changes(&ctx);
-        self.show_status_bar(ui);
         self.show_sidebar(ui, &snap);
+        // The status bar belongs to the open tab view: it spans the area right of the sidebar
+        // (sidebar first, so the bar's panel takes its width from what is left), under the
+        // review panel and the tab content.
+        self.show_status_bar(ui);
         self.show_changes_panel(ui);
         self.show_central(ui);
         self.show_settings(&ctx);

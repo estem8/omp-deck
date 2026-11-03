@@ -28,6 +28,8 @@ pub struct Out {
     pub release: bool,
     /// Blob id of an image to enlarge.
     pub zoom: Option<String>,
+    /// The user asked to leave the page omp shows: omp gets an Esc, as if it were typed.
+    pub dismiss: bool,
 }
 
 /// A fold flipped locally, until omp's echo (`set collapsed`) arrives (the node's generation moves).
@@ -58,6 +60,8 @@ pub struct Cx<'a> {
     pub focused: bool,
     /// What omp's hello advertised for input: native caret placement.
     pub can_edit: bool,
+    /// The app already shows these composer facts for this pane (never for fullscreen pages).
+    pub hide_duplicates: bool,
 }
 
 /// A toast from the document's ring, kept by `seq` so it shows for its whole `ttl` although omp
@@ -110,7 +114,7 @@ pub struct Local {
     pub ansi: super::ansi::Cache,
     /// Syntax-highlight results of code blocks (self-bounded; owned by `highlight`).
     pub hl: super::highlight::Cache,
-    pub textures: HashMap<String, TextureHandle>,
+    pub textures: HashMap<String, Option<TextureHandle>>,
     pub follow: bool,
     pub jump: bool,
     /// Following, but not at the end (the content grew): scroll back there next frame unless
@@ -273,6 +277,7 @@ impl<'a> Cx<'a> {
             }),
             focused,
             can_edit,
+            hide_duplicates: false,
         }
     }
 
@@ -344,6 +349,11 @@ impl<'a> Cx<'a> {
     /// A menu entry was clicked: its events must reach omp although the popup still holds input.
     pub fn release(&self) {
         self.out.borrow_mut().release = true;
+    }
+
+    /// Leave the page omp shows (its fullscreen overlay): the view sends omp an Esc key.
+    pub fn dismiss(&self) {
+        self.out.borrow_mut().dismiss = true;
     }
 
     pub fn zoom(&self, blob: String) {

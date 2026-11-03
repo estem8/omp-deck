@@ -25,6 +25,7 @@
 
 use deck_term::ScreenText;
 use deck_tsp::document::{Document, NodeRef};
+use deck_tsp::wire::Mode;
 
 /// What the composer holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,6 +421,16 @@ impl TspComposer {
             chips,
             popup,
         };
+        // A fullscreen overlay (omp's git page, model manager, settings…) is a second, `screen`
+        // surface that freezes the inline one: all input goes to it until it closes, so the
+        // inline composer is not addressable meanwhile.
+        if document
+            .surfaces()
+            .iter()
+            .any(|s| s.is_open() && s.mode() != Mode::Inline)
+        {
+            return missing(0, false);
+        }
         let Some(surface) = document.inline() else {
             return missing(0, false);
         };
@@ -921,5 +932,39 @@ mod tests {
             &["edit"],
         );
         assert!(!TspComposer::of(&doc).can_send);
+    }
+
+    #[test]
+    fn an_open_fullscreen_surface_takes_the_composer_away_until_it_closes() {
+        use deck_tsp::stream::{Message, Verb};
+        let mut doc = tsp_document(
+            serde_json::json!([editor("", true)]),
+            serde_json::json!([]),
+            Some("ed"),
+            &["edit", "send"],
+        );
+        let msg = |verb, body: serde_json::Value| Message {
+            verb,
+            params: Vec::new(),
+            body: serde_json::to_vec(&body).expect("json"),
+        };
+        let now = std::time::Instant::now();
+        assert_eq!(TspComposer::of(&doc).state, Composer::Empty);
+
+        // omp's git page: a second surface, the inline one frozen under it.
+        doc.apply(
+            &msg(
+                Verb::Open,
+                serde_json::json!({"id": "s2", "mode": "screen", "role": "omp.session"}),
+            ),
+            now,
+        );
+        let covered = TspComposer::of(&doc);
+        assert_eq!((covered.state, covered.target), (Composer::Missing, None));
+
+        doc.apply(&msg(Verb::Close, serde_json::json!({"id": "s2"})), now);
+        let back = TspComposer::of(&doc);
+        assert_eq!(back.state, Composer::Empty);
+        assert!(back.target.is_some());
     }
 }

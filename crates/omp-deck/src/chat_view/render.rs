@@ -18,7 +18,7 @@ use super::snap::SNode;
 use super::style::LABEL;
 use super::text::{self, Base};
 use super::tsel::{RunOpts, Sep};
-use super::{ansi, code, dock, layer, md, tools, transcript};
+use super::{ansi, code, dock, layer, md, page, tools, transcript};
 
 /// Spacing step of `gap`/`size` props (px).
 pub fn step(name: Option<&str>) -> f32 {
@@ -38,6 +38,17 @@ pub fn blank(cx: &Cx, n: &SNode) -> bool {
     if n.hidden() {
         return true;
     }
+    // The footer's grow spacer: with every fact hidden as a duplicate it still pushes the
+    // send/stop button to the right edge, so it is not "nothing to show".
+    if cx.hide_duplicates
+        && n.role() == "omp.composer.extras"
+        && n.num("grow").is_some_and(|g| g > 0.0)
+    {
+        return false;
+    }
+    if cx.hide_duplicates && (dock::duplicate(n) || dock::dangling_separator(cx, n)) {
+        return true;
+    }
     match n.kind.as_str() {
         "col" | "row" | "status" => {
             n.text().is_empty()
@@ -55,7 +66,10 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
         return;
     }
     cx.in_node(n.ord, || {
-        if transcript::role_node(cx, ui, n) || dock::role_node(cx, ui, n) {
+        if transcript::role_node(cx, ui, n)
+            || dock::role_node(cx, ui, n)
+            || page::role_node(cx, ui, n)
+        {
             return;
         }
         with_click(cx, ui, n, |ui| kind(cx, ui, n));
@@ -181,13 +195,22 @@ fn col(cx: &Cx, ui: &mut Ui, n: &SNode) {
 
 /// Natural width of what `f` draws on one row (nothing is painted or allocated).
 pub fn measure(ui: &mut Ui, f: &dyn Fn(&mut Ui)) -> f32 {
+    measure_salted(ui, "measure", f)
+}
+
+/// [`measure`] under its own id salt, for several measurements in one `ui`.
+fn measure_salted(
+    ui: &mut Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    f: &dyn Fn(&mut Ui),
+) -> f32 {
     let rect = Rect::from_min_size(
         ui.cursor().min,
         vec2(4000.0, ui.available_height().max(40.0)),
     );
     let mut child = ui.new_child(
         UiBuilder::new()
-            .id_salt("measure")
+            .id_salt(salt)
             .max_rect(rect)
             .layout(Layout::left_to_right(Align::Center))
             .invisible()
@@ -212,21 +235,19 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
             || (c.kind == "spacer" && c.flag("grow"))
             || (hud && c.role() == "omp.hud.status")
     });
-    if n.flag("wrap") && grow.is_none() {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(gap, gap);
-            for c in &kids {
-                node(cx, ui, c);
-            }
-        });
+    if n.flag("wrap") {
+        wrapped(cx, ui, n, &kids, gap, align);
         return;
     }
     // Idle, the activity row holds the todo pill alone: it sits at the right, where the pill of a
     // run sits next to the working line.
     let justify_end = (n.str("justify") == Some("end") || hud) && grow.is_none();
+    // `between`: the first child at the left edge, the rest as one group at the right.
+    let justify_between = n.str("justify") == Some("between") && grow.is_none() && kids.len() > 1;
     let (left, mid, right): (&[&SNode], Option<&SNode>, &[&SNode]) = match grow {
         Some(i) if kids[i].kind == "spacer" => (&kids[..i], None, &kids[i + 1..]),
         Some(i) => (&kids[..i], Some(kids[i]), &kids[i + 1..]),
+        None if justify_between => (&kids[..1], None, &kids[1..]),
         None if justify_end => (&[][..], None, &kids[..]),
         None => (&kids[..], None, &[][..]),
     };
@@ -271,6 +292,180 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
         ui.add_space(pad);
         draw(ui, right);
     });
+}
+
+/// Role whose children omp's TUI draws one per line at full width (the jobs' tiles of `wait`).
+const STACKED: &str = "omp.job.tiles";
+
+/// Greedy line breaking as an iterator of `kids` index ranges, one per line of `avail` px with
+/// children `gap` apart. A width beyond `avail` is bounded to it, so it fills a line alone; every
+/// line holds at least one child.
+pub fn line_breaks(widths: &[f32], gap: f32, avail: f32) -> Lines<'_> {
+    Lines {
+        widths,
+        gap,
+        avail,
+        at: 0,
+    }
+}
+
+/// See [`line_breaks`].
+pub struct Lines<'a> {
+    widths: &'a [f32],
+    gap: f32,
+    avail: f32,
+    at: usize,
+}
+
+impl Iterator for Lines<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let start = self.at;
+        let mut end = start;
+        let mut x = 0.0f32;
+        while let Some(&w) = self.widths.get(end) {
+            let w = w.min(self.avail);
+            let lead = if end > start { self.gap } else { 0.0 };
+            // Half a pixel of slack: measured widths are rounded sums of the same galleys.
+            if end > start && x + lead + w > self.avail + 0.5 {
+                break;
+            }
+            x += lead + w;
+            end += 1;
+        }
+        self.at = end;
+        (end > start).then_some(start..end)
+    }
+}
+
+/// One child of a wrapped row, held to `w` px: a container does not wrap by itself, so a child
+/// handed the rest of a line would otherwise lay out in a sliver (or past the card's edge).
+fn bounded(cx: &Cx, ui: &mut Ui, c: &SNode, w: f32, fill: bool) {
+    let h = ui.available_height().clamp(20.0, 4000.0);
+    ui.allocate_ui_with_layout(vec2(w, h), Layout::top_down(Align::Min), |ui| {
+        if fill {
+            ui.set_width(w);
+        } else {
+            ui.set_max_width(w);
+        }
+        node(cx, ui, c);
+    });
+}
+
+/// A `wrap: true` row. Children are measured at their natural width, packed greedily into lines
+/// no wider than the row, and each is allocated at most the row's width, so containers (cols,
+/// cards, tiles) stay inside it and text inside them wraps at that width. The jobs' tiles take a
+/// line each at full width.
+fn wrapped(cx: &Cx, ui: &mut Ui, n: &SNode, kids: &[&SNode], gap: f32, align: Align) {
+    let avail = ui.available_width();
+    let stack = n.role() == STACKED && avail.is_finite();
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        if stack {
+            for (i, c) in kids.iter().enumerate() {
+                if i > 0 {
+                    let (r, _) = ui.allocate_exact_size(vec2(avail, 7.0), Sense::hover());
+                    let y = r.center().y.round() - 0.5;
+                    ui.painter().line_segment(
+                        [pos2(r.left(), y), pos2(r.right(), y)],
+                        Stroke::new(1.0, cx.ink.line()),
+                    );
+                }
+                bounded(cx, ui, c, avail, true);
+            }
+            return;
+        }
+        // The widths live in a buffer kept between frames: taken out of the context's memory so
+        // drawing (which may reach this node's subtree again) never aliases it, put back after.
+        let key = ui.scope_id().with(("wrap-widths", n.id.as_str()));
+        let mut widths = ui
+            .data_mut(|d| d.remove_temp::<Vec<f32>>(key))
+            .unwrap_or_default();
+        widths.clear();
+        // Each child's basis: its natural width (one pixel over, so a label given exactly its
+        // measured width does not wrap), raised to its `min.w`; a growing child with a `min.w`
+        // starts from that minimum and takes its share of the line's spare room.
+        let mut ch = None;
+        widths.extend(kids.iter().map(|c| {
+            let min = c
+                .obj("min")
+                .and_then(|m| m.get("w"))
+                .and_then(|v| len_px(v, || *ch.get_or_insert_with(|| ch_width(cx, ui))));
+            match min {
+                Some(m) if grow_of(c) > 0.0 => m,
+                _ => {
+                    let natural =
+                        measure_salted(ui, ("wrap-measure", c.id.as_str()), &|ui| node(cx, ui, c))
+                            + 1.0;
+                    min.map_or(natural, |m| natural.max(m))
+                }
+            }
+        }));
+        for line in line_breaks(&widths, gap, avail) {
+            let ks = &kids[line.clone()];
+            let ws = &widths[line];
+            let used = ws.iter().map(|w| w.min(avail)).sum::<f32>()
+                + gap * (ws.len().saturating_sub(1)) as f32;
+            let growth: f32 = ks.iter().map(|c| grow_of(c)).sum();
+            let spare = if avail.is_finite() {
+                (avail - used).max(0.0)
+            } else {
+                0.0
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.with_layout(Layout::left_to_right(align), |ui| {
+                    for (c, w) in ks.iter().zip(ws) {
+                        let g = grow_of(c);
+                        let w = share(w.min(avail), g, growth, spare).min(avail);
+                        bounded(cx, ui, c, w, g > 0.0);
+                    }
+                });
+            });
+        }
+        ui.data_mut(|d| d.insert_temp(key, widths));
+    });
+}
+
+/// The flex-grow factor of a child of a wrapped row (0: it keeps its basis).
+fn grow_of(c: &SNode) -> f32 {
+    if c.kind == "spacer" && c.flag("grow") {
+        return 1.0;
+    }
+    c.num("grow").filter(|g| *g > 0.0).unwrap_or(0.0) as f32
+}
+
+/// A child's width on a line: its `basis` plus its `grow / growth` part of the line's `spare` px.
+fn share(basis: f32, grow: f32, growth: f32, spare: f32) -> f32 {
+    if growth > 0.0 && grow > 0.0 {
+        basis + spare * grow / growth
+    } else {
+        basis
+    }
+}
+
+/// A `min.w` length in px: a number, `"12px"`, or `"48ch"` (`ch`: the width of a `0` in the
+/// current text font, asked for only when needed).
+fn len_px(v: &serde_json::Value, ch: impl FnOnce() -> f32) -> Option<f32> {
+    match v {
+        Value::Number(n) => n.as_f64().map(|n| n as f32),
+        Value::String(s) => {
+            let s = s.trim();
+            if let Some(n) = s.strip_suffix("ch") {
+                n.trim().parse::<f32>().ok().map(|n| n * ch())
+            } else {
+                s.strip_suffix("px").unwrap_or(s).trim().parse().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Width of a `0` in the current plain-text font.
+fn ch_width(cx: &Cx, ui: &Ui) -> f32 {
+    let font = cx.tx().font;
+    ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0')).max(1.0)
 }
 
 fn rule(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -331,7 +526,11 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let collapsible = n.flag("collapsible");
     let collapsed = collapsible && cx.collapsed(n);
     let status = n.str("status");
+    // IRC identity keeps its warning outline even when delivery reports an error; the
+    // message's status text and content still convey the error independently.
+    let irc = !bare && n.role_under("omp.irc");
     let edge = match status {
+        _ if irc => tools::irc_edge(ink),
         Some("error") => ink.p.danger,
         Some("running" | "pending") => ink.b,
         _ => tone.map_or(ink.line(), |t| ink.edge(t)),
@@ -359,13 +558,20 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
         .inner_margin(egui::Margin::symmetric(margin, if bare { 0 } else { 6 }));
     let base = Base::new(ink.label(12.0), ink.dim(), ink);
     let head = head_job(cx, n, &base);
+    let outer_clip = ui.clip_rect();
     let r = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        if let Some(job) = head {
+        // Reserved before the content (and after the frame's own fill) so the tint is behind it.
+        let band = (irc && head.is_some()).then(|| paint::reserve(ui.painter()));
+        let inner = ui.max_rect();
+        let head_rect = head.map(|job| {
             let resp = ui
                 .horizontal(|ui| {
                     if collapsible {
                         chevron(ui, ink.dim(), !collapsed);
+                    }
+                    if irc {
+                        glyphs::icon(ui, "message", 13.0, tools::irc_icon(ink), Sense::hover());
                     }
                     ui.add(
                         egui::Label::new(job)
@@ -385,13 +591,68 @@ fn card(cx: &Cx, ui: &mut Ui, n: &SNode) {
             {
                 cx.toggle(n);
             }
+            resp.rect
+        });
+        if let (Some(idx), Some(head)) = (band, head_rect) {
+            let m = f32::from(margin);
+            let rect = Rect::from_min_max(
+                pos2(inner.left() - m + 1.0, inner.top() - 5.0),
+                pos2(inner.right() + m - 1.0, head.bottom() + 5.0),
+            );
+            let (a, b) = tools::irc_head(ink);
+            let low = if collapsed { 5.0 } else { 0.0 };
+            let tint = gradient_h(&tools::head_band(rect, 0.0, 5.0, low), a, b);
+            ui.painter().with_clip_rect(outer_clip).set(idx, tint);
         }
         if !collapsed {
+            if irc && head_rect.is_some() {
+                // The tinted header extends 5px below its row. Start the body after that band
+                // plus modest padding, rather than letting its first baseline touch the tint.
+                ui.add_space(12.0);
+            }
             ui.spacing_mut().item_spacing.y = 4.0;
+            // The card's width is the body's width: whatever a child cannot fit is cut at the
+            // card's side (a margin's worth stays so hover outlines are not shaved), and the
+            // height stays the content's.
+            let side = (f32::from(margin) - 1.0).max(2.0);
+            let clip = ui.clip_rect();
+            ui.set_clip_rect(
+                Rect::from_x_y_ranges(
+                    (inner.left() - side)..=(inner.right() + side),
+                    clip.y_range(),
+                )
+                .intersect(clip),
+            );
             children(cx, ui, n);
         }
     });
     let _ = r;
+}
+
+/// The convex outline `pts` filled with a left→right gradient `a → b`, as one shape (a painter
+/// call would draw immediately; this one can fill a slot reserved behind content).
+fn gradient_h(pts: &[egui::Pos2], a: Color32, b: Color32) -> egui::Shape {
+    let Some(first) = pts.first() else {
+        return egui::Shape::Noop;
+    };
+    let (mut lo, mut hi) = (first.x, first.x);
+    for p in pts {
+        lo = lo.min(p.x);
+        hi = hi.max(p.x);
+    }
+    let span = (hi - lo).max(1.0);
+    let col = |x: f32| a.lerp_to_gamma(b, ((x - lo) / span).clamp(0.0, 1.0));
+    let mut m = egui::epaint::Mesh::default();
+    let c = pts.iter().fold(egui::Vec2::ZERO, |s, p| s + p.to_vec2()) / pts.len() as f32;
+    m.colored_vertex(c.to_pos2(), col(c.x));
+    for p in pts {
+        m.colored_vertex(*p, col(p.x));
+    }
+    let n = pts.len() as u32;
+    for i in 1..=n {
+        m.add_triangle(0, i, if i == n { 1 } else { i + 1 });
+    }
+    egui::Shape::mesh(m)
 }
 
 /// Small chevron: pointing down when `open`, else right.
@@ -1251,7 +1512,7 @@ pub fn item(cx: &Cx, ui: &mut Ui, n: &SNode, list: Option<&SNode>, selected: boo
 fn tabs(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let ink = cx.ink;
     let active = n.str("active").map(str::to_owned);
-    ui.horizontal_wrapped(|ui| {
+    let body = |ui: &mut Ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for t in n.arr("items") {
             let Some(id) = t.get("id").and_then(Value::as_str) else {
@@ -1301,7 +1562,13 @@ fn tabs(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 cx.send(super::events::select(cx.sf(), &n.id, id));
             }
         }
-    });
+    };
+    // A segmented control is one unbroken strip; plain tabs wrap.
+    if n.str("variant") == Some("segmented") {
+        ui.horizontal(body);
+    } else {
+        ui.horizontal_wrapped(body);
+    }
 }
 
 fn cell_job(cx: &Cx, v: &Value, base: &Base) -> LayoutJob {
@@ -1459,5 +1726,67 @@ mod tests {
             (shift - 14.0 * THINK_LINE).abs() < 1e-3,
             "the first fourteen lines move out above: {shift}"
         );
+    }
+
+    #[test]
+    fn wrapped_children_pack_greedily_and_never_exceed_the_line() {
+        // 100 px of room, 10 px gaps: 40 + 10 + 40 fits, a third 40 does not.
+        let breaks = |w: &[f32], gap, avail| {
+            line_breaks(w, gap, avail)
+                .map(|r| r.len())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(breaks(&[40.0, 40.0, 40.0], 10.0, 100.0), vec![2, 1]);
+        // Exactly full lines stay whole (the half pixel of slack).
+        assert_eq!(breaks(&[45.0, 45.0], 10.0, 100.0), vec![2]);
+        // A child wider than the line is bounded to it and fills a line alone.
+        assert_eq!(
+            breaks(&[20.0, 4000.0, 20.0, 20.0], 6.0, 100.0),
+            vec![1, 1, 2]
+        );
+        assert_eq!(breaks(&[], 6.0, 100.0), Vec::<usize>::new());
+        // Whatever the widths, every line holds at least one child and all children are placed.
+        assert_eq!(breaks(&[500.0; 5], 0.0, 1.0), vec![1; 5]);
+        // Ranges are contiguous and cover the children.
+        let ranges: Vec<_> = line_breaks(&[40.0, 40.0, 40.0], 10.0, 100.0).collect();
+        assert_eq!(ranges, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn min_widths_parse_in_px_and_ch() {
+        let ch = || 8.0;
+        assert_eq!(len_px(&serde_json::json!("48ch"), ch), Some(384.0));
+        assert_eq!(len_px(&serde_json::json!("120px"), ch), Some(120.0));
+        assert_eq!(len_px(&serde_json::json!(90), ch), Some(90.0));
+        assert_eq!(len_px(&serde_json::json!("wide"), ch), None);
+        assert_eq!(len_px(&serde_json::json!(true), ch), None);
+    }
+
+    /// omp's agent-hub body: roster `grow 3, min 48ch` beside detail `grow 2, min 34ch`.
+    #[test]
+    fn growing_children_share_the_spare_room_or_stack_when_their_minima_do_not_fit() {
+        let (roster, detail) = (48.0 * 8.0, 34.0 * 8.0);
+        let gap = 10.0;
+        // Wide: both minima fit on one line; the spare room splits 3 : 2 and fills the line.
+        let avail = 1000.0;
+        let breaks: Vec<_> = line_breaks(&[roster, detail], gap, avail).collect();
+        assert_eq!(breaks, vec![0..2]);
+        let spare = avail - roster - detail - gap;
+        let (a, b) = (
+            share(roster, 3.0, 5.0, spare),
+            share(detail, 2.0, 5.0, spare),
+        );
+        assert!((a + b + gap - avail).abs() < 1e-3, "{a} + {b}");
+        assert!(
+            ((a - roster) / (b - detail) - 1.5).abs() < 1e-3,
+            "3 : 2 shares"
+        );
+        // Narrow: the minima do not fit side by side, so each takes a line and fills it.
+        let avail = 500.0;
+        let breaks: Vec<_> = line_breaks(&[roster, detail], gap, avail).collect();
+        assert_eq!(breaks, vec![0..1, 1..2]);
+        assert!((share(roster, 3.0, 3.0, avail - roster) - avail).abs() < 1e-3);
+        // A child that does not grow keeps its basis.
+        assert_eq!(share(40.0, 0.0, 5.0, 100.0), 40.0);
     }
 }

@@ -277,6 +277,7 @@ settings! {
     Theme(theme: Theme) = Shared,
     Style(style: UiStyle) = Shared,
     StyleRev(style_rev: u32) = Shared,
+    ViewRev(view_rev: u32) = Shared,
     Density(density: Density) = Shared,
     UiFont(ui_font: UiFont) = Shared,
     UiScale(ui_scale: f32) = Shared,
@@ -773,28 +774,103 @@ mod tests {
         let a = open(&dir);
         let b = open(&dir);
         let base = a.snapshot().config;
-        assert_eq!(base.session_view, SessionView::Terminal);
+        assert_eq!(base.session_view, SessionView::Chat);
         let mut edited = (*base).clone();
-        edited.session_view = SessionView::Chat;
+        edited.session_view = SessionView::Terminal;
         let edit = Edit::between(base.clone(), &edited);
         assert_eq!(edit.changes.len(), 1, "only the view differs");
         let snap = a.submit(edit).wait().expect("commits");
-        assert_eq!(snap.config.session_view, SessionView::Chat);
+        assert_eq!(snap.config.session_view, SessionView::Terminal);
         let stored = AppConfig::load_from(&dir.path().join("state.json"));
-        assert_eq!(stored.session_view, SessionView::Chat);
+        assert_eq!(stored.session_view, SessionView::Terminal);
         // A window that only changed its font keeps the view the other window chose, both
         // by rebasing and when its edit commits.
         let mut untouched = (*base).clone();
         rebase(&mut untouched, &base, &snap.config);
-        assert_eq!(untouched.session_view, SessionView::Chat);
+        assert_eq!(untouched.session_view, SessionView::Terminal);
         let mut own = (*base).clone();
         own.font_size = 19.0;
         let merged = b
             .submit(Edit::between(base, &own))
             .wait()
             .expect("an unrelated edit merges");
-        assert_eq!(merged.config.session_view, SessionView::Chat);
+        assert_eq!(merged.config.session_view, SessionView::Terminal);
         assert_eq!(merged.config.font_size, 19.0);
+    }
+
+    #[test]
+    fn model_preferences_survive_wire_edits_rebases_and_owner_restart() {
+        assert_eq!(Field::FavoriteModels.scope(), Scope::Shared);
+        assert_eq!(Field::ModelProviderFilter.scope(), Scope::Shared);
+        for mode in [
+            GatewayMode::Off,
+            GatewayMode::WhileOpen,
+            GatewayMode::Background,
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            AppConfig {
+                gateway_mode: mode,
+                ..AppConfig::default()
+            }
+            .save_to(&dir.path().join("state.json"))
+            .expect("save baseline");
+            let owner = open(&dir);
+            let other = open(&dir);
+            let base = owner.snapshot().config;
+            let mut edited = (*base).clone();
+            edited.toggle_favorite("fake/fake-1");
+            edited.model_provider_filter = Some("fake".into());
+            let edit = Edit::between(base.clone(), &edited);
+            assert_eq!(
+                edit.changes.iter().map(Setting::field).collect::<Vec<_>>(),
+                [Field::FavoriteModels, Field::ModelProviderFilter]
+            );
+            // The gateway transports the same edit and snapshot as JSON.
+            let bytes = serde_json::to_vec(&edit).expect("encode edit");
+            let edit = serde_json::from_slice(&bytes).expect("decode edit");
+            let committed = owner.submit(edit).wait().expect("commit model preferences");
+            let bytes = serde_json::to_vec(&committed).expect("encode snapshot");
+            let committed: Snapshot = serde_json::from_slice(&bytes).expect("decode snapshot");
+            let mut local = (*base).clone();
+            local.check_updates = false;
+            rebase(&mut local, &base, &committed.config);
+            assert_eq!(local.favorite_models, ["fake/fake-1"]);
+            assert_eq!(local.model_provider_filter.as_deref(), Some("fake"));
+            assert!(!local.check_updates, "unsubmitted shared edits stay");
+            // A stale window's unrelated Shared-field edit must not restore empty favorites.
+            let mut stale = (*base).clone();
+            stale.check_updates = false;
+            other
+                .submit(Edit::between(base, &stale))
+                .wait()
+                .expect("merge shared edit");
+            owner.flush();
+            other.flush();
+            drop(other);
+            drop(owner);
+            let restarted = open(&dir);
+            let cfg = restarted.snapshot().config;
+            assert_eq!(cfg.favorite_models, ["fake/fake-1"], "{mode:?}");
+            assert_eq!(
+                cfg.model_provider_filter.as_deref(),
+                Some("fake"),
+                "{mode:?}"
+            );
+            assert!(!cfg.check_updates, "{mode:?}");
+            assert_eq!(cfg.gateway_mode, mode);
+            let mut edited = (*cfg).clone();
+            edited.toggle_favorite("fake/fake-1");
+            edited.model_provider_filter = None;
+            restarted
+                .submit(Edit::between(cfg, &edited))
+                .wait()
+                .expect("remove preferences");
+            restarted.flush();
+            drop(restarted);
+            let cfg = open(&dir).snapshot().config;
+            assert!(cfg.favorite_models.is_empty());
+            assert_eq!(cfg.model_provider_filter, None);
+        }
     }
 
     fn tab(name: &str) -> TabState {

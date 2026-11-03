@@ -5,6 +5,10 @@
 //! (the measured height of a clamped body, a checklist phase's local fold, the nesting depth of
 //! tools). Layout jobs are rebuilt per frame from the node's props; egui's galley cache makes
 //! that a hash lookup, and the node's own caches (`gen_`) keep the props themselves untouched.
+//! IRC tool views retain omp's real `write`/`wait` identity (`omp.tool.write` /
+//! `omp.tool.wait`); their structured `IRC` title supplies the messaging identity.
+//! Display-only incoming traffic is a separate `card` with role `omp.irc.incoming`.
+//! Both consumers share warning header/outline/icon colours without changing delivery actions.
 
 use std::sync::Arc;
 
@@ -518,7 +522,7 @@ fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
     let task = is_agent && n.get("task").is_some_and(|t| !tplain(t).trim().is_empty());
     let href = n
         .str("href")
-        .filter(|_| n.str("targetKind") == Some("path"))
+        .filter(|_| n.kind == "image" || n.str("targetKind") == Some("path"))
         .map(str::to_owned);
     let add = |acts: &mut Vec<CardAct>, a: CardAct| {
         if !acts.iter().any(|b| b.what == a.what) {
@@ -742,7 +746,7 @@ pub fn head_band(rect: Rect, slant: f32, r_tr: f32, r_bl: f32) -> Vec<Pos2> {
 }
 
 /// The hover pop of a card with per-corner radii: a second outline 2 px outside.
-fn pop_shaped(painter: &egui::Painter, rect: Rect, corner: CornerRadius, ink: &Ink, t: f32) {
+fn pop_shaped(painter: &egui::Painter, rect: Rect, corner: CornerRadius, color: Color32, t: f32) {
     if t <= 0.01 {
         return;
     }
@@ -755,7 +759,7 @@ fn pop_shaped(painter: &egui::Painter, rect: Rect, corner: CornerRadius, ink: &I
             se: grow(corner.se),
             sw: grow(corner.sw),
         },
-        Stroke::new(1.0, ink.p.hover_line.gamma_multiply(0.75 * t)),
+        Stroke::new(1.0, color.gamma_multiply(0.75 * t)),
         StrokeKind::Outside,
     );
 }
@@ -847,6 +851,43 @@ fn clusters(
 }
 
 // ---- tool -----------------------------------------------------------------------------------
+/// IRC is a view of `write`/`wait`, not necessarily a tool named `irc`. Match the
+/// upstream verb in the structured title, never message body text or a generic write target.
+fn irc_tool(role: &str, name: Option<&str>, title: Option<&Value>) -> bool {
+    if role == "omp.tool.irc" || name == Some("irc") {
+        return true;
+    }
+    if !matches!(role, "omp.tool.write" | "omp.tool.wait")
+        && !matches!(name, Some("write" | "wait"))
+    {
+        return false;
+    }
+    let first = match title {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Array(a)) => a.iter().find_map(|s| s.get("t").and_then(Value::as_str)),
+        _ => None,
+    };
+    first.is_some_and(|s| {
+        s == "IRC"
+            || s.strip_prefix("IRC")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
+}
+
+/// Warning identity is independent of execution status: the status mark, elapsed
+/// text, live stripe and error details continue to convey running/failed delivery.
+pub(super) fn irc_head(ink: &Ink) -> (Color32, Color32) {
+    (ink.wash(ink.p.warn), mix(ink.p.surface, ink.p.warn, 0.08))
+}
+
+pub(super) fn irc_edge(ink: &Ink) -> Color32 {
+    ink.legible(ink.p.warn, ink.card(), 3.0)
+}
+
+pub(super) fn irc_icon(ink: &Ink) -> Color32 {
+    let (a, b) = irc_head(ink);
+    ink.legible(ink.legible(ink.p.warn, a, 3.0), b, 3.0)
+}
 
 /// `tool` node: a tool call as a card (or an inline head line) with its children as the body.
 pub fn tool(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -861,6 +902,7 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let lk = tool_look(status).unwrap_or(FALLBACK);
     let running = status == "running";
     let errored = status == "error";
+    let irc = irc_tool(n.role(), n.str("name"), n.get("title"));
     let inline = depth > 0 || n.str("frame") == Some("inline");
     let collapsible = n.flag("collapsible");
     let collapsed = collapsible && cx.collapsed(n);
@@ -884,7 +926,9 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         .animate_bool_with_time(hid.with("hot"), head.contains_pointer(), 0.1);
 
     // Colours of this state.
-    let edge = if running {
+    let edge = if irc {
+        irc_edge(ink)
+    } else if running {
         ink.b
     } else if errored {
         mix(ink.p.stroke, ink.p.danger, 0.85)
@@ -902,6 +946,9 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         hb = mix(hb, ink.p.danger, 0.16);
         fill = mix(fill, ink.p.danger, 0.06);
     }
+    if irc {
+        (ha, hb) = irc_head(ink);
+    }
 
     // Header background.
     if inline {
@@ -910,11 +957,20 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
         paint::fill_h(
             ui.painter(),
             &band,
-            ink.chip().gamma_multiply(k),
-            ink.chip().gamma_multiply(k * 0.4),
+            if irc {
+                ha
+            } else {
+                ink.chip().gamma_multiply(k)
+            },
+            if irc {
+                hb
+            } else {
+                ink.chip().gamma_multiply(k * 0.4)
+            },
         );
         let tick = Rect::from_min_size(head_rect.left_top(), vec2(2.0, head_h));
-        ui.painter().rect_filled(tick, 0.0, hue(ink, lk.hue));
+        ui.painter()
+            .rect_filled(tick, 0.0, if irc { edge } else { hue(ink, lk.hue) });
     } else {
         let band = head_band(
             head_rect.shrink(1.0),
@@ -935,7 +991,7 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
                     pos2(head_rect.left() + 1.0, y),
                     pos2(head_rect.right() - SLANT, y),
                 ],
-                Stroke::new(1.0, mix(edge, ink.a, 0.35)),
+                Stroke::new(1.0, if irc { edge } else { mix(edge, ink.a, 0.35) }),
             );
         }
         p.line_segment(
@@ -1000,7 +1056,7 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
             let x = head_rect.left() + 6.5;
             ui.painter().line_segment(
                 [pos2(x, top + 3.0), pos2(x, bottom)],
-                Stroke::new(1.0, ink.line()),
+                Stroke::new(1.0, if irc { edge } else { ink.line() }),
             );
         } else {
             let ml = if running { 16.0 } else { 12.0 };
@@ -1056,17 +1112,27 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     p.add(Shape::rect_stroke(
         rect,
         CARD_CORNER,
-        Stroke::new(1.0, edge),
+        Stroke::new(if irc { 1.5 } else { 1.0 }, edge),
         StrokeKind::Inside,
     ));
-    paint::hairline(
-        p,
-        ink,
-        rect.left() + 1.0,
-        rect.right() - SLANT,
-        rect.top(),
-        if running { 1.0 } else { 0.85 },
-    );
+    if irc {
+        p.line_segment(
+            [
+                pos2(rect.left() + 1.0, rect.top()),
+                pos2(rect.right() - SLANT, rect.top()),
+            ],
+            Stroke::new(1.0, edge),
+        );
+    } else {
+        paint::hairline(
+            p,
+            ink,
+            rect.left() + 1.0,
+            rect.right() - SLANT,
+            rect.top(),
+            if running { 1.0 } else { 0.85 },
+        );
+    }
     if running {
         let stripe_bottom = (rect.bottom() - 8.0).max(rect.top() + head_h);
         p.rect_filled(
@@ -1078,7 +1144,14 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
             ink.b,
         );
     }
-    pop_shaped(p, rect, CARD_CORNER, ink, t);
+    // IRC identity belongs to the entire card, including its body and hover outline.
+    pop_shaped(
+        p,
+        rect,
+        CARD_CORNER,
+        if irc { edge } else { ink.p.hover_line },
+        t,
+    );
 }
 
 /// Right cluster of a tool head, right to left: fold chevron, hover buttons, time/status, exit
@@ -1186,6 +1259,9 @@ fn head_left(cx: &Cx, ui: &mut Ui, n: &SNode, lk: Look) {
     let ink = cx.ink;
     ui.spacing_mut().item_spacing.x = 7.0;
     mark(cx, ui, lk, 13.0, false);
+    if irc_tool(n.role(), n.str("name"), n.get("title")) {
+        glyphs::icon(ui, "message", 13.0, irc_icon(ink), Sense::hover());
+    }
     let base = Base::new(ink.label(12.0), ink.strong(), ink);
     let mut job = n
         .get("title")
@@ -1359,6 +1435,10 @@ fn body_scope(
                 .max_rect(region)
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
+                let clip = ui.clip_rect();
+                ui.set_clip_rect(
+                    Rect::from_x_y_ranges(region.x_range(), clip.y_range()).intersect(clip),
+                );
                 ui.set_width(w);
                 body_children(cx, ui, n, &tx);
             },
@@ -2169,6 +2249,78 @@ mod tests {
         "pending", "running", "done", "failed", "aborted", "idle", "parked",
     ];
     const ITEM_STATUSES: [&str; 5] = ["pending", "active", "done", "dropped", "blocked"];
+
+    #[test]
+    fn image_open_menu_does_not_require_a_tool_target_kind() {
+        use super::super::snap::tests::{fixture_mirror, sync_doc};
+        let mut snap = Snap::default();
+        sync_doc(&mut snap, &fixture_mirror(usize::MAX));
+        let main = snap.region("main").expect("main");
+        let mut image = snap
+            .find(main, &|n| n.kind == "tool")
+            .expect("recorded tool")
+            .clone();
+        image.id = "image-menu".into();
+        image.kind = "image".into();
+        image.children.clear();
+        image.props = serde_json::from_value(json!({
+            "href": "file:///tmp/sandbox-image.png", "actions": {"menu": ["open"]}
+        }))
+        .expect("image props");
+        let acts = build_acts(&snap, &image);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].label, "Open");
+        assert_eq!(
+            acts[0].what,
+            What::Open("file:///tmp/sandbox-image.png".into())
+        );
+    }
+
+    #[test]
+    fn irc_views_match_structured_verbs_not_arbitrary_tool_text() {
+        for title in [
+            json!("IRC"),
+            json!([{"t":"IRC","s":"toolTitle strong"}, {"t":" Peer"}]),
+            json!([{"t":"IRC ← Peer","s":"toolTitle strong"}]),
+        ] {
+            assert!(irc_tool("omp.tool.write", Some("write"), Some(&title)));
+            assert!(irc_tool("omp.tool.wait", Some("wait"), Some(&title)));
+            assert!(!irc_tool("omp.tool.bash", Some("bash"), Some(&title)));
+        }
+        assert!(irc_tool("omp.tool.irc", None, None));
+        for title in [
+            json!("Write"),
+            json!("IRCopy"),
+            json!("echo IRC"),
+            json!("Wait"),
+        ] {
+            assert!(!irc_tool("omp.tool.write", Some("write"), Some(&title)));
+        }
+        assert!(!irc_tool("omp.tool.write", Some("write"), None));
+    }
+
+    #[test]
+    fn irc_warning_outline_and_icon_have_a_contrast_floor_in_every_palette() {
+        use crate::chat_view::highlight::contrast;
+        use deck_core::config::UiStyle;
+        for style in UiStyle::ALL {
+            for dark in [true, false] {
+                let mut ink = crate::chat_view::style::test_ink();
+                ink.p = crate::theme::palette(style, dark);
+                ink.dark = dark;
+                (ink.a, ink.b) = crate::deco::accent_pair(ink.p);
+                let (a, b) = irc_head(&ink);
+                assert!(
+                    contrast(irc_edge(&ink), ink.card()) >= 3.0,
+                    "{style:?} {dark}"
+                );
+                for bg in [a, b] {
+                    assert!(contrast(irc_icon(&ink), bg) >= 3.0, "{style:?} {dark}");
+                }
+                assert_ne!(a, ink.head().0, "IRC header has its own warning tint");
+            }
+        }
+    }
 
     #[test]
     fn head_texts_come_from_the_props_of_a_recorded_tool() {

@@ -3340,7 +3340,9 @@ module comment). Unknown verbs/fields/kinds/ops are tolerated, never fatal.
   `document::{Document::{apply, surfaces, surface, inline, blobs_have}, Surface, NodeRef, OpError}`,
   `terminal::{Responder::{new, on_output, resize, theme, motion, document, live, program, info}, TermInfo,
   InputEncoding::{Apc, Osc877, native}, encode_event, encode_reply, hello_reply, FEATURES}`.
-- Hello reply: `term:"omp-deck"`, kinds = KINDS minus `json`, features `["blobs","settle","adopt","reduce-motion"]`
+- Hello reply: `term:"omp-deck"`, kinds = KINDS minus `json` and `media` (0.25.1: omp then sends tool-result images as
+  blob-backed `image` nodes instead of path-only `media`, which also works for remote hosts), features
+  `["blobs","settle","adopt","reduce-motion"]`
   (only what the crate honours; `dock`/`aside`/`scroll`/`styles`/`flow` are renderer decisions for step 2),
   `apc:65536`, `credits:2`.
 - deck-host: `SessionSpec.tsp`, `Kind::TspPeek = 0x0c`, `tsp_peek`, CLI `new … --tsp`, `tsp <name> [--follow]`.
@@ -3569,3 +3571,39 @@ Removes the step-2 known limits. Shared interfaces:
   toast never reappears on reopen. omp 18.15.0 reuses one toast node while idle (first toast `add`, later ones `set`
   on the same id, recorded live): `set`/`text`/`splice` on a `toast` node record a fresh toast. Gate `tsp_toast_live.rs`.
 - **Attachments**: a TSP composer with chips and no text is `Draft("[n attachment(s)]")` ⇒ confirmation before `send`.
+- **Fullscreen pages** (0.25.1 fix; user bug: clicking the git segment froze the chat until the session was killed):
+  omp's fullscreen overlays (`status.git` git app, `/models`, agents hub, `/settings`) open a second surface
+  `o {"mode":"screen","role":"omp.session"}` and freeze the inline one; all input goes to the overlay until `x`. The
+  view keeps a second `Snap` + `Local` for the newest open non-inline surface (`snap::Follow::Page`), draws it instead
+  of the transcript/dock (`chat_view/page.rs`: native `button`, two-pane `omp.app.git`, scrolling sheets) and
+  addresses its events to that `sf`. An always-drawn "Back to chat" strip sends omp Esc, so even an undrawable page can
+  be left. deck-service `TspComposer::of` returns `Composer::Missing` while any non-inline surface is open ⇒ injected
+  commands are refused as "dialog open" and never typed into the overlay.
+
+### 0.25.1 (2026-11-03, user requests after 0.25.0)
+- **Session status bar in the tab area**: the bar is a bottom strip of the area right of the sidebar (panel order
+  sidebar → status bar → changes panel → central; the sidebar keeps the full window height), one bar across split
+  panes following the focused one. Restyled to the chat composer's row: `BAR_H` 40, `CHIP_H` 26, 13/12 px text,
+  15 px icons, chip plates (chat chip fill + hairline, `theme::rad(8,10)`, pop ring on hover), no dividers (6 px gaps,
+  measured-width dropping unchanged, usage first), glass gradient strip with the accent-pair hairline, model chip
+  `MODEL_CHIP_W` 260 / floor `MODEL_CHIP_MIN` 176 / share 0.42, actions in one outlined box, Retry/Stop amber pills.
+  Test `bar_is_a_bottom_strip_of_the_tab_area_and_leaves_the_sidebar_alone`.
+- **Model picker** restyled to the chat language (accent header band "Model · N models" + reload, 32 px search and
+  provider plates, current row wash + left bar + ✓, chip-fill thinking pills); behavior unchanged.
+- **Favorites** (user: lost after an Anthropic logout/login): `favorite_models` was always persisted; `build_rows`
+  hid selectors missing from omp's auth-filtered catalog and the catalog only reloaded at startup. Now unavailable
+  favorites stay in ★ as grey "Not available now" rows (star removable, not selectable), favorites show while the
+  catalog loads/fails, and every picker opening refreshes the catalog (cached rows kept meanwhile). Selectors are
+  `provider/id` independent of auth mode (omp `models-cli.ts`). Gate `deck-service/tests/model_preferences.rs`.
+- **No duplicates in single-pane chat**: `ChatView::hide_duplicates(true)` for a single session pane skips omp's
+  composer pieces OmpDeck's bar shows (roles `omp.composer.{model,effort,model.effort,context,usage}`, facts `model`,
+  `git`, `path`, `context_pct`, `context_total`, `cost`, `token_*`, `cache_*`) and their separators; empty growing
+  extras stay as the spacer so Send/Stop remain right-aligned. Split panes keep omp's chips.
+- **IRC cards** (`omp.irc.*` and IRC `write`/`wait` tool cards): whole-card amber outline from the style's warn tone
+  (contrast-floored via `Ink::legible`), tinted head, message icon.
+- **Wrapping rows**: `row{wrap:true}` with container children uses greedy flex-wrap with bounded child widths
+  (`horizontal_wrapped` only for leaf children); `omp.job.tiles` stacks one tile per line; card bodies are clamped and
+  clipped to the card width.
+- **Images**: `image` crate gains `webp` (omp re-encodes pasted images to WebP/JPEG); `image.max` accepts
+  `{"w":"12ch","h":"4lines"}` objects (and px/numbers); `w`/`h` reserve space before the blob; failed decodes are cached;
+  click opens a lightbox (Esc/outside closes); "Open" menu works on image nodes. Hello `kinds` omit `media`.

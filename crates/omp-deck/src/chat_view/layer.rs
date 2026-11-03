@@ -43,16 +43,54 @@ fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
-/// The texture of blob `id` (decoded once; a blob that does not decode is remembered as absent).
-fn texture(cx: &Cx, ctx: &Context, id: &str) -> Option<egui::TextureHandle> {
-    if let Some(t) = cx.loc(|l| l.textures.get(id).cloned()) {
-        return Some(t);
+/// Missing blobs are not cached: the frame precedes blob delivery. Present but invalid bytes
+/// get a negative entry, so decoding (including failed decoding) runs just once per blob.
+fn cached_texture(
+    cache: &mut HashMap<String, Option<egui::TextureHandle>>,
+    id: &str,
+    load: impl FnOnce() -> Option<Option<egui::TextureHandle>>,
+) -> Option<egui::TextureHandle> {
+    if let Some(t) = cache.get(id) {
+        return t.clone();
     }
-    let blob = cx.snap.blob(id)?;
-    let img = decode(&blob.bytes)?;
-    let t = ctx.load_texture(format!("chat-blob-{id}"), img, TextureOptions::LINEAR);
-    cx.loc(|l| l.textures.insert(id.to_owned(), t.clone()));
-    Some(t)
+    let t = load()?;
+    cache.insert(id.to_owned(), t.clone());
+    t
+}
+
+fn texture(cx: &Cx, ctx: &Context, id: &str) -> Option<egui::TextureHandle> {
+    cx.loc(|l| {
+        cached_texture(&mut l.textures, id, || {
+            let blob = cx.snap.blob(id)?;
+            Some(decode(&blob.bytes).map(|img| {
+                ctx.load_texture(format!("chat-blob-{id}"), img, TextureOptions::LINEAR)
+            }))
+        })
+    })
+}
+
+fn image_length(v: Option<&Value>, suffix: &str, unit: f32) -> Option<f32> {
+    let s = v?.as_str()?;
+    let px = if let Some(n) = s.strip_suffix("px") {
+        n.parse::<f32>().ok()?
+    } else {
+        s.strip_suffix(suffix)?.parse::<f32>().ok()? * unit
+    };
+    (px.is_finite() && px > 0.0).then_some(px)
+}
+
+fn image_bounds(max: Option<&Value>, available: f32, cell: egui::Vec2) -> egui::Vec2 {
+    let numeric = max.and_then(Value::as_f64).map(|v| v as f32);
+    let w = image_length(max.and_then(|v| v.get("w")), "ch", cell.x)
+        .or(numeric)
+        .unwrap_or(480.0);
+    // Tool-result images use omp's 20-line cap even on versions that omit `max`.
+    let h = image_length(max.and_then(|v| v.get("h")), "lines", cell.y).unwrap_or(20.0 * cell.y);
+    vec2(w.min(available).max(1.0), h.max(1.0))
+}
+
+fn image_fit(size: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {
+    size * (bounds.x / size.x).min(bounds.y / size.y).min(1.0)
 }
 
 /// An `image` node: inline, bounded, click to enlarge.
@@ -68,17 +106,39 @@ pub fn image(cx: &Cx, ui: &mut Ui, n: &SNode) {
     }
     let alt = n.str("alt").unwrap_or("image");
     let tex = n.str("blob").and_then(|b| texture(cx, ui.ctx(), b));
+    let font = ink.mono_px(ink.mono_size);
+    let cell = ui.fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let bounds = image_bounds(n.get("max"), ui.available_width(), cell);
+    // Prefer original dimensions even after upload (large textures are downsampled). This
+    // gives the pending blob exactly the same footprint as the decoded image.
+    let size = match (n.num("w"), n.num("h")) {
+        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => vec2(w as f32, h as f32),
+        _ => tex.as_ref().map_or(bounds, egui::TextureHandle::size_vec2),
+    };
+    let draw = image_fit(size, bounds);
+    let (rect, resp) = ui.allocate_exact_size(draw, Sense::click());
+    cx.loc(|l| {
+        if l.ctx_claim.is_none() && l.ctx_click.is_some_and(|p| rect.contains(p)) {
+            l.ctx_claim = Some(super::ctx::Claim::Card(n.id.clone()));
+        }
+    });
     let Some(tex) = tex else {
-        render::badge(cx, ui, &format!("▣ {alt}"), Some("muted"));
+        paint::boxed(
+            ui.painter(),
+            rect,
+            6,
+            ink.chip(),
+            Stroke::new(1.0, ink.line()),
+        );
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            alt,
+            ink.label(LABEL),
+            ink.dim(),
+        );
         return;
     };
-    let size = tex.size_vec2();
-    let max_w = ui
-        .available_width()
-        .min(n.num("max").map_or(480.0, |m| m as f32).max(48.0));
-    let k = (max_w / size.x).min(260.0 / size.y).min(1.0);
-    let draw = size * k;
-    let (rect, resp) = ui.allocate_exact_size(draw, Sense::click());
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
@@ -96,21 +156,42 @@ pub fn image(cx: &Cx, ui: &mut Ui, n: &SNode) {
         Stroke::new(1.0, ink.line().lerp_to_gamma(ink.b, hov)),
     );
     paint::pop(ui.painter(), rect, 6, ink, hov);
-    let resp = resp
-        .on_hover_cursor(CursorIcon::ZoomIn)
-        .on_hover_text(alt.to_owned());
-    if resp.clicked() {
-        cx.click(n, n.click().unwrap_or("zoom"));
+    let resp = resp.on_hover_cursor(CursorIcon::ZoomIn).on_hover_text(alt);
+    let mut opened = false;
+    if ui.rect_contains_pointer(rect)
+        && let Some(href) = n.str("href")
+        && n.obj("actions")
+            .and_then(|a| a.get("menu"))
+            .and_then(Value::as_array)
+            .is_some_and(|menu| menu.iter().any(|a| a.as_str() == Some("open")))
+    {
+        let button = Rect::from_min_size(rect.right_top() - vec2(26.0, -2.0), vec2(24.0, 24.0));
+        if ui
+            .put(button, egui::Button::new("↗"))
+            .on_hover_text("Open image")
+            .clicked()
+        {
+            cx.open(href.to_owned());
+            opened = true;
+        }
+    }
+    if resp.clicked()
+        && !opened
+        && let Some(blob) = n.str("blob")
+    {
+        cx.zoom(blob.to_owned());
     }
 }
 
 // ---- sheets ---------------------------------------------------------------------------------
 
 /// A floating sheet: styled header band over a body, gradient outline, lift. Padding on all sides.
+/// A body taller than `max_body` scrolls.
 fn sheet(
     cx: &Cx,
     ui: &mut Ui,
     width: f32,
+    max_body: f32,
     head: Option<LayoutJob>,
     right: &dyn Fn(&mut Ui),
     body: &dyn Fn(&mut Ui),
@@ -119,7 +200,8 @@ fn sheet(
     let pad = 14.0;
     let head_h = if head.is_some() { 38.0 } else { 0.0 };
     let inner_w = width - 2.0 * pad;
-    let size = measure_size(ui, inner_w, body);
+    let full = measure_size(ui, inner_w, body);
+    let size = vec2(full.x, full.y.min(max_body));
     let h = head_h + size.y + 2.0 * pad;
     let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
     let p = ui.painter();
@@ -187,7 +269,15 @@ fn sheet(
         vec2(inner_w, size.y),
     );
     let mut child = ui.new_child(UiBuilder::new().id_salt("sheet-body").max_rect(inner));
-    body(&mut child);
+    if full.y > size.y {
+        egui::ScrollArea::vertical()
+            .id_salt("sheet-scroll")
+            .max_height(size.y)
+            .auto_shrink([false, false])
+            .show(&mut child, body);
+    } else {
+        body(&mut child);
+    }
 }
 
 fn head_job(cx: &Cx, n: &SNode, fallback: Option<&str>) -> Option<LayoutJob> {
@@ -232,22 +322,27 @@ pub fn inline(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let w = ui.available_width();
     match n.kind.as_str() {
         "picker" => picker_sheet(cx, ui, n, w, 360.0),
-        _ => sheet(cx, ui, w, head_job(cx, n, n.str("title")), &|_| {}, &|ui| {
-            overlay_body(cx, ui, n)
-        }),
+        _ => sheet(
+            cx,
+            ui,
+            w,
+            f32::INFINITY,
+            head_job(cx, n, n.str("title")),
+            &|_| {},
+            &|ui| overlay_body(cx, ui, n),
+        ),
     }
 }
 
 /// Shows every overlay of the `layer` region, the toasts and the zoomed image over `rect`.
 pub fn overlays(cx: &Cx, ctx: &Context, rect: Rect, salt: Id) {
-    let Some(layer) = cx.snap.region("layer") else {
-        return;
-    };
-    for n in cx.snap.kids(layer).filter(|n| !n.hidden()) {
-        match n.kind.as_str() {
-            "overlay" => overlay(cx, ctx, rect, salt, n),
-            "picker" => modal_picker(cx, ctx, rect, salt, n),
-            _ => {}
+    if let Some(layer) = cx.snap.region("layer") {
+        for n in cx.snap.kids(layer).filter(|n| !n.hidden()) {
+            match n.kind.as_str() {
+                "overlay" => overlay(cx, ctx, rect, salt, n),
+                "picker" => modal_picker(cx, ctx, rect, salt, n),
+                _ => {}
+            }
         }
     }
     toasts(cx, ctx, rect, salt);
@@ -318,9 +413,17 @@ fn overlay(cx: &Cx, ctx: &Context, rect: Rect, salt: Id, n: &SNode) {
             if caret_anchor {
                 menu_sheet(cx, ui, w, n);
             } else {
-                sheet(cx, ui, w, head_job(cx, n, n.str("title")), &|_| {}, &|ui| {
-                    overlay_body(cx, ui, n)
-                });
+                // The sheet keeps clear of the pane's edges: a taller body scrolls.
+                let max_body = (rect.height() - 2.0 * 40.0 - 38.0 - 28.0).max(120.0);
+                sheet(
+                    cx,
+                    ui,
+                    w,
+                    max_body,
+                    head_job(cx, n, n.str("title")),
+                    &|_| {},
+                    &|ui| overlay_body(cx, ui, n),
+                );
             }
         });
 }
@@ -516,37 +619,18 @@ fn zoomed(cx: &Cx, ctx: &Context, rect: Rect, salt: Id) {
         cx.loc(|l| l.zoomed = None);
         return;
     };
-    if backdrop(ctx, rect, salt.with("zoom"), cx.ink) {
-        cx.loc(|l| l.zoomed = None);
-        return;
-    }
+    let bounds = ctx.content_rect().intersect(rect).size() - vec2(64.0, 144.0);
     let size = tex.size_vec2();
-    let k = ((rect.width() * 0.9) / size.x)
-        .min((rect.height() * 0.9) / size.y)
+    let k = (bounds.x.max(1.0) / size.x)
+        .min(bounds.y.max(1.0) / size.y)
         .min(4.0);
     let draw = size * k;
-    Area::new(salt.with("zoom-img"))
-        .order(Order::Foreground)
-        .fixed_pos(rect.center() - draw / 2.0)
-        .show(ctx, |ui| {
-            let (r, resp) = ui.allocate_exact_size(draw, Sense::click());
-            ui.painter().image(
-                tex.id(),
-                r,
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            paint::boxed(
-                ui.painter(),
-                r,
-                4,
-                Color32::TRANSPARENT,
-                Stroke::new(1.0, cx.ink.edge(cx.ink.b)),
-            );
-            if resp.clicked() {
-                cx.loc(|l| l.zoomed = None);
-            }
-        });
+    let head = crate::card::Header::new(crate::icons::ICON_APP_WINDOW, "Image preview");
+    if crate::card::modal(ctx, salt.with("zoom-img"), draw.x + 32.0, &head, |ui| {
+        ui.add(egui::Image::new(&tex).fit_to_exact_size(draw));
+    }) {
+        cx.loc(|l| l.zoomed = None);
+    }
 }
 
 // ---- pickers --------------------------------------------------------------------------------
@@ -704,7 +788,7 @@ fn picker_sheet(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, list_h: f32) {
             );
         }
     };
-    sheet(cx, ui, w, Some(head), &right, &|ui| {
+    sheet(cx, ui, w, f32::INFINITY, Some(head), &right, &|ui| {
         picker_body(cx, ui, n, &items, list_h)
     });
 }
@@ -1061,6 +1145,65 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn webp_blob_decodes_into_a_texture() {
+        let mut bytes = Vec::new();
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 20, 30, 255]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::WebP,
+        )
+        .expect("webp encodes");
+        let ctx = Context::default();
+        let mut cache = HashMap::new();
+        let tex = cached_texture(&mut cache, "webp", || {
+            Some(decode(&bytes).map(|img| ctx.load_texture("webp", img, TextureOptions::LINEAR)))
+        })
+        .expect("webp uploads");
+        assert_eq!(tex.size(), [3, 2]);
+    }
+
+    #[test]
+    fn image_limits_use_character_and_line_units_and_reserve_the_aspect_ratio() {
+        let max = json!({"w": "12ch", "h": "4lines"});
+        let bounds = image_bounds(Some(&max), 800.0, vec2(8.0, 20.0));
+        assert_eq!(bounds, vec2(96.0, 80.0));
+        let draw = image_fit(vec2(333.0, 200.0), bounds);
+        assert_eq!(draw.x, 96.0);
+        assert!((draw.y - 57.65766).abs() < 0.001);
+        assert_eq!(
+            image_bounds(
+                Some(&json!({"w": "120px", "h": "80px"})),
+                100.0,
+                vec2(8.0, 20.0)
+            ),
+            vec2(100.0, 80.0)
+        );
+        assert_eq!(
+            image_bounds(Some(&json!(320)), 800.0, vec2(8.0, 20.0)),
+            vec2(320.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn invalid_blob_is_decoded_once_but_a_missing_blob_is_retried() {
+        let mut cache = HashMap::new();
+        let mut attempts = 0;
+        assert!(cached_texture(&mut cache, "blob", || None).is_none());
+        assert!(!cache.contains_key("blob"));
+        for _ in 0..3 {
+            assert!(
+                cached_texture(&mut cache, "blob", || {
+                    attempts += 1;
+                    Some(decode(b"invalid").map(|_| unreachable!("invalid bytes")))
+                })
+                .is_none()
+            );
+        }
+        assert_eq!(attempts, 1);
+        assert!(matches!(cache.get("blob"), Some(None)));
+    }
 
     #[test]
     fn picker_order_interleaves_group_headers_and_skips_unknown_ids() {

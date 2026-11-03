@@ -6,13 +6,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::icons::ICON_GAUGE;
+use crate::chat_view::{Ink, hairline, pop};
 use crate::icons::{
-    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BRAIN, ICON_CHART_PIE,
-    ICON_CHEVRONS_UP_DOWN, ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY,
-    ICON_DOWNLOAD, ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2,
-    ICON_GIT_BRANCH, ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE,
-    ICON_MAP, ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_VIBRATE,
+    ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_BRAIN, ICON_CHART_PIE, ICON_CHEVRON_DOWN,
+    ICON_CIRCLE_ALERT, ICON_CIRCLE_CHECK, ICON_CIRCLE_STOP, ICON_COPY, ICON_CPU, ICON_DOWNLOAD,
+    ICON_ELLIPSIS, ICON_FOLD_VERTICAL, ICON_FOLDER, ICON_FOLDER_GIT_2, ICON_GAUGE, ICON_GIT_BRANCH,
+    ICON_GIT_FORK, ICON_GIT_MERGE, ICON_HANDSHAKE, ICON_HISTORY, ICON_LIST_TREE, ICON_MAP,
+    ICON_NETWORK, ICON_PENCIL, ICON_ROTATE_CCW, ICON_SPARKLES, ICON_SQUARE, ICON_VIBRATE,
 };
 use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
 use deck_core::omp::ModelInfo;
@@ -43,18 +43,33 @@ use deck_service::statusfmt::{
     fmt_tokens, thinking_fill, thinking_short,
 };
 
-pub const BAR_H: f32 = 41.0;
-const CHIP_H: f32 = 29.0;
+/// Height of the bar strip. The chat view's composer row sits on 12 px labels; the bar is a
+/// full-width strip read from further away, so its chips run at 13 px (≈1.08×, was 14.4 = 1.2×)
+/// inside 26 px pills (was 29) on a 40 px strip (was 41).
+pub const BAR_H: f32 = 40.0;
+const CHIP_H: f32 = 26.0;
 const PATH_CHARS: usize = 44;
-const CHIP_PAD: f32 = 7.0;
+const CHIP_PAD: f32 = 8.0;
 /// Horizontal space a chip adds around its content: both pads plus the one item gap measured
 /// on screen (so a chip asked to be N px wide really is N px wide).
 const CHIP_CHROME_W: f32 = 2.0 * CHIP_PAD + 6.0;
-/// The model chip's width in every session (a 213 px baseline widened by 30 %); it does not follow
-/// the path chip, so a long path (a worktree) cannot push the other segments out.
-const MODEL_CHIP_W: f32 = 213.0 * 1.3;
-const PIE_BOX: f32 = 18.0;
-const CARET_W: f32 = 16.8;
+/// Text size of chip content, of the secondary figures (git counts, effort label, PR tag) and of
+/// icons, in px.
+const TEXT_PX: f32 = 13.0;
+const SMALL_PX: f32 = 12.0;
+const ICON_PX: f32 = 15.0;
+/// The model chip's width in every session (was 213 × 1.3 = 277); it does not follow the path
+/// chip, so a long path (a worktree) cannot push the other segments out.
+const MODEL_CHIP_W: f32 = 260.0;
+/// The model chip never gets narrower than this, however narrow the bar (was 195).
+const MODEL_CHIP_MIN: f32 = 176.0;
+/// Share of the bar the model chip may take at most.
+const MODEL_CHIP_SHARE: f32 = 0.42;
+const PIE_BOX: f32 = 16.0;
+const CARET_W: f32 = 14.0;
+/// Side padding of the strip, and width of one icon button of the action group.
+const BAR_PAD_X: i8 = 12;
+const BTN_W: f32 = 28.0;
 
 // ------------------------------------------------------------------ view (cached strings)
 
@@ -500,31 +515,38 @@ pub struct AgentsChip {
 
 // ------------------------------------------------------------------ drawing
 
-/// Draws the bar as a bottom panel and returns what the user asked for.
+/// Draws the bar as a bottom panel of the space that is left. The app shows the sidebar first, so
+/// the strip spans exactly the tab area (the sidebar keeps the window's full height). Returns
+/// what the user asked for.
 pub fn show(
     ui: &mut Ui,
     view: &BarView,
     picker: &mut PickerState,
     input: &BarInput<'_>,
 ) -> Vec<BarAction> {
-    let pal = Palette::of_ui(ui);
+    let ink = Ink::new(ui, TEXT_PX);
     let mut out = Vec::new();
-    let panel = egui::Panel::bottom("status-bar")
+    egui::Panel::bottom("status-bar")
         .resizable(false)
         .exact_size(BAR_H)
         .show_separator_line(false)
         .frame(
             Frame::NONE
-                .fill(pal.bar)
-                .inner_margin(Margin::symmetric(12, 0)),
+                .fill(ink.p.bar)
+                .inner_margin(Margin::symmetric(BAR_PAD_X, 0)),
         )
         .show(ui, |ui| {
             let full = ui.max_rect();
+            paint_strip(
+                ui.painter(),
+                full.expand2(vec2(f32::from(BAR_PAD_X), 0.0)),
+                &ink,
+            );
             let right = ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(full)
                     .layout(Layout::right_to_left(Align::Center)),
-                |ui| actions_row(ui, input, &mut out),
+                |ui| actions_row(ui, &ink, input, &mut out),
             );
             let left_max = (right.response.rect.left() - 8.0).max(full.left());
             let left_rect = Rect::from_min_max(full.min, pos2(left_max, full.max.y));
@@ -534,21 +556,47 @@ pub fn show(
                     .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
                     ui.set_clip_rect(left_rect.intersect(ui.clip_rect()));
-                    info_row(ui, view, picker, input, &mut out);
+                    info_row(ui, &ink, view, picker, input, &mut out);
                 },
             );
         });
-    let r = panel.response.rect;
-    if theme::is_gallery() || theme::look().separated {
-        theme::skin::paint_edge(ui.painter(), r, theme::skin::Edge::Top, pal);
-    } else {
-        ui.painter().hline(
-            r.x_range(),
-            r.top() + 0.5,
-            Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
-        );
-    }
     out
+}
+
+/// The strip behind the bar, in the composer card's language: its vertical glass gradient
+/// (surface warmed toward the first accent at the top, toward the second at the bottom), the
+/// style's region separator, the accent-pair hairline of the card's outline along the top edge
+/// and the faint light edge just below it.
+fn paint_strip(p: &Painter, rect: Rect, ink: &Ink) {
+    let (k_top, k_bot) = if ink.dark { (0.07, 0.03) } else { (0.05, 0.02) };
+    theme::gradient_rect(
+        p,
+        rect,
+        theme::mix(ink.p.surface, ink.a, k_top),
+        theme::mix(ink.p.surface, ink.b, k_bot),
+        false,
+    );
+    theme::skin::paint_edge(p, rect, theme::skin::Edge::Top, ink.p);
+    hairline(
+        p,
+        ink,
+        rect.left(),
+        rect.right(),
+        rect.top(),
+        if ink.dark { 0.75 } else { 0.6 },
+    );
+    let glass = Color32::from_white_alpha(if ink.dark { 26 } else { 90 });
+    crate::deco::gradient_rule(
+        p,
+        pos2(rect.left() + 18.0, rect.top() + 1.5),
+        pos2(rect.right() - 18.0, rect.top() + 1.5),
+        1.0,
+        &[
+            (0.0, Color32::TRANSPARENT),
+            (0.5, glass),
+            (1.0, Color32::TRANSPARENT),
+        ],
+    );
 }
 
 /// The droppable segments of the info row, most important first.
@@ -571,11 +619,17 @@ const SEGS: [Seg; 6] = [
     Seg::Usage,
 ];
 
-/// Real widths (divider + chip, without the spacing before them) of every segment for one view
+/// Real widths (the chip, without the spacing before it) of every segment for one view
 /// revision, usage chip page and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
-    key: (u64, Option<usize>, u32, deck_core::config::UiFont),
+    key: (
+        u64,
+        Option<usize>,
+        u32,
+        deck_core::config::UiFont,
+        &'static str,
+    ),
     w: [f32; 6],
 }
 
@@ -593,13 +647,15 @@ fn measure(ui: &mut Ui, f: impl FnOnce(&mut Ui)) -> f32 {
     child.min_rect().width()
 }
 
-fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
+fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> [f32; 6] {
     let key = (
         v.rev,
         // The pager's pick lives in egui memory, outside `rev`.
         usage_chip_card(ui.ctx(), v).map(|(_, i)| i),
         ui.ctx().pixels_per_point().to_bits(),
         theme::ui_font(),
+        // The label face (mono or the UI font) follows the style.
+        theme::style().key(),
     );
     let id = ui.scope_id().with("seg-widths");
     if let Some(c) = ui.data(|d| d.get_temp::<SegWidths>(id))
@@ -610,7 +666,7 @@ fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
     let mut w = [0.0; 6];
     let mut sink = Vec::new();
     for (i, s) in SEGS.into_iter().enumerate() {
-        w[i] = measure(ui, |ui| segment(ui, v, s, &mut sink));
+        w[i] = measure(ui, |ui| segment(ui, ink, v, s, &mut sink));
     }
     ui.data_mut(|d| d.insert_temp(id, SegWidths { key, w }));
     w
@@ -618,6 +674,7 @@ fn seg_widths(ui: &mut Ui, v: &BarView) -> [f32; 6] {
 
 fn info_row(
     ui: &mut Ui,
+    ink: &Ink,
     v: &BarView,
     picker: &mut PickerState,
     input: &BarInput<'_>,
@@ -626,12 +683,12 @@ fn info_row(
     ui.spacing_mut().item_spacing.x = 6.0;
 
     activity_dot(ui, input.activity);
-    ui.add_space(3.0);
+    ui.add_space(2.0);
     // The model chip has one width in every session, but never takes over the bar.
-    let widths = seg_widths(ui, v);
+    let widths = seg_widths(ui, ink, v);
     let gap = ui.spacing().item_spacing.x;
     let (chip_w, cap) = model_chip_width(ui.available_width());
-    model_chip(ui, v, picker, input, (chip_w, cap), out);
+    model_chip(ui, ink, v, picker, input, (chip_w, cap), out);
 
     // Priority-based fit on measured widths: drop the least important segments first.
     let present = SEGS.map(|s| match s {
@@ -652,15 +709,15 @@ fn info_row(
         Seg::Usage,
     ] {
         if shown[SEGS.iter().position(|x| *x == s).unwrap_or(0)] {
-            segment(ui, v, s, out);
+            segment(ui, ink, v, s, out);
         }
     }
 }
 
-/// Model chip `(width, cap)`: [`MODEL_CHIP_W`], capped at 52% of the bar so it never takes over a
-/// narrow bar.
+/// Model chip `(width, cap)`: [`MODEL_CHIP_W`], capped at [`MODEL_CHIP_SHARE`] of the bar (never
+/// below [`MODEL_CHIP_MIN`]) so it never takes over a narrow bar.
 fn model_chip_width(bar_w: f32) -> (f32, f32) {
-    let cap = (bar_w * 0.52).max(195.0);
+    let cap = (bar_w * MODEL_CHIP_SHARE).max(MODEL_CHIP_MIN);
     (MODEL_CHIP_W.min(cap), cap)
 }
 
@@ -687,15 +744,14 @@ fn fit_segments<const N: usize>(
     shown
 }
 
-/// One segment with its leading divider.
-fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
-    let pal = Palette::of_ui(ui);
+/// One segment: a pill (the pills are separated by the row's gap alone).
+fn segment(ui: &mut Ui, ink: &Ink, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
+    let pal = ink.p;
     match seg {
         Seg::Path => {
-            divider(ui);
-            let r = chip(ui, "path", Sense::click(), |ui| {
-                ui.label(icon_text(ICON_FOLDER, 14.4, pal.weak));
-                ui.add(text(&v.path_text, 14.4, pal.text));
+            let r = chip(ui, ink, "path", Sense::click(), Tone::Plain, |ui| {
+                ui.label(icon_text(ICON_FOLDER, ICON_PX, pal.weak));
+                ui.add(text(&v.path_text, TEXT_PX, pal.text));
             });
             let r = r.on_hover_cursor(CursorIcon::PointingHand);
             path_hover(&r, &v.path_full);
@@ -705,29 +761,25 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
         }
         Seg::Git => {
             if let Some(g) = &v.git {
-                divider(ui);
-                git_chip(ui, g, out);
+                git_chip(ui, ink, g, out);
             }
         }
         Seg::Ctx => {
-            divider(ui);
-            context_meter(ui, v);
+            context_meter(ui, ink, v);
         }
         Seg::Tokens => {
-            divider(ui);
-            let r = chip(ui, "tokens", Sense::hover(), |ui| {
-                ui.add(text("↑", 14.4, pal.weak));
-                ui.add(text(&v.tokens_in, 14.4, pal.text));
+            let r = chip(ui, ink, "tokens", Sense::hover(), Tone::Plain, |ui| {
+                ui.add(text("↑", TEXT_PX, pal.weak));
+                ui.add(text(&v.tokens_in, TEXT_PX, pal.text));
                 ui.add_space(4.0);
-                ui.add(text("↓", 14.4, pal.weak));
-                ui.add(text(&v.tokens_out, 14.4, pal.text));
+                ui.add(text("↓", TEXT_PX, pal.weak));
+                ui.add(text(&v.tokens_out, TEXT_PX, pal.text));
             });
             tokens_hover(&r, &v.tokens_tip);
         }
         Seg::Cost => {
-            divider(ui);
-            let r = chip(ui, "cost", Sense::hover(), |ui| {
-                ui.label(RichText::new(&v.cost).size(14.4).color(pal.ok));
+            let r = chip(ui, ink, "cost", Sense::hover(), Tone::Plain, |ui| {
+                ui.add(text(&v.cost, TEXT_PX, pal.ok));
             });
             cost_tip::hover(&r, &v.cost_tip);
         }
@@ -735,8 +787,7 @@ fn segment(ui: &mut Ui, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
             if let Some(u) = &v.usage
                 && let Some(c) = &u.chip
             {
-                divider(ui);
-                let r = chip(ui, "usage", Sense::click(), |ui| {
+                let r = chip(ui, ink, "usage", Sense::click(), Tone::Plain, |ui| {
                     usage_chip_content(ui, pal, v, c);
                 });
                 let r = r.on_hover_cursor(CursorIcon::PointingHand);
@@ -765,7 +816,7 @@ fn usage_chip_card<'a>(ctx: &egui::Context, v: &'a BarView) -> Option<(&'a CardV
 /// in its own colour; a provider without a measurable window falls back to the tightest quota
 /// overall, named so it is not mistaken for the selected provider's.
 fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, c: &Chip) {
-    ui.label(icon_text(ICON_GAUGE, 15.6, pal.weak));
+    ui.label(icon_text(ICON_GAUGE, ICON_PX, pal.weak));
     let pills = usage_chip_card(ui.ctx(), v)
         .and_then(|(card, i)| card.pages.get(i))
         .map(|p| p.pills.as_slice())
@@ -786,7 +837,7 @@ fn usage_chip_content(ui: &mut Ui, pal: &Palette, v: &BarView, c: &Chip) {
     } else {
         &[(who, pal.weak), (&c.text, tint)]
     };
-    Badge::new(ui.painter(), None, parts, tint, 13.0).show(ui);
+    Badge::new(ui.painter(), None, parts, tint, SMALL_PX).show(ui);
 }
 
 /// `5h 63% left`: the window tag in the window's hue, the figure strong; a warning or exhausted
@@ -808,29 +859,95 @@ fn quota_pill(ui: &mut Ui, pal: &Palette, p: &QuotaPill) {
         None,
         &[(&p.tag, tint), (&p.text, figure)],
         tint,
-        13.0,
+        SMALL_PX,
     )
     .show(ui);
 }
 
+/// Chip text in the chat view's label face (mono where the style sets labels in mono).
 fn text(s: &str, size: f32, color: Color32) -> egui::Label {
-    egui::Label::new(RichText::new(s).size(size).color(color)).selectable(false)
+    egui::Label::new(RichText::new(s).font(theme::label_font(size)).color(color)).selectable(false)
 }
 
 fn chip_radius() -> u8 {
-    if theme::flat() { 6 } else { 10 }
+    theme::rad(8, 10)
 }
 
-/// A rounded segment with a hover plate; `add` lays out its contents on one line. The response
+/// What a pill stands for; picks its fill and outline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// A quiet chip: the chat view's chip fill and hairline.
+    Plain,
+    /// The primary control (model): washed and outlined in the second accent.
+    Accent,
+    /// A switched-on toggle (the open dashboard): washed and outlined in the solid accent.
+    Lit,
+    /// Retry / Stop: amber.
+    Alert,
+}
+
+/// Fill and outline of a pill at hover progress `hot` (0..=1). Hovering moves a plain chip's
+/// outline to the style's hover line and an accent pill's toward its accent, as the chat view's
+/// pills do; [`pop`] adds the outer ring.
+fn plate_colors(ink: &Ink, tone: Tone, hot: f32) -> (Color32, Color32) {
+    let p = ink.p;
+    let (fill, line, lit, k) = match tone {
+        Tone::Plain => (ink.chip(), ink.line(), p.hover_line, 1.0),
+        Tone::Accent => (ink.wash(ink.b), ink.edge(ink.b), ink.b, 0.7),
+        Tone::Lit => (ink.wash(p.accent), ink.edge(p.accent), p.accent, 0.7),
+        Tone::Alert => (ink.wash(p.warn), ink.edge(p.warn), p.warn, 0.7),
+    };
+    (
+        theme::mix(fill, p.hover_bg, 0.55 * hot),
+        theme::mix(line, lit, k * hot),
+    )
+}
+
+/// Paints a pill's plate into the slot reserved for it before its content and returns the hover
+/// progress (0..=1) so the content can follow it.
+fn paint_plate(
+    ui: &Ui,
+    slot: egui::layers::ShapeIdx,
+    ink: &Ink,
+    rect: Rect,
+    id: egui::Id,
+    hovered: bool,
+    tone: Tone,
+) -> f32 {
+    let hot = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hot"), hovered, 0.1);
+    let (fill, line) = plate_colors(ink, tone, hot);
+    ui.painter().set(
+        slot,
+        Shape::Rect(egui::epaint::RectShape::new(
+            rect,
+            chip_radius(),
+            fill,
+            Stroke::new(1.0, line),
+            egui::StrokeKind::Inside,
+        )),
+    );
+    pop(ui.painter(), rect, chip_radius(), ink, hot);
+    hot
+}
+
+/// A pill with an outline and a hover pop; `add` lays out its contents on one line. The response
 /// is registered after the contents, so it wins hit-testing and labels never swallow clicks.
-fn chip(ui: &mut Ui, id: &'static str, sense: Sense, add: impl FnOnce(&mut Ui)) -> Response {
-    let pal = Palette::of_ui(ui);
-    let bg = ui.painter().add(Shape::Noop);
+fn chip(
+    ui: &mut Ui,
+    ink: &Ink,
+    id: &'static str,
+    sense: Sense,
+    tone: Tone,
+    add: impl FnOnce(&mut Ui),
+) -> Response {
+    let slot = ui.painter().add(Shape::Noop);
     let rect = ui
         .allocate_ui_with_layout(
             vec2(ui.available_width(), CHIP_H),
             // `ui.horizontal` would reserve only `interact_size.y` (24 px in Compact) centred in
-            // the row and let the 29 px chip grow downwards from there, sitting 2.5 px low.
+            // the row and let the chip grow downwards from there, sitting low.
             if ui.layout().prefer_right_to_left() {
                 Layout::right_to_left(Align::Center)
             } else {
@@ -851,24 +968,8 @@ fn chip(ui: &mut Ui, id: &'static str, sense: Sense, add: impl FnOnce(&mut Ui)) 
         // Keep keyboard focus with the terminal, not the chip.
         r.surrender_focus();
     }
-    if sense != Sense::hover() && r.hovered() {
-        ui.painter().set(
-            bg,
-            Shape::rect_filled(
-                r.rect,
-                chip_radius(),
-                theme::hover_fill(pal).gamma_multiply(0.85),
-            ),
-        );
-    }
+    paint_plate(ui, slot, ink, r.rect, r.id, r.hovered(), tone);
     r
-}
-
-fn divider(ui: &mut Ui) {
-    let pal = Palette::of_ui(ui);
-    let (rect, _) = ui.allocate_exact_size(vec2(1.0, 16.8), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 0, pal.stroke.gamma_multiply(0.8));
 }
 
 fn activity_dot(ui: &mut Ui, activity: Activity) {
@@ -1118,13 +1219,14 @@ fn pr_hover(resp: &Response, label: &str, url: &str) {
 
 fn model_chip(
     ui: &mut Ui,
+    ink: &Ink,
     v: &BarView,
     picker: &mut PickerState,
     input: &BarInput<'_>,
     (min_w, max_w): (f32, f32),
     out: &mut Vec<BarAction>,
 ) {
-    let pal = Palette::of_ui(ui);
+    let pal = ink.p;
     let pending = input.pending;
     let assumed = input
         .assumed
@@ -1132,9 +1234,9 @@ fn model_chip(
     // An assumed switch overrides only what it changed (a model, a level or both).
     let assumed_model = assumed.and_then(|a| a.selector.as_deref());
     let assumed_level = assumed.and_then(|a| a.level.as_deref());
-    let resp = chip(ui, "model", Sense::click(), |ui| {
+    let resp = chip(ui, ink, "model", Sense::click(), Tone::Accent, |ui| {
         if let Some(p) = pending {
-            ui.add(crate::widgets::Spin::new(16.8, pal.accent));
+            ui.add(crate::widgets::Spin::new(16.0, ink.b));
             ui.add(text(
                 &format!(
                     "switching to {}…",
@@ -1147,8 +1249,8 @@ fn model_chip(
                         (None, None) => String::new(),
                     }
                 ),
-                15.2,
-                pal.accent,
+                TEXT_PX,
+                ink.accent_text(),
             ));
             return;
         }
@@ -1162,38 +1264,45 @@ fn model_chip(
         };
         let level = assumed_level.or(v.level.as_deref());
         let configured = assumed_level.or(v.configured.as_deref());
-        let col = if (v.model_name.is_empty() || v.model_is_default) && assumed.is_none() {
-            pal.weak
-        } else {
-            pal.text_strong
-        };
-        // Effort glyph + label and the caret sit at the right edge of a fixed-width chip; the
+        let unknown = (v.model_name.is_empty() || v.model_is_default) && assumed.is_none();
+        let col = if unknown { pal.weak } else { pal.text_strong };
+        // The chip glyph, the effort glyph + label and the caret frame a fixed-width chip; the
         // model name takes the rest and ellipsizes.
         let effort = configured.filter(|c| *c == "auto").or(level.or(configured));
         let label_w = effort.map_or(0.0, |l| {
             ui.painter()
                 .layout_no_wrap(
                     thinking_short(l).to_owned(),
-                    crate::theme::font(14.4),
-                    pal.accent,
+                    theme::label_font(SMALL_PX),
+                    ink.accent_text(),
                 )
                 .size()
                 .x
         });
         let spacing = ui.spacing().item_spacing.x;
+        let lead_w = ICON_PX + spacing;
         let right_w = CARET_W + effort.map_or(0.0, |_| spacing + PIE_BOX + spacing + label_w);
         let name_text = name.as_str();
         let name_nat = ui
             .painter()
-            .layout_no_wrap(name_text.to_owned(), crate::theme::font(15.0), col)
+            .layout_no_wrap(name_text.to_owned(), theme::label_font(TEXT_PX), col)
             .size()
             .x
             + 8.0;
         let inner_w = (min_w - CHIP_CHROME_W)
-            .max((name_nat + spacing + right_w).min(max_w - CHIP_CHROME_W))
+            .max((lead_w + name_nat + spacing + right_w).min(max_w - CHIP_CHROME_W))
             .min(ui.available_width())
             .max(0.0);
-        let name_w = (inner_w - right_w - spacing).max(0.0);
+        let name_w = (inner_w - lead_w - right_w - spacing).max(0.0);
+        let (glyph, _) = ui.allocate_exact_size(vec2(ICON_PX, ICON_PX), Sense::hover());
+        paint_icon(
+            ui.painter(),
+            glyph.center(),
+            Align2::CENTER_CENTER,
+            ICON_CPU,
+            ICON_PX,
+            if unknown { pal.weak } else { ink.accent_text() },
+        );
         ui.allocate_ui_with_layout(
             vec2(name_w, CHIP_H),
             Layout::left_to_right(Align::Center),
@@ -1203,7 +1312,7 @@ fn model_chip(
                 ui.add(
                     egui::Label::new(
                         RichText::new(name_text)
-                            .size(15.0)
+                            .font(theme::label_font(TEXT_PX))
                             .color(col)
                             .variation("wght", 620.0),
                     )
@@ -1217,16 +1326,33 @@ fn model_chip(
             paint_pie(
                 ui.painter(),
                 rect.center(),
-                7.2,
+                6.4,
                 thinking_fill(l),
-                pal.accent,
+                ink.accent_text(),
             );
-            ui.add(text(thinking_short(l), 14.4, pal.accent));
+            ui.add(text(thinking_short(l), SMALL_PX, ink.accent_text()));
         }
-        ui.label(icon_text(ICON_CHEVRONS_UP_DOWN, 16.8, pal.weak));
+        let (caret, _) = ui.allocate_exact_size(vec2(CARET_W, CARET_W), Sense::hover());
+        paint_icon(
+            ui.painter(),
+            caret.center(),
+            Align2::CENTER_CENTER,
+            ICON_CHEVRON_DOWN,
+            CARET_W,
+            pal.weak,
+        );
     });
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if !egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
+    let popup_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    if popup_open {
+        // The dropdown is up: the chip stays outlined in the accent while the pointer is on it.
+        ui.painter().rect_stroke(
+            resp.rect,
+            chip_radius(),
+            Stroke::new(1.5, ink.b),
+            egui::StrokeKind::Inside,
+        );
+    } else {
         model_hover(&resp, &v.model_tip);
     }
     let acts = model_picker::show(
@@ -1271,30 +1397,30 @@ fn paint_pie(p: &Painter, c: Pos2, r: f32, fill: Option<f32>, color: Color32) {
     }
 }
 
-fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
-    let pal = Palette::of_ui(ui);
-    let r = chip(ui, "git", Sense::click(), |ui| {
+fn git_chip(ui: &mut Ui, ink: &Ink, g: &GitView, out: &mut Vec<BarAction>) {
+    let pal = ink.p;
+    let r = chip(ui, ink, "git", Sense::click(), Tone::Plain, |ui| {
         ui.label(icon_text(
             if g.worktree_of.is_some() {
                 ICON_FOLDER_GIT_2
             } else {
                 ICON_GIT_BRANCH
             },
-            18.0,
+            ICON_PX + 1.0,
             if g.dirty { pal.warn } else { pal.ok },
         ));
-        ui.add(text(&g.branch, 14.4, pal.text));
+        ui.add(text(&g.branch, TEXT_PX, pal.text));
         if !g.sync.is_empty() {
-            ui.add(text(&g.sync, 13.8, pal.weak));
+            ui.add(text(&g.sync, SMALL_PX, pal.weak));
         }
         if !g.unstaged.is_empty() {
-            ui.add(text(&g.unstaged, 13.8, pal.warn));
+            ui.add(text(&g.unstaged, SMALL_PX, pal.warn));
         }
         if !g.staged.is_empty() {
-            ui.add(text(&g.staged, 13.8, pal.ok));
+            ui.add(text(&g.staged, SMALL_PX, pal.ok));
         }
         if !g.untracked.is_empty() {
-            ui.add(text(&g.untracked, 13.8, pal.weak));
+            ui.add(text(&g.untracked, SMALL_PX, pal.weak));
         }
     });
     let r = r.on_hover_cursor(CursorIcon::PointingHand);
@@ -1303,12 +1429,12 @@ fn git_chip(ui: &mut Ui, g: &GitView, out: &mut Vec<BarAction>) {
         out.push(BarAction::ToggleChanges);
     }
     if let Some((label, url)) = &g.pr {
-        let pr = chip(ui, "pr", Sense::click(), |ui| {
-            ui.add(text("PR", 13.2, pal.weak));
+        let pr = chip(ui, ink, "pr", Sense::click(), Tone::Plain, |ui| {
+            ui.add(text("PR", SMALL_PX, pal.weak));
             ui.label(
                 RichText::new(label)
-                    .size(14.4)
-                    .color(pal.accent)
+                    .font(theme::label_font(TEXT_PX))
+                    .color(ink.accent_text())
                     .underline(),
             );
         });
@@ -1330,25 +1456,28 @@ pub(crate) fn level_color(pal: &Palette, level: Option<ContextLevel>) -> Color32
     }
 }
 
-fn context_meter(ui: &mut Ui, v: &BarView) {
-    let pal = Palette::of_ui(ui);
+fn context_meter(ui: &mut Ui, ink: &Ink, v: &BarView) {
+    let pal = ink.p;
     let color = level_color(pal, v.ctx_level);
-    let r = chip(ui, "ctx", Sense::hover(), |ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(81.0, 16.8), Sense::hover());
-        let bar = Rect::from_center_size(rect.center(), vec2(65.0, 5.0));
+    let escalated = v.ctx_level.is_some_and(|l| l != ContextLevel::Normal);
+    let r = chip(ui, ink, "ctx", Sense::hover(), Tone::Plain, |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(70.0, 16.0), Sense::hover());
+        let bar = Rect::from_center_size(rect.center(), vec2(64.0, 5.0));
         let p = ui.painter();
-        p.rect_filled(bar, 3, pal.surface);
+        // The chat view's meter: a quiet track, the accent pair as the fill while the context is
+        // healthy, the escalation colour once it is not.
+        p.rect_filled(bar, 3, ink.line().gamma_multiply(0.7));
         if let Some(f) = v.ctx_frac {
             let w = (bar.width() * f).max(if f > 0.0 { 3.6 } else { 0.0 });
             let fill = Rect::from_min_size(bar.min, vec2(w, bar.height()));
-            p.rect_filled(fill, 3, color);
+            if escalated {
+                p.rect_filled(fill, 3, color);
+            } else {
+                theme::gradient_rounded(p, fill, 3.0, ink.a, ink.b);
+            }
         }
-        let label_color = if v.ctx_level.is_some_and(|l| l != ContextLevel::Normal) {
-            color
-        } else {
-            pal.text
-        };
-        ui.add(text(&v.ctx_label, 14.4, label_color));
+        let label_color = if escalated { color } else { pal.text };
+        ui.add(text(&v.ctx_label, TEXT_PX, label_color));
     });
     ctx_tip::hover(&r, v.ctx_detail.as_ref().map(|(_, t)| &**t), &v.ctx_tip);
 }
@@ -1360,13 +1489,14 @@ enum Glyph {
 }
 
 /// `⟳ 2 · ✓ 5 · ✕ 1` — live counts of the active session's subagents; click toggles the dashboard.
-fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
-    let pal = Palette::of_ui(ui);
+fn agents_chip(ui: &mut Ui, ink: &Ink, v: &AgentsChip, out: &mut Vec<BarAction>) {
+    let pal = ink.p;
     let c = v.counts;
     let total = c.total();
     // The action row lays out right → left and `horizontal` inherits that: contents are emitted
     // in reverse reading order (last count first, number before its glyph, dashboard icon last).
-    let r = chip(ui, "agents", Sense::click(), |ui| {
+    let tone = if v.open { Tone::Lit } else { Tone::Plain };
+    let r = chip(ui, ink, "agents", Sense::click(), tone, |ui| {
         let lit = v.open || c.running > 0;
         let icon_color = if lit {
             pal.accent
@@ -1375,8 +1505,8 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
         } else {
             pal.weak
         };
-        if total == 0 {
-            ui.add(text("Agents", 14.4, pal.weak.gamma_multiply(0.85)));
+        if c.total() == c.parked {
+            ui.add(text("Agents", TEXT_PX, pal.weak.gamma_multiply(0.85)));
         } else {
             let mut first = true;
             let mut seg = |ui: &mut Ui, n: usize, glyph: Glyph, color: Color32| {
@@ -1384,16 +1514,16 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
                     return;
                 }
                 if !first {
-                    ui.add(text("·", 14.4, pal.weak));
+                    ui.add(text("·", TEXT_PX, pal.weak));
                 }
                 first = false;
-                ui.add(text(&n.to_string(), 14.4, pal.text));
+                ui.add(text(&n.to_string(), TEXT_PX, pal.text));
                 match glyph {
                     Glyph::Spinner => {
-                        ui.add(crate::widgets::Spin::new(15.6, color));
+                        ui.add(crate::widgets::Spin::new(ICON_PX, color));
                     }
                     Glyph::Icon(i) => {
-                        ui.label(icon_text(i, 16.8, color));
+                        ui.label(icon_text(i, ICON_PX + 1.0, color));
                     }
                 }
             };
@@ -1407,18 +1537,8 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
             seg(ui, c.done, Glyph::Icon(ICON_CIRCLE_CHECK), pal.ok);
             seg(ui, c.running, Glyph::Spinner, pal.accent_b);
         }
-        ui.label(icon_text(ICON_NETWORK, 19.2, icon_color));
+        ui.label(icon_text(ICON_NETWORK, ICON_PX + 2.0, icon_color));
     });
-    if v.open {
-        let p = ui.painter();
-        p.rect_filled(r.rect, chip_radius(), pal.accent.gamma_multiply(0.14));
-        p.rect_stroke(
-            r.rect,
-            chip_radius(),
-            Stroke::new(1.0, pal.accent.gamma_multiply(0.55)),
-            egui::StrokeKind::Inside,
-        );
-    }
     let r = r.on_hover_cursor(CursorIcon::PointingHand);
     crate::card::hover(
         &r,
@@ -1453,122 +1573,154 @@ fn agents_chip(ui: &mut Ui, v: &AgentsChip, out: &mut Vec<BarAction>) {
 
 // ------------------------------------------------------------------ action buttons
 
-fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
+fn actions_row(ui: &mut Ui, ink: &Ink, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     let c = &input.actions;
-    ui.spacing_mut().item_spacing.x = 3.0;
+    ui.spacing_mut().item_spacing.x = 6.0;
 
     // Added right → left: the Agents chip sits at the far right, under the dashboard.
-    agents_chip(ui, &input.agents, out);
-    ui.add_space(6.0);
+    agents_chip(ui, ink, &input.agents, out);
 
-    // Added right → left, so this reads: Stop/Retry · Plan · Handoff · Compact ▾ · Shake ▾ · Fork · Tree · ⋯
-    let more = bar_button(ui, ICON_ELLIPSIS, "More actions", true, None, false);
-    theme::dropup_menu(&more, 220.0, |ui| overflow_menu(ui, c, out));
+    // The icon buttons share one outlined group (the chat composer's button cluster), added
+    // right → left, so it reads: Plan · Handoff · Compact ▾ · Shake ▾ · Fork · Tree · ⋯
+    let slot = ui.painter().add(Shape::Noop);
+    let group = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let more = bar_button(ui, ink, ICON_ELLIPSIS, "More actions", true, None, false);
+            theme::dropup_menu(&more, 220.0, |ui| overflow_menu(ui, c, out));
 
-    let tree = Kind::Tree;
-    if bar_button(
-        ui,
-        ICON_LIST_TREE,
-        "Session tree (Ctrl+Shift+B)",
-        session_actions::availability(tree, c).is_enabled(),
-        reason(tree, c),
-        false,
-    )
-    .clicked()
-    {
-        out.push(BarAction::OpenTree);
-    }
+            let tree = Kind::Tree;
+            if bar_button(
+                ui,
+                ink,
+                ICON_LIST_TREE,
+                "Session tree (Ctrl+Shift+B)",
+                session_actions::availability(tree, c).is_enabled(),
+                reason(tree, c),
+                false,
+            )
+            .clicked()
+            {
+                out.push(BarAction::OpenTree);
+            }
 
-    let fork = Kind::Fork;
-    if bar_button(
-        ui,
-        ICON_GIT_FORK,
-        "Fork into a new tab",
-        session_actions::availability(fork, c).is_enabled(),
-        reason(fork, c),
-        false,
-    )
-    .clicked()
-    {
-        out.push(BarAction::Run(Action::Fork));
-    }
+            let fork = Kind::Fork;
+            if bar_button(
+                ui,
+                ink,
+                ICON_GIT_FORK,
+                "Fork into a new tab",
+                session_actions::availability(fork, c).is_enabled(),
+                reason(fork, c),
+                false,
+            )
+            .clicked()
+            {
+                out.push(BarAction::Run(Action::Fork));
+            }
 
-    let shake = bar_button(
-        ui,
-        ICON_VIBRATE,
-        "Shake heavy content out of the context…",
-        session_actions::availability(Kind::Shake, c).is_enabled(),
-        reason(Kind::Shake, c),
-        false,
+            let shake = bar_button(
+                ui,
+                ink,
+                ICON_VIBRATE,
+                "Shake heavy content out of the context…",
+                session_actions::availability(Kind::Shake, c).is_enabled(),
+                reason(Kind::Shake, c),
+                false,
+            );
+            if session_actions::availability(Kind::Shake, c).is_enabled() {
+                theme::dropup_menu(&shake, 250.0, |ui| {
+                    for (text, mode) in [
+                        ("Shake tool results + large blocks", ShakeMode::Elide),
+                        ("Shake images", ShakeMode::Images),
+                        ("Shake thinking", ShakeMode::Thinking),
+                    ] {
+                        if menu_item(ui, ICON_VIBRATE, text, None, true, false).clicked() {
+                            out.push(BarAction::Run(Action::Shake(mode)));
+                        }
+                    }
+                });
+            }
+
+            let compact = bar_button(
+                ui,
+                ink,
+                ICON_FOLD_VERTICAL,
+                "Compact context…",
+                session_actions::availability(Kind::Compact, c).is_enabled(),
+                reason(Kind::Compact, c),
+                false,
+            );
+            if session_actions::availability(Kind::Compact, c).is_enabled() {
+                theme::dropup_menu(&compact, 210.0, |ui| {
+                    if menu_item(ui, ICON_FOLD_VERTICAL, "Compact", None, true, false).clicked() {
+                        out.push(BarAction::Run(Action::Compact(CompactMode::Default)));
+                    }
+                    if menu_item(ui, ICON_FOLD_VERTICAL, "Compact (soft)", None, true, false)
+                        .clicked()
+                    {
+                        out.push(BarAction::Run(Action::Compact(CompactMode::Soft)));
+                    }
+                    if menu_item(ui, ICON_FOLD_VERTICAL, "Snapcompact", None, true, false).clicked()
+                    {
+                        out.push(BarAction::Run(Action::Compact(CompactMode::Snapcompact)));
+                    }
+                    ui.separator();
+                    if menu_item(ui, ICON_PENCIL, "Compact with focus…", None, true, false)
+                        .clicked()
+                    {
+                        out.push(BarAction::AskCompactFocus);
+                    }
+                });
+            }
+
+            let handoff = bar_button(
+                ui,
+                ink,
+                ICON_HANDSHAKE,
+                "Hand off to a fresh context…",
+                session_actions::availability(Kind::Handoff, c).is_enabled(),
+                reason(Kind::Handoff, c),
+                false,
+            );
+            if handoff.clicked() && session_actions::availability(Kind::Handoff, c).is_enabled() {
+                out.push(BarAction::AskHandoff);
+            }
+
+            if bar_button(
+                ui,
+                ink,
+                ICON_MAP,
+                "Plan mode (toggle)",
+                session_actions::availability(Kind::PlanMode, c).is_enabled(),
+                reason(Kind::PlanMode, c),
+                false,
+            )
+            .clicked()
+            {
+                out.push(BarAction::Run(Action::PlanMode));
+            }
+        })
+        .response
+        .rect;
+    // The scope spans the bar's height; the box is only as tall as the pills beside it.
+    let group = Rect::from_center_size(group.center(), vec2(group.width(), CHIP_H));
+    ui.painter().set(
+        slot,
+        Shape::Rect(egui::epaint::RectShape::new(
+            group,
+            chip_radius(),
+            ink.chip(),
+            Stroke::new(1.0, ink.line()),
+            egui::StrokeKind::Inside,
+        )),
     );
-    if session_actions::availability(Kind::Shake, c).is_enabled() {
-        theme::dropup_menu(&shake, 250.0, |ui| {
-            for (text, mode) in [
-                ("Shake tool results + large blocks", ShakeMode::Elide),
-                ("Shake images", ShakeMode::Images),
-                ("Shake thinking", ShakeMode::Thinking),
-            ] {
-                if menu_item(ui, ICON_VIBRATE, text, None, true, false).clicked() {
-                    out.push(BarAction::Run(Action::Shake(mode)));
-                }
-            }
-        });
-    }
 
-    let compact = bar_button(
-        ui,
-        ICON_FOLD_VERTICAL,
-        "Compact context…",
-        session_actions::availability(Kind::Compact, c).is_enabled(),
-        reason(Kind::Compact, c),
-        false,
-    );
-    if session_actions::availability(Kind::Compact, c).is_enabled() {
-        theme::dropup_menu(&compact, 210.0, |ui| {
-            if menu_item(ui, ICON_FOLD_VERTICAL, "Compact", None, true, false).clicked() {
-                out.push(BarAction::Run(Action::Compact(CompactMode::Default)));
-            }
-            if menu_item(ui, ICON_FOLD_VERTICAL, "Compact (soft)", None, true, false).clicked() {
-                out.push(BarAction::Run(Action::Compact(CompactMode::Soft)));
-            }
-            if menu_item(ui, ICON_FOLD_VERTICAL, "Snapcompact", None, true, false).clicked() {
-                out.push(BarAction::Run(Action::Compact(CompactMode::Snapcompact)));
-            }
-            ui.separator();
-            if menu_item(ui, ICON_PENCIL, "Compact with focus…", None, true, false).clicked() {
-                out.push(BarAction::AskCompactFocus);
-            }
-        });
-    }
-
-    let handoff = bar_button(
-        ui,
-        ICON_HANDSHAKE,
-        "Hand off to a fresh context…",
-        session_actions::availability(Kind::Handoff, c).is_enabled(),
-        reason(Kind::Handoff, c),
-        false,
-    );
-    if handoff.clicked() && session_actions::availability(Kind::Handoff, c).is_enabled() {
-        out.push(BarAction::AskHandoff);
-    }
-
-    if bar_button(
-        ui,
-        ICON_MAP,
-        "Plan mode (toggle)",
-        session_actions::availability(Kind::PlanMode, c).is_enabled(),
-        reason(Kind::PlanMode, c),
-        false,
-    )
-    .clicked()
-    {
-        out.push(BarAction::Run(Action::PlanMode));
-    }
-
+    // Retry and Stop stand out of the group as amber pills, left of it.
     if session_actions::visible(Kind::Retry, c)
         && bar_button(
             ui,
+            ink,
             ICON_ROTATE_CCW,
             "Retry the failed turn",
             session_actions::availability(Kind::Retry, c).is_enabled(),
@@ -1582,6 +1734,7 @@ fn actions_row(ui: &mut Ui, input: &BarInput<'_>, out: &mut Vec<BarAction>) {
     if session_actions::visible(Kind::Stop, c)
         && bar_button(
             ui,
+            ink,
             ICON_SQUARE,
             "Stop the current turn (Esc)",
             true,
@@ -1656,47 +1809,64 @@ fn overflow_menu(ui: &mut Ui, c: &ActionCtx, out: &mut Vec<BarAction>) {
     }
 }
 
-/// Compact icon button; disabled ones dim and explain why in the tooltip. `emphasis` tints it.
+/// Compact icon button; disabled ones dim and explain why in the tooltip. A plain button sits in
+/// the action group and shows a plate only under the pointer; `emphasis` makes it an amber pill
+/// of its own.
 fn bar_button(
     ui: &mut Ui,
+    ink: &Ink,
     icon: crate::icons::Icon,
     tooltip: &str,
     enabled: bool,
     disabled_reason: Option<&str>,
     emphasis: bool,
 ) -> Response {
-    let pal = Palette::of_ui(ui);
+    let pal = ink.p;
     let sense = if enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, CHIP_H), sense);
+    let slot = ui.painter().add(Shape::Noop);
+    let (rect, resp) = ui.allocate_exact_size(vec2(BTN_W, CHIP_H), sense);
     if resp.clicked() {
         resp.surrender_focus();
     }
-    let hov = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("hov"), resp.hovered() && enabled, 0.1);
-    let base = if emphasis { pal.warn } else { pal.weak };
-    let (fg_rest, fg_hot) = if enabled {
-        (base, if emphasis { pal.warn } else { pal.text_strong })
-    } else {
-        (pal.weak.gamma_multiply(0.4), pal.weak.gamma_multiply(0.4))
+    let hovered = resp.hovered() && enabled;
+    let (fg_rest, fg_hot) = match (enabled, emphasis) {
+        (false, _) => (pal.weak.gamma_multiply(0.4), pal.weak.gamma_multiply(0.4)),
+        (true, true) => (pal.warn, pal.warn),
+        (true, false) => (pal.weak, pal.text_strong),
     };
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        chip_radius(),
-        theme::hover_fill(pal).gamma_multiply(0.9 * hov),
-    );
+    let hot = if emphasis {
+        paint_plate(ui, slot, ink, rect, resp.id, hovered, Tone::Alert)
+    } else {
+        // Inside the group's outline: the plate is inset so its own outline and the pop ring
+        // stay within it.
+        let plate = rect.shrink2(vec2(2.0, 3.0));
+        let hot = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hot"), hovered, 0.1);
+        let (fill, line) = plate_colors(ink, Tone::Plain, hot);
+        let radius = chip_radius().saturating_sub(2);
+        let p = ui.painter();
+        p.rect(
+            plate,
+            radius,
+            fill.gamma_multiply(hot),
+            Stroke::new(1.0, line.gamma_multiply(hot)),
+            egui::StrokeKind::Inside,
+        );
+        pop(p, plate, radius, ink, hot);
+        hot
+    };
     paint_icon(
-        p,
+        ui.painter(),
         rect.center(),
         Align2::CENTER_CENTER,
         icon,
-        21.6,
-        theme::mix(fg_rest, fg_hot, hov),
+        17.0,
+        theme::mix(fg_rest, fg_hot, hot),
     );
     let tip = match (enabled, disabled_reason) {
         (false, Some(why)) => format!("{tooltip}\n{why}"),
@@ -2012,8 +2182,8 @@ mod tests {
 
     #[test]
     fn model_chip_is_as_wide_in_every_session_and_segments_still_fit_monotonically() {
-        assert!((model_chip_width(1400.0).0 - 276.9).abs() < 0.1);
-        assert_eq!(model_chip_width(400.0).0, 208.0);
+        assert_eq!(model_chip_width(1400.0).0, MODEL_CHIP_W);
+        assert_eq!(model_chip_width(400.0).0, MODEL_CHIP_MIN);
         // A worktree's long path chip leaves the model chip alone, so every segment still fits
         // a 1100 px bar (sized from the path, the chip took 546 px and usage was dropped).
         let widths = [60.0, 90.0, 420.0, 70.0, 80.0];
@@ -2146,5 +2316,67 @@ mod centering_tests {
         );
         assert_centered(UiStyle::Neon, Density::Compact, UiFont::Inter);
         assert_centered(UiStyle::Phosphor, Density::Compact, UiFont::VictorMono);
+    }
+
+    /// The bar is a full-width strip of exactly `BAR_H` at the bottom of what the sidebar leaves:
+    /// it never overlaps the sidebar, which keeps the whole window height.
+    #[test]
+    fn bar_is_a_bottom_strip_of_the_tab_area_and_leaves_the_sidebar_alone() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        crate::ui_fonts::finalize(&ctx);
+        theme::apply(
+            &ctx,
+            UiStyle::Blueprint,
+            Density::Compact,
+            UiFont::Auto,
+            true,
+        );
+        let v = BarView::default();
+        let cat = ModelsCache::default();
+        let mut picker = PickerState::default();
+        let input = BarInput {
+            catalog: &cat,
+            favorites: &[],
+            provider: None,
+            activity: Activity::Idle,
+            pending: None,
+            assumed: None,
+            actions: ActionCtx::default(),
+            agents: AgentsChip::default(),
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 700.0))),
+            ..Default::default()
+        };
+        let (mut sidebar, mut before, mut after) = (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
+        for _ in 0..3 {
+            ctx.run_ui(raw.clone(), |ui| {
+                sidebar = egui::Panel::left("sidebar")
+                    .exact_size(300.0)
+                    .show(ui, |_| {})
+                    .response
+                    .rect;
+                before = ui.available_rect_before_wrap();
+                show(ui, &v, &mut picker, &input);
+                after = ui.available_rect_before_wrap();
+            })
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(sidebar.height(), 700.0, "the sidebar keeps the full height");
+        assert!(
+            before.left() >= sidebar.right() - 0.5,
+            "{before:?} vs {sidebar:?}"
+        );
+        assert_eq!(
+            (after.left(), after.right()),
+            (before.left(), before.right())
+        );
+        assert_eq!(after.top(), before.top());
+        assert_eq!(before.bottom() - after.bottom(), BAR_H);
     }
 }

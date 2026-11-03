@@ -52,6 +52,58 @@ pub fn char_to_utf16(s: &str, c: usize) -> usize {
 
 // ---- entry points ---------------------------------------------------------------------------
 
+/// Match composer semantics and the stable segment key, never the generated node ordinal.
+/// `fact` is shared by hook/collab/plan indicators, so hiding the whole extras row loses data.
+pub fn duplicate(n: &SNode) -> bool {
+    match n.role() {
+        "omp.composer.model"
+        | "omp.composer.effort"
+        | "omp.composer.model.effort"
+        | "omp.composer.context"
+        | "omp.composer.usage" => true,
+        "omp.composer.fact" => matches!(
+            n.id.rsplit('/').next(),
+            Some(
+                "model"
+                    | "git"
+                    | "path"
+                    | "context_pct"
+                    | "context_total"
+                    | "cost"
+                    | "token_in"
+                    | "token_out"
+                    | "token_total"
+                    | "cache_read"
+                    | "cache_write"
+            )
+        ),
+        _ => false,
+    }
+}
+
+/// Some omp versions emit explicit separators. A removed adjacent status piece must not
+/// leave its dot/pipe behind. Limit this to the composer footer, not transcript punctuation.
+pub fn dangling_separator(cx: &Cx, n: &SNode) -> bool {
+    if n.kind != "text" || !matches!(n.text().trim(), "·" | "|" | "│" | "•") {
+        return false;
+    }
+    let Some(parent) = cx.snap.parent_of(&n.id) else {
+        return false;
+    };
+    if !matches!(parent.role(), "omp.composer.bar" | "omp.composer.extras") {
+        return false;
+    }
+    let mut previous = None;
+    let mut kids = cx.snap.kids(parent);
+    while let Some(child) = kids.next() {
+        if child.id == n.id {
+            return previous.is_some_and(duplicate) || kids.next().is_some_and(duplicate);
+        }
+        previous = Some(child);
+    }
+    false
+}
+
 /// The whole dock region, top to bottom.
 pub fn show(cx: &Cx, ui: &mut Ui) {
     let Some(dock) = cx.snap.region("dock") else {

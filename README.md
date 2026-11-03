@@ -167,8 +167,9 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
 
   <details><summary>More</summary>
 
-  Sessions open in the terminal by default. Settings → General → "Open sessions in" switches the default to Chat,
-  and "Open in chat view" / "New chat session" in the sidebar menus open one on demand. omp then describes its UI to
+  Sessions open in the chat view by default (since 0.25.1; an existing config switches once on upgrade). Settings →
+  General → "Open sessions in" switches the default back to Terminal, and "Open in terminal" / "Switch to terminal
+  view" in the sidebar menus open one on demand. In the chat view omp describes its UI to
   OmpDeck (omp's Tern Surface Protocol), which draws it natively: your messages as bubbles, replies as formatted
   text, tool calls as cards with output, thinking, todos, approvals, questions, the model picker and slash
   commands, in the colors of the active style. You still type into omp's own composer. "Switch to chat / terminal

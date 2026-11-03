@@ -188,6 +188,16 @@ impl Ink {
     pub fn rule_stops(&self) -> [(f32, Color32); 2] {
         [(0.0, self.a), (1.0, self.b)]
     }
+
+    /// `c` pulled toward the strong text colour just far enough to reach WCAG contrast `min`
+    /// against the opaque `bg` (unchanged when it already does): for text, outlines and icons
+    /// drawn on a tinted surface.
+    pub fn legible(&self, c: Color32, bg: Color32, min: f32) -> Color32 {
+        (0..=10)
+            .map(|i| theme::mix(c, self.p.text_strong, i as f32 / 10.0))
+            .find(|c| super::highlight::contrast(*c, bg) >= min)
+            .unwrap_or(self.p.text_strong)
+    }
 }
 
 /// An [`Ink`] from a headless frame (tests).

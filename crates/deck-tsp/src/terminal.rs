@@ -8,8 +8,8 @@
 //!
 //! # Hello reply and advertised features
 //!
-//! Kinds: all of [`KINDS`] except `json` (this build has no collapsible JSON tree renderer, so
-//! omp draws tool arguments/results as `tree` or text instead; omp-studio does the same).
+//! Kinds: all of [`KINDS`] except `json` (omp draws arguments/results as `tree` or text)
+//! and `media` (omp sends blob-backed `image` nodes, also usable on remote hosts).
 //! Features ([`FEATURES`]) are limited to what this crate honours:
 //! - `blobs`: the `b` verb and the `blobs` query (verified by SHA-256, LRU-capped store);
 //! - `settle`: tracked per node ([`crate::document::NodeRef::is_settled`]);
@@ -83,7 +83,7 @@ pub fn hello_reply(info: &TermInfo) -> Reply {
         ver: Some(env!("CARGO_PKG_VERSION").to_owned()),
         kinds: KINDS
             .iter()
-            .filter(|k| **k != "json")
+            .filter(|k| !matches!(**k, "json" | "media"))
             .map(|k| (*k).to_owned())
             .collect(),
         features: FEATURES.iter().map(|f| (*f).to_owned()).collect(),
@@ -374,7 +374,11 @@ mod tests {
     fn hello_reply_is_exact_and_carries_the_vocabulary() {
         let mut r = Responder::new(info());
         let out = r.on_output(&hello_query(), Instant::now());
-        let kinds: Vec<&str> = KINDS.iter().copied().filter(|k| *k != "json").collect();
+        let kinds: Vec<&str> = KINDS
+            .iter()
+            .copied()
+            .filter(|k| !matches!(*k, "json" | "media"))
+            .collect();
         let expected = json!({
             "r": "hello", "v": 1, "term": "omp-deck", "ver": env!("CARGO_PKG_VERSION"),
             "kinds": kinds,
@@ -394,8 +398,9 @@ mod tests {
             (Some("omp"), Some("18.15.0"))
         );
         assert!(p.supports("send") && p.supports("edit") && !p.supports("nope"));
-        assert_eq!(kinds.len(), 44);
+        assert_eq!(kinds.len(), 43);
         assert!(!kinds.contains(&"json"));
+        assert!(!kinds.contains(&"media"));
     }
 
     #[test]

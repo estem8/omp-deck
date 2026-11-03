@@ -1,0 +1,599 @@
+{
+  "jobs": [
+    {
+      "id": "q3-jobs",
+      "k": "tool",
+      "p": {
+        "role": "omp.tool.wait",
+        "name": "wait",
+        "title": "waiting on 3 jobs",
+        "status": "running",
+        "age": 29900,
+        "frame": "card",
+        "collapsible": false
+      },
+      "c": [
+        {
+          "id": "jobs",
+          "k": "row",
+          "p": {
+            "role": "omp.job.tiles",
+            "gap": "none",
+            "wrap": true
+          },
+          "c": [
+            {
+              "id": "jobs/1",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "jobs/1/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "jobs/1/dot",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent"
+                          }
+                        ],
+                        "wrap": "none"
+                      }
+                    },
+                    {
+                      "id": "jobs/1/title",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "spans": [
+                          {
+                            "t": "Worker1"
+                          }
+                        ],
+                        "grow": 1,
+                        "wrap": "none",
+                        "truncate": "end"
+                      }
+                    },
+                    {
+                      "id": "jobs/1/ring",
+                      "k": "meter",
+                      "p": {
+                        "role": "omp.job.tile.ring",
+                        "style": "ring",
+                        "size": "sm",
+                        "value": 0.1,
+                        "label": "10%"
+                      }
+                    },
+                    {
+                      "id": "jobs/1/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 20000,
+                        "stopped": 20000
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "jobs/1/lead",
+                  "k": "text",
+                  "p": {
+                    "role": "omp.job.tile.lead",
+                    "spans": [
+                      {
+                        "t": "Worker 1 is implementing a bounded renderer and preserving all visible content."
+                      }
+                    ],
+                    "wrap": "word"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "jobs/2",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "jobs/2/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "jobs/2/dot",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent"
+                          }
+                        ],
+                        "wrap": "none"
+                      }
+                    },
+                    {
+                      "id": "jobs/2/title",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "spans": [
+                          {
+                            "t": "Worker2"
+                          }
+                        ],
+                        "grow": 1,
+                        "wrap": "none",
+                        "truncate": "end"
+                      }
+                    },
+                    {
+                      "id": "jobs/2/ring",
+                      "k": "meter",
+                      "p": {
+                        "role": "omp.job.tile.ring",
+                        "style": "ring",
+                        "size": "sm",
+                        "value": 0.2,
+                        "label": "20%"
+                      }
+                    },
+                    {
+                      "id": "jobs/2/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 21000,
+                        "stopped": 21000
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "jobs/2/lead",
+                  "k": "text",
+                  "p": {
+                    "role": "omp.job.tile.lead",
+                    "spans": [
+                      {
+                        "t": "Worker 2 is implementing a bounded renderer and preserving all visible content."
+                      }
+                    ],
+                    "wrap": "word"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "jobs/3",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "jobs/3/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "jobs/3/dot",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent"
+                          }
+                        ],
+                        "wrap": "none"
+                      }
+                    },
+                    {
+                      "id": "jobs/3/title",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "spans": [
+                          {
+                            "t": "Worker3"
+                          }
+                        ],
+                        "grow": 1,
+                        "wrap": "none",
+                        "truncate": "end"
+                      }
+                    },
+                    {
+                      "id": "jobs/3/ring",
+                      "k": "meter",
+                      "p": {
+                        "role": "omp.job.tile.ring",
+                        "style": "ring",
+                        "size": "sm",
+                        "value": 0.3,
+                        "label": "30%"
+                      }
+                    },
+                    {
+                      "id": "jobs/3/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 22000,
+                        "stopped": 22000
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "jobs/3/lead",
+                  "k": "text",
+                  "p": {
+                    "role": "omp.job.tile.lead",
+                    "spans": [
+                      {
+                        "t": "Worker 3 is implementing a bounded renderer and preserving all visible content."
+                      }
+                    ],
+                    "wrap": "word"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "irc": [
+    {
+      "id": "q3-irc-incoming",
+      "k": "card",
+      "p": {
+        "role": "omp.irc.incoming",
+        "head": [
+          {
+            "t": "IRC \u2190 LayoutWorker",
+            "s": "accent"
+          }
+        ],
+        "tone": "info",
+        "collapsible": true,
+        "collapsed": false,
+        "preview": {
+          "lines": 3
+        }
+      },
+      "c": [
+        {
+          "id": "q3-irc-body",
+          "k": "md",
+          "p": {
+            "text": "LayoutWorker: the three job tiles now remain inside the card.\n\nThe native renderer preserves all task details."
+          }
+        }
+      ]
+    },
+    {
+      "id": "q3-irc-outgoing",
+      "k": "tool",
+      "p": {
+        "role": "omp.tool.write",
+        "name": "write",
+        "title": [
+          {
+            "t": "IRC LayoutWorker",
+            "s": "toolTitle"
+          },
+          {
+            "t": " injected",
+            "s": "success"
+          }
+        ],
+        "target": "agent://LayoutWorker",
+        "status": "done",
+        "frame": "card",
+        "collapsible": false
+      },
+      "c": [
+        {
+          "id": "q3-out-body",
+          "k": "text",
+          "p": {
+            "text": "Please retain the model picker alignment while fixing the card layout."
+          }
+        }
+      ]
+    }
+  ],
+  "jobs-live": [
+    {
+      "id": "x",
+      "k": "tool",
+      "p": {
+        "role": "omp.tool.wait",
+        "key": "q3_wait",
+        "name": "wait",
+        "title": [
+          {
+            "t": "waiting on 3 jobs",
+            "s": "toolTitle strong"
+          }
+        ],
+        "status": "running",
+        "age": 110,
+        "frame": "card",
+        "collapsible": true,
+        "collapsed": true,
+        "preview": "children",
+        "tone": "info"
+      },
+      "c": [
+        {
+          "id": "x.tiles",
+          "k": "row",
+          "p": {
+            "role": "omp.job.tiles",
+            "gap": "none",
+            "wrap": true
+          },
+          "c": [
+            {
+              "id": "x.tiles/2tjcwgiwglv72",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "x.tiles/2tjcwgiwglv72/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "x.tiles/2tjcwgiwglv72/head/0",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent",
+                            "fx": "pulse"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/2tjcwgiwglv72/head/1",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "wrap": "none",
+                        "truncate": "end",
+                        "grow": 1,
+                        "spans": [
+                          {
+                            "t": "Launching Worker1"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/2tjcwgiwglv72/head/2",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.id",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "bg_1",
+                            "s": "dim"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/2tjcwgiwglv72/head/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 162,
+                        "format": "short"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "x.tiles/tg9j8c52s9jl",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "x.tiles/tg9j8c52s9jl/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "x.tiles/tg9j8c52s9jl/head/0",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent",
+                            "fx": "pulse"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/tg9j8c52s9jl/head/1",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "wrap": "none",
+                        "truncate": "end",
+                        "grow": 1,
+                        "spans": [
+                          {
+                            "t": "Launching Worker2"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/tg9j8c52s9jl/head/2",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.id",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "bg_2",
+                            "s": "dim"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/tg9j8c52s9jl/head/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 155,
+                        "format": "short"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "x.tiles/39kl7u4ev8gai",
+              "k": "col",
+              "p": {
+                "role": "omp.job.tile",
+                "tone": "accent",
+                "gap": "xs"
+              },
+              "c": [
+                {
+                  "id": "x.tiles/39kl7u4ev8gai/head",
+                  "k": "row",
+                  "p": {
+                    "role": "omp.job.tile.head",
+                    "gap": "xs",
+                    "align": "center"
+                  },
+                  "c": [
+                    {
+                      "id": "x.tiles/39kl7u4ev8gai/head/0",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.dot",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "\u25cf",
+                            "s": "accent",
+                            "fx": "pulse"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/39kl7u4ev8gai/head/1",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.title",
+                        "wrap": "none",
+                        "truncate": "end",
+                        "grow": 1,
+                        "spans": [
+                          {
+                            "t": "Launching Worker3"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/39kl7u4ev8gai/head/2",
+                      "k": "text",
+                      "p": {
+                        "role": "omp.job.tile.id",
+                        "wrap": "none",
+                        "spans": [
+                          {
+                            "t": "bg_3",
+                            "s": "dim"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "id": "x.tiles/39kl7u4ev8gai/head/clock",
+                      "k": "elapsed",
+                      "p": {
+                        "age": 135,
+                        "format": "short"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

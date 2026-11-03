@@ -7,6 +7,11 @@
 //! One [`ChatState`] per chat view lives in egui's temp memory under the view's id: the surface
 //! snapshot ([`snap::Snap`], re-synced only when the mirrored document moved) and the view's local
 //! state (folds, measured heights, parse caches, textures).
+//!
+//! [`ChatView::hide_duplicates`] removes composer model/effort, context, cost and the stable
+//! git/path/token/cache fact keys when OmpDeck's bar describes the only pane. It never filters
+//! fullscreen pages or omp-only facts (plan/todo/collab/hooks/rate), mode indicators or the queue.
+//! Split panes keep the composer facts since the shared bar follows only the focused pane.
 
 mod ansi;
 mod code;
@@ -18,6 +23,7 @@ mod highlight;
 mod layer;
 mod md;
 mod menu;
+mod page;
 mod paint;
 mod render;
 mod select;
@@ -36,8 +42,9 @@ use deck_term::{Terminal, TspRefused, input};
 use egui::{Event, EventFilter, Rect, Sense, Ui, pos2, vec2};
 
 use ctx::{Cx, Local};
+pub(crate) use paint::{hairline, pop};
 use snap::Snap;
-use style::Ink;
+pub(crate) use style::Ink;
 
 /// Space between the composer and the bottom edge of the pane (px).
 const BOTTOM_PAD: f32 = 16.0;
@@ -53,6 +60,7 @@ pub struct ChatView<'a> {
     term: &'a mut Terminal,
     font_size: f32,
     id_salt: Option<u64>,
+    hide_duplicates: bool,
 }
 
 /// What a frame of the chat view reports back to the app.
@@ -70,6 +78,24 @@ pub struct ChatResponse {
 struct ChatState {
     snap: Snap,
     loc: Local,
+    /// The page omp shows in the session's place while one of its fullscreen overlays is open.
+    page: Page,
+}
+
+/// The copy and the local state of the page surface (its node ids are its own: `main` of the page
+/// is not `main` of the session, so nothing of the session's caches may be shared with it).
+struct Page {
+    snap: Snap,
+    loc: Local,
+}
+
+impl Default for Page {
+    fn default() -> Page {
+        Page {
+            snap: Snap::following(snap::Follow::Page),
+            loc: Local::default(),
+        }
+    }
 }
 
 /// How long a chat may go unshown before its state (snapshot, caches, fold flips) is dropped; a
@@ -105,6 +131,7 @@ impl<'a> ChatView<'a> {
             term,
             font_size: 14.0,
             id_salt: None,
+            hide_duplicates: false,
         }
     }
 
@@ -122,11 +149,19 @@ impl<'a> ChatView<'a> {
         self
     }
 
+    /// Omit composer status already shown by OmpDeck's bar. Leave this off in split view,
+    /// where the bar only describes the focused pane. Fullscreen omp pages are unaffected.
+    pub fn hide_duplicates(mut self, hide: bool) -> Self {
+        self.hide_duplicates = hide;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> ChatResponse {
         let ChatView {
             term,
             font_size,
             id_salt,
+            hide_duplicates,
         } = self;
         term.poll();
         let ctx = ui.ctx().clone();
@@ -187,21 +222,39 @@ impl<'a> ChatView<'a> {
             .clone()
         });
         let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let ChatState { snap, loc } = &mut *guard;
-        if !snap.is_current(rev, epoch) {
-            let moved = handle.with_stamp(|doc, rev, epoch| {
-                let moved = snap.sync(doc, rev, epoch);
-                let ring = doc
+        let ChatState {
+            snap: session_snap,
+            loc: session_loc,
+            page,
+        } = &mut *guard;
+        if !session_snap.is_current(rev, epoch) || !page.snap.is_current(rev, epoch) {
+            handle.with_stamp(|doc, rev, epoch| {
+                let moved = session_snap.sync(doc, rev, epoch);
+                let page_moved = page.snap.sync(doc, rev, epoch);
+                let ring: Vec<_> = doc
                     .toasts(now)
                     .filter(|r| !r.text.trim().is_empty())
-                    .map(layer::toast_of);
-                layer::merge_toasts(&mut loc.toasts, ring, now);
-                moved
+                    .map(layer::toast_of)
+                    .collect();
+                layer::merge_toasts(&mut session_loc.toasts, ring.iter().cloned(), now);
+                layer::merge_toasts(&mut page.loc.toasts, ring, now);
+                if moved {
+                    session_loc.prune(session_snap, now);
+                }
+                if page_moved {
+                    page.loc.prune(&page.snap, now);
+                }
             });
-            if moved {
-                loc.prune(snap, now);
-            }
         }
+        // While omp shows a page (a fullscreen overlay: `/git`, the agents hub, …) it owns the
+        // keyboard and the session surface is frozen: the page is what the view draws and what
+        // the pointer and keys address. A dead session keeps the session surface (and its banner).
+        let paged = exit.is_none() && page.snap.is_open();
+        let (snap, loc) = if paged {
+            (&page.snap, &mut page.loc)
+        } else {
+            (&*session_snap, &mut *session_loc)
+        };
         loc.toasts.retain(|t| now < t.at + t.ttl);
         loc.toast_galleys
             .retain(|seq, _| loc.toasts.iter().any(|t| t.seq == *seq));
@@ -292,7 +345,12 @@ impl<'a> ChatView<'a> {
             loc.probe = Some(probe);
         }
         ui.painter().rect_filled(rect, 0.0, ink.p.bg);
-        let (cols, rows, cell_w_px, cell_h_px) = grid(&ctx, &ink, rect, ppp);
+        let column = if paged {
+            page::body_width(rect)
+        } else {
+            transcript::column_width(rect.width())
+        };
+        let (cols, rows, cell_w_px, cell_h_px) = grid(&ctx, &ink, column, rect, ppp);
         term.resize(cols, rows, cell_w_px, cell_h_px);
 
         if snap.region("main").is_none() {
@@ -310,129 +368,19 @@ impl<'a> ChatView<'a> {
             };
         }
 
-        let cx = Cx::new(snap, &ink, loc, now, focused, snap.can_edit);
-        // A copy of the transcript selection (Ctrl+C, the menu): built from the items themselves,
-        // the ones never laid out included.
-        if cx.loc(|l| std::mem::take(&mut l.tsel.want_copy))
-            && let Some(text) = tsel::copy(&cx, ui, transcript::column_width(rect.width()))
-        {
-            ctx.copy_text(text);
-        }
-
-        // Dock first: its height decides where the conversation ends.
-        let cw = transcript::column_width(rect.width());
-        let draw_dock = |ui: &mut Ui| match exit {
-            Some(code) => dock::exited(&cx, ui, code),
-            None => dock::show(&cx, ui),
-        };
-        let dock_size = transcript::measure_size(ui, cw, &draw_dock);
-        let dock_h = dock_size.y;
-        let dock_rect = Rect::from_min_size(
-            pos2(
-                rect.center().x - cw / 2.0,
-                (rect.bottom() - BOTTOM_PAD - dock_h).max(rect.top()),
-            ),
-            vec2(cw, dock_h.min(rect.height())),
-        );
-        let main_bottom = if dock_h > 0.0 {
-            (dock_rect.top() + OVERLAP).min(rect.bottom())
+        let mut cx = Cx::new(snap, &ink, loc, now, focused, snap.can_edit);
+        cx.hide_duplicates = hide_duplicates && !paged;
+        if paged {
+            page::show(&cx, ui, rect, id);
         } else {
-            rect.bottom()
-        };
-        let main_rect = Rect::from_min_max(rect.min, pos2(rect.right(), main_bottom));
-        let view = Rect::from_min_max(
-            main_rect.min,
-            pos2(
-                main_rect.right(),
-                if dock_h > 0.0 {
-                    dock_rect.top()
-                } else {
-                    main_bottom
-                },
-            ),
-        );
-        cx.loc(|l| {
-            l.tsel.pointer(
-                &ctx,
-                cx.snap,
-                &tsel::Area {
-                    chat: rect,
-                    view,
-                    layer: ui.layer_id(),
-                },
-            )
-        });
-        // The scroll area runs under the floating composer and its fade: the last line gets that
-        // much room, so it ends up fully visible above them.
-        let end_pad = if dock_h > 0.0 {
-            OVERLAP + FADE + 8.0
-        } else {
-            12.0
-        };
-        let away = transcript::show(&cx, ui, main_rect, id, end_pad);
-        // The conversation also melts into the top edge.
-        crate::deco::fill_vertical(
-            ui.painter(),
-            &[
-                main_rect.left_top(),
-                main_rect.right_top(),
-                pos2(main_rect.right(), main_rect.top() + TOP_FADE),
-                pos2(main_rect.left(), main_rect.top() + TOP_FADE),
-            ],
-            ink.p.bg.gamma_multiply(0.93),
-            ink.p.bg.gamma_multiply(0.0),
-        );
-
-        if dock_h > 0.0 {
-            // The conversation melts into the background above the composer.
-            let fade = Rect::from_min_max(
-                pos2(rect.left(), dock_rect.top() - FADE),
-                pos2(rect.right(), rect.bottom()),
-            );
-            let pts = [
-                fade.left_top(),
-                fade.right_top(),
-                fade.right_bottom(),
-                fade.left_bottom(),
-            ];
-            let clear = ink.p.bg.gamma_multiply(0.0);
-            let mut mesh = egui::Mesh::default();
-            mesh.colored_vertex(pts[0], clear);
-            mesh.colored_vertex(pts[1], clear);
-            let solid_at = ((FADE + 10.0) / fade.height()).clamp(0.0, 1.0);
-            let mid_y = fade.top() + fade.height() * solid_at;
-            let c = ink.p.bg.gamma_multiply(0.96);
-            mesh.colored_vertex(pos2(fade.left(), mid_y), c);
-            mesh.colored_vertex(pos2(fade.right(), mid_y), c);
-            mesh.colored_vertex(pts[3], c);
-            mesh.colored_vertex(pts[2], c);
-            mesh.add_triangle(0, 1, 3);
-            mesh.add_triangle(0, 3, 2);
-            mesh.add_triangle(2, 3, 5);
-            mesh.add_triangle(2, 5, 4);
-            ui.painter().add(egui::Shape::mesh(mesh));
-
-            let mut dock_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(id.with("dock"))
-                    .max_rect(dock_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            dock_ui.style_mut().interaction.selectable_labels = false;
-            draw_dock(&mut dock_ui);
-        }
-        if away {
-            // Above the dock and its fade, which would otherwise dim or cover the pill.
-            let bottom =
-                transcript::pill_bottom((dock_h > 0.0).then(|| dock_rect.top()), rect.bottom());
-            transcript::jump_pill(&cx, ui, rect.center().x, bottom);
+            draw_session(&cx, ui, &ctx, rect, id, exit, &ink);
         }
 
         if exit.is_none() {
             layer::overlays(&cx, &ctx, rect, id);
         }
 
-        if exit.is_none() {
+        if exit.is_none() && !paged {
             let opened = menu::open(&cx);
             menu::show(&cx, ui, id, opened);
         }
@@ -446,6 +394,18 @@ impl<'a> ChatView<'a> {
         }
         if out.release {
             term.hold_input_until(Instant::now());
+        }
+        if out.dismiss && exit.is_none() {
+            // Leaving a page is a deliberate click: it reaches omp whatever else holds the input.
+            term.hold_input_until(Instant::now());
+            let esc = |pressed| Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            term.route_keyboard(&[esc(true), esc(false)], egui::Modifiers::NONE);
         }
         for e in out.events.iter().filter(|_| exit.is_none()) {
             if let Err(r) = term.send_tsp(e) {
@@ -466,19 +426,147 @@ impl<'a> ChatView<'a> {
     }
 }
 
-/// Terminal grid for the pane: columns from the chat column's width in the terminal font, rows
-/// from the pane height. `(cols, rows, cell_w_px, cell_h_px)`.
-fn grid(ctx: &egui::Context, ink: &Ink, rect: Rect, ppp: f32) -> (u16, u16, u16, u16) {
+/// Terminal grid for the pane: columns from `column` px (the conversation column, or the body of
+/// a page) in the terminal font, rows from the pane height. `(cols, rows, cell_w_px, cell_h_px)`.
+fn grid(ctx: &egui::Context, ink: &Ink, column: f32, rect: Rect, ppp: f32) -> (u16, u16, u16, u16) {
     let font = ink.mono_px(ink.mono_size);
     let (advance, row_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
     let cell_w_px = (advance * ppp).round().max(1.0);
     let cell_h_px = (row_h * ppp).ceil().max(1.0);
-    let column = transcript::column_width(rect.width());
     let cols = ((column * ppp) / cell_w_px).floor().clamp(2.0, 4096.0);
     let rows = ((rect.height() * ppp) / cell_h_px)
         .floor()
         .clamp(1.0, 4096.0);
     (cols as u16, rows as u16, cell_w_px as u16, cell_h_px as u16)
+}
+
+/// The session surface: the conversation, the dock floating over its bottom edge, the fade
+/// between them (the layer and the menus are drawn by the caller).
+fn draw_session(
+    cx: &Cx,
+    ui: &mut Ui,
+    ctx: &egui::Context,
+    rect: Rect,
+    id: egui::Id,
+    exit: Option<i32>,
+    ink: &Ink,
+) {
+    // A copy of the transcript selection (Ctrl+C, the menu): built from the items themselves,
+    // the ones never laid out included.
+    if cx.loc(|l| std::mem::take(&mut l.tsel.want_copy))
+        && let Some(text) = tsel::copy(cx, ui, transcript::column_width(rect.width()))
+    {
+        ctx.copy_text(text);
+    }
+
+    // Dock first: its height decides where the conversation ends.
+    let cw = transcript::column_width(rect.width());
+    let draw_dock = |ui: &mut Ui| match exit {
+        Some(code) => dock::exited(cx, ui, code),
+        None => dock::show(cx, ui),
+    };
+    let dock_size = transcript::measure_size(ui, cw, &draw_dock);
+    let dock_h = dock_size.y;
+    let dock_rect = Rect::from_min_size(
+        pos2(
+            rect.center().x - cw / 2.0,
+            (rect.bottom() - BOTTOM_PAD - dock_h).max(rect.top()),
+        ),
+        vec2(cw, dock_h.min(rect.height())),
+    );
+    let main_bottom = if dock_h > 0.0 {
+        (dock_rect.top() + OVERLAP).min(rect.bottom())
+    } else {
+        rect.bottom()
+    };
+    let main_rect = Rect::from_min_max(rect.min, pos2(rect.right(), main_bottom));
+    let view = Rect::from_min_max(
+        main_rect.min,
+        pos2(
+            main_rect.right(),
+            if dock_h > 0.0 {
+                dock_rect.top()
+            } else {
+                main_bottom
+            },
+        ),
+    );
+    cx.loc(|l| {
+        l.tsel.pointer(
+            ctx,
+            cx.snap,
+            &tsel::Area {
+                chat: rect,
+                view,
+                layer: ui.layer_id(),
+            },
+        )
+    });
+    // The scroll area runs under the floating composer and its fade: the last line gets that
+    // much room, so it ends up fully visible above them.
+    let end_pad = if dock_h > 0.0 {
+        OVERLAP + FADE + 8.0
+    } else {
+        12.0
+    };
+    let away = transcript::show(cx, ui, main_rect, id, end_pad);
+    // The conversation also melts into the top edge.
+    crate::deco::fill_vertical(
+        ui.painter(),
+        &[
+            main_rect.left_top(),
+            main_rect.right_top(),
+            pos2(main_rect.right(), main_rect.top() + TOP_FADE),
+            pos2(main_rect.left(), main_rect.top() + TOP_FADE),
+        ],
+        ink.p.bg.gamma_multiply(0.93),
+        ink.p.bg.gamma_multiply(0.0),
+    );
+
+    if dock_h > 0.0 {
+        // The conversation melts into the background above the composer.
+        let fade = Rect::from_min_max(
+            pos2(rect.left(), dock_rect.top() - FADE),
+            pos2(rect.right(), rect.bottom()),
+        );
+        let pts = [
+            fade.left_top(),
+            fade.right_top(),
+            fade.right_bottom(),
+            fade.left_bottom(),
+        ];
+        let clear = ink.p.bg.gamma_multiply(0.0);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(pts[0], clear);
+        mesh.colored_vertex(pts[1], clear);
+        let solid_at = ((FADE + 10.0) / fade.height()).clamp(0.0, 1.0);
+        let mid_y = fade.top() + fade.height() * solid_at;
+        let c = ink.p.bg.gamma_multiply(0.96);
+        mesh.colored_vertex(pos2(fade.left(), mid_y), c);
+        mesh.colored_vertex(pos2(fade.right(), mid_y), c);
+        mesh.colored_vertex(pts[3], c);
+        mesh.colored_vertex(pts[2], c);
+        mesh.add_triangle(0, 1, 3);
+        mesh.add_triangle(0, 3, 2);
+        mesh.add_triangle(2, 3, 5);
+        mesh.add_triangle(2, 5, 4);
+        ui.painter().add(egui::Shape::mesh(mesh));
+
+        let mut dock_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(id.with("dock"))
+                .max_rect(dock_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        dock_ui.style_mut().interaction.selectable_labels = false;
+        draw_dock(&mut dock_ui);
+    }
+    if away {
+        // Above the dock and its fade, which would otherwise dim or cover the pill.
+        let bottom =
+            transcript::pill_bottom((dock_h > 0.0).then(|| dock_rect.top()), rect.bottom());
+        transcript::jump_pill(cx, ui, rect.center().x, bottom);
+    }
 }
 
 /// Files dropped on the chat paste their paths into the composer like the terminal view does.
@@ -517,6 +605,8 @@ mod tests {
         /// What the view asked to open (links clicked).
         opened: Vec<String>,
         modifiers: Modifiers,
+        hide_duplicates: bool,
+        width: f32,
     }
 
     impl Harness {
@@ -539,6 +629,25 @@ mod tests {
             frames: &[serde_json::Value],
             later: &[serde_json::Value],
         ) -> Harness {
+            let mut after = Vec::new();
+            for (i, ops) in later.iter().enumerate() {
+                let body = serde_json::json!({"sf": "s:1", "s": 64 + frames.len() + i, "ops": ops});
+                after.extend(deck_tsp::stream::encode_message(
+                    deck_tsp::stream::Verb::Frame,
+                    &[],
+                    &serde_json::to_vec(&body).expect("frame JSON"),
+                ));
+            }
+            Harness::spawn(name, frames, &after, !later.is_empty())
+        }
+
+        /// [`Harness::new`], and program messages `later` (any surface, already on the wire) that
+        /// the child prints only once [`Harness::release_later`] is called.
+        fn with_later_wire(name: &str, later: &[u8]) -> Harness {
+            Harness::spawn(name, &[], later, true)
+        }
+
+        fn spawn(name: &str, frames: &[serde_json::Value], after: &[u8], gated: bool) -> Harness {
             let dir =
                 std::env::temp_dir().join(format!("omp-deck-chat-{name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("temp dir");
@@ -562,18 +671,8 @@ mod tests {
                 ));
             }
             std::fs::write(dir.join("frames"), wire).expect("frames file");
-            let mut after = Vec::new();
-            for (i, ops) in later.iter().enumerate() {
-                let body = serde_json::json!({"sf": "s:1", "s": 64 + frames.len() + i, "ops": ops});
-                after.extend(deck_tsp::stream::encode_message(
-                    deck_tsp::stream::Verb::Frame,
-                    &[],
-                    &serde_json::to_vec(&body).expect("frame JSON"),
-                ));
-            }
             std::fs::write(dir.join("later"), after).expect("later file");
-            // The later frames wait for `go` (see `release_later`).
-            let script = if later.is_empty() {
+            let script = if !gated {
                 "stty raw -echo; cat frames; cat > typed"
             } else {
                 // The later frames wait for `go` (see `release_later`).
@@ -606,6 +705,8 @@ mod tests {
                 id: egui::Id::NULL,
                 opened: Vec::new(),
                 modifiers: Modifiers::NONE,
+                hide_duplicates: false,
+                width: 900.0,
             };
             let until = Instant::now() + Duration::from_secs(10);
             while !(h.term.tsp().live() && h.term.tsp().revision() > 0) {
@@ -622,7 +723,7 @@ mod tests {
                 events.insert(0, Event::ModifiersChanged(self.modifiers));
             }
             let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(self.width, 700.0))),
                 events,
                 focused: true,
                 time: Some(self.time),
@@ -631,9 +732,17 @@ mod tests {
             self.time += 0.05;
             let term = &mut self.term;
             let opened = &mut self.opened;
+            let hide_duplicates = self.hide_duplicates;
             let mut id = egui::Id::NULL;
+            // As in the app: clicks on the chat's own widgets do not take its keyboard focus away.
+            self.ctx.options_mut(|o| {
+                o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never;
+            });
             let mut out = self.ctx.run_ui(raw, |ui| {
-                let shown = ChatView::new(term).id_salt(7).show(ui);
+                let shown = ChatView::new(term)
+                    .id_salt(7)
+                    .hide_duplicates(hide_duplicates)
+                    .show(ui);
                 id = shown.response.id;
                 opened.extend(shown.open_url);
             });
@@ -734,6 +843,322 @@ mod tests {
             walk(&clipped.shape, text, &mut hits);
         }
         hits
+    }
+
+    #[test]
+    fn composer_duplicates_follow_the_bar_without_hiding_omp_only_facts() {
+        // Model/context are real recorded ops. Facts use omp's describeSeg stable keys and
+        // roles, deliberately beneath a different generated prefix (not "3.bar/extras").
+        for key in [
+            "git",
+            "path",
+            "token_in",
+            "token_out",
+            "token_total",
+            "cache_read",
+            "cache_write",
+            "cost",
+            "context_pct",
+            "context_total",
+            "plan",
+            "todo",
+            "collab",
+            "status",
+            "token_rate",
+        ] {
+            // Render configurations individually: all possible facts cannot fit simultaneously.
+            let id = format!("other-generated-prefix/{key}");
+            let ops = serde_json::json!([
+                ["set", "3.bar/usage", {"text": "$0.42"}],
+                ["add", id, "3.bar/extras", null, {
+                    "id": id, "k": "seg", "p": {
+                        "role": "omp.composer.fact", "spans": [{"t": "Configured fact"}]
+                    }
+                }],
+                ["add", "effort", "3.bar", "3.bar/model", {
+                    "id": "effort", "k": "text",
+                    "p": {"role": "omp.composer.effort", "text": "High"}
+                }],
+                ["add", "dot", "3.bar", "3.bar/extras", {
+                    "id": "dot", "k": "text", "p": {"text": "│"}
+                }]
+            ]);
+            let mut h = Harness::with_frames(&format!("dedup-{key}"), &[ops]);
+            let visible = h.settle();
+            let duplicates = ["Fake One", "$0.42", "High", "│"];
+            for text in duplicates.into_iter().chain(["Configured fact"]) {
+                assert!(
+                    !text_at(&visible, text).is_empty(),
+                    "{key}: {text} missing with option off"
+                );
+            }
+            h.hide_duplicates = true;
+            let hidden = h.settle();
+            for text in duplicates {
+                assert!(
+                    text_at(&hidden, text).is_empty(),
+                    "{key}: {text} painted with option on"
+                );
+            }
+            let keep = matches!(key, "plan" | "todo" | "collab" | "status" | "token_rate");
+            assert_eq!(
+                !text_at(&hidden, "Configured fact").is_empty(),
+                keep,
+                "{key}"
+            );
+            // The context label is in a combined meter galley, not an independent text node.
+            assert!(galleys(&visible).iter().any(|g| g.2.contains("200K")));
+            assert!(!galleys(&hidden).iter().any(|g| g.2.contains("200K")));
+            // Changing pane count restores the same document, without new TSP ops.
+            h.hide_duplicates = false;
+            assert!(!text_at(&h.settle(), "Fake One").is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_suppression_never_changes_fullscreen_pages() {
+        let mut wire = git_page_wire(false);
+        wire.extend(deck_tsp::stream::encode_message(
+            deck_tsp::stream::Verb::Frame,
+            &[],
+            &serde_json::to_vec(&serde_json::json!({"sf": "s:2", "s": 2, "ops": [
+                ["add", "page-cost", "main", "r", {
+                    "id": "page-cost", "k": "text",
+                    "p": {"role": "omp.composer.usage", "text": "Page cost stays"}
+                }]
+            ]}))
+            .expect("page frame"),
+        ));
+        let mut h = Harness::with_later_wire("dedup-page", &wire);
+        h.hide_duplicates = true;
+        h.release_later();
+        let out = show_until(&mut h, "Page cost stays");
+        assert!(!text_at(&out, "Page cost stays").is_empty());
+    }
+
+    /// Nodes follow omp's describeJobTiles/describeJobTile and IRC describe functions. Keep the
+    /// payload shared with the native smoke harness so layout proof exercises the same wire.
+    fn visual_ops(case: &str) -> serde_json::Value {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("visual-fixtures.json")).expect("visual fixture");
+        let mut ops: Vec<serde_json::Value> =
+            ["1", "n", "o", "q", "s", "u", "v", "x", "z", "10", "11"]
+                .into_iter()
+                .map(|id| serde_json::json!(["del", id]))
+                .collect();
+        for n in cases[case].as_array().expect("fixture case") {
+            ops.push(serde_json::json!(["add", n["id"], "main", null, n]));
+        }
+        serde_json::Value::Array(ops)
+    }
+
+    fn boxes(out: &egui::FullOutput) -> Vec<Rect> {
+        fn walk(shape: &Shape, out: &mut Vec<Rect>) {
+            match shape {
+                Shape::Path(p) if p.closed => out.push(Rect::from_points(&p.points)),
+                Shape::Rect(r) => out.push(r.rect),
+                Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn irc_body_has_header_clearance_and_the_entire_tool_card_has_warning_outline() {
+        let mut h = Harness::with_frames("irc-body-chrome", &[visual_ops("irc")]);
+        h.hide_duplicates = true;
+        show_until(&mut h, "IRC ← LayoutWorker");
+        let out = h.settle();
+        let painted = galleys(&out);
+        let head = painted
+            .iter()
+            .find(|g| g.2 == "IRC ← LayoutWorker")
+            .expect("incoming header");
+        let body = painted
+            .iter()
+            .find(|g| g.2.starts_with("LayoutWorker:"))
+            .expect("incoming body");
+        assert!(
+            body.0.y - (head.0.y + head.1.y) >= 12.0,
+            "body starts below the tinted header with padding: {head:?} {body:?}"
+        );
+        let outgoing = painted
+            .iter()
+            .find(|g| g.2.starts_with("Please retain"))
+            .expect("outgoing body");
+        let body_rect = Rect::from_min_size(outgoing.0, outgoing.1);
+        let edge = tools::irc_edge(&style::test_ink());
+        fn full_outline(shape: &Shape, body: Rect, edge: egui::Color32) -> bool {
+            match shape {
+                Shape::Rect(r) => {
+                    r.rect.contains_rect(body)
+                        && r.rect.height() > body.height() + 25.0
+                        && r.stroke.color == edge
+                        && r.stroke.width >= 1.5
+                }
+                Shape::Vec(v) => v.iter().any(|s| full_outline(s, body, edge)),
+                _ => false,
+            }
+        }
+        assert!(
+            out.shapes
+                .iter()
+                .any(|s| full_outline(&s.shape, body_rect, edge)),
+            "warning outline must enclose the whole outgoing card, not only its header"
+        );
+    }
+
+    #[test]
+    fn hidden_composer_facts_keep_send_and_stop_at_the_footer_right_edge() {
+        for stop in [false, true] {
+            let frames = if stop {
+                vec![serde_json::json!([["set", "3.bar/send", {
+                    "role": "omp.composer.stop", "actions": {"click": "interrupt"}
+                }]])]
+            } else {
+                Vec::new()
+            };
+            let mut h =
+                Harness::with_frames(if stop { "stop-align" } else { "send-align" }, &frames);
+            h.hide_duplicates = true;
+            let out = h.settle();
+            let (p, size, _) = galleys(&out)
+                .into_iter()
+                .find(|g| g.2 == if stop { "Stop" } else { "Send" })
+                .expect("footer action");
+            let text = Rect::from_min_size(p, size);
+            let button = boxes(&out)
+                .into_iter()
+                .filter(|r| r.width() < 150.0 && r.height() < 50.0 && r.contains_rect(text))
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("button outline");
+            let pane = h.ctx.read_response(h.id).expect("chat response").rect;
+            let right = pane.center().x + transcript::column_width(pane.width()) / 2.0 - 16.0;
+            assert!(
+                (button.right() - right).abs() <= 1.5,
+                "button {button:?}, footer right {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_job_tiles_stack_and_stay_inside_the_card() {
+        check_job_tiles("jobs", "Worker");
+        check_job_tiles("jobs-live", "Launching Worker");
+    }
+
+    fn check_job_tiles(case: &str, prefix: &str) {
+        let mut h = Harness::with_frames(&format!("jobs-layout-{case}"), &[visual_ops(case)]);
+        h.hide_duplicates = true;
+        show_until(&mut h, &format!("{prefix}1"));
+        // Real running jobs update subsecond clocks every frame, so their text never settles.
+        // Let layout initialize without requiring a live status label to become static.
+        for _ in 0..8 {
+            h.frame(vec![]);
+        }
+        let out = h.frame(vec![]);
+        let painted = galleys(&out);
+        let names: Vec<Rect> = (1..=3)
+            .map(|i| {
+                let (p, size, _) = painted
+                    .iter()
+                    .find(|g| g.2 == format!("{prefix}{i}"))
+                    .expect("every tile title painted");
+                Rect::from_min_size(*p, *size)
+            })
+            .collect();
+        for pair in names.windows(2) {
+            assert!(
+                pair[1].top() > pair[0].bottom(),
+                "tiles must stack: {names:?}"
+            );
+            assert!(
+                (pair[1].left() - pair[0].left()).abs() < 1.0,
+                "tile left edges: {names:?}"
+            );
+        }
+        let head = painted
+            .iter()
+            .find(|g| g.2 == "waiting on 3 jobs")
+            .expect("wait title");
+        let head = Rect::from_min_size(head.0, head.1);
+        let card = boxes(&out)
+            .into_iter()
+            .filter(|r| {
+                r.width() > 300.0
+                    && r.height() > 70.0
+                    && r.height() < 450.0
+                    && r.contains_rect(head)
+                    && r.contains_rect(names[2])
+            })
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("content-sized card outline");
+        for (p, size, text) in painted {
+            if text.starts_with(prefix) {
+                assert!(
+                    card.contains_rect(Rect::from_min_size(p, size)),
+                    "{text} outside {card:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_hub_page_grow_columns_wrap_at_their_real_minimum_widths() {
+        use deck_tsp::stream::{Verb, encode_message};
+        let open =
+            serde_json::json!({"id":"s:2","mode":"screen","title":"Agents","role":"omp.session"});
+        // agent-hub.ts describeAgents/describeRoster/describeDetail: the body itself grows,
+        // and its roster/detail children grow 3:2 with minima 48ch/34ch.
+        let page = serde_json::json!({"sf":"s:2","s":1,"ops":[
+            ["add","main","s:2",null,{"id":"main","k":"col"}],
+            ["add","dock","s:2",null,{"id":"dock","k":"col"}],
+            ["add","layer","s:2",null,{"id":"layer","k":"col"}],
+            ["add","hub-body","main",null,{"id":"hub-body","k":"row",
+                "p":{"gap":"md","wrap":true,"align":"start","grow":1},"c":[
+                    {"id":"hub-roster","k":"col","p":{"grow":3,"min":{"w":"48ch"}},"c":[
+                        {"id":"roster-title","k":"text","p":{"text":"Roster column"}}]},
+                    {"id":"hub-detail","k":"col","p":{"grow":2,"min":{"w":"34ch"},"gap":"sm",
+                        "role":"omp.overlay.agentHub.detail"},"c":[
+                        {"id":"detail-title","k":"text","p":{"text":"Detail column"}}]}
+                ]}]
+        ]});
+        let mut wire = encode_message(Verb::Open, &[], &serde_json::to_vec(&open).expect("open"));
+        wire.extend(encode_message(
+            Verb::Frame,
+            &[],
+            &serde_json::to_vec(&page).expect("page"),
+        ));
+        for (width, stacked) in [(1100.0, false), (450.0, true)] {
+            let mut h = Harness::with_later_wire(&format!("hub-{width}"), &wire);
+            h.width = width;
+            h.release_later();
+            show_until(&mut h, "Detail column");
+            let out = h.settle();
+            let roster = centre_of(&out, "Roster column").expect("roster");
+            let detail = centre_of(&out, "Detail column").expect("detail");
+            if stacked {
+                assert!(
+                    detail.y > roster.y + 10.0,
+                    "narrow page: {roster:?} {detail:?}"
+                );
+            } else {
+                assert!(
+                    (detail.y - roster.y).abs() < 1.0 && detail.x > roster.x + 100.0,
+                    "wide page: {roster:?} {detail:?}"
+                );
+            }
+            for (p, size, text) in galleys(&out) {
+                if text.ends_with("column") {
+                    assert!(p.x >= 0.0 && p.x + size.x <= width, "{text} outside page");
+                }
+            }
+        }
     }
 
     fn ime(e: ImeEvent) -> Event {
@@ -932,6 +1357,201 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    /// What omp prints when the git overlay opens (a trimmed copy of a recorded 18.15.0 page):
+    /// a second surface in `screen` mode with the toolbar, the changes and the diff.
+    fn git_page_wire(close_again: bool) -> Vec<u8> {
+        use deck_tsp::stream::{Verb, encode_message};
+        let msg = |verb, body: serde_json::Value| {
+            encode_message(verb, &[], &serde_json::to_vec(&body).expect("JSON"))
+        };
+        let button = |id: &str, act: &str, icon: &str, title: &str| {
+            serde_json::json!({"id": id, "k": "button", "p": {
+                "icon": icon, "title": title, "aria": title, "variant": "quiet",
+                "role": "omp.app.ibtn", "actions": {"click": act}}})
+        };
+        let page = serde_json::json!({"id": "r", "k": "row", "p": {"role": "omp.app.git"}, "c": [
+            {"id": "r.main", "k": "col", "p": {"role": "omp.app.git.main"}, "c": [
+                {"id": "r.main/bar", "k": "row", "p": {
+                    "justify": "between", "align": "center", "role": "omp.app.git.bar"}, "c": [
+                    {"id": "r.main/bar/0", "k": "row", "p": {"gap": "sm"}, "c": [
+                        {"id": "r.main/bar/0/0", "k": "text", "p": {"text": "notes.txt"}},
+                        {"id": "r.main/bar/0/1", "k": "badge", "p": {
+                            "text": "Untracked", "tone": "warning"}}]},
+                    {"id": "r.main/bar/1", "k": "row", "p": {"gap": "sm"}, "c": [
+                        {"id": "r.main/bar/1/views", "k": "tabs", "p": {
+                            "active": "split", "role": "omp.app.seg", "variant": "segmented",
+                            "items": [{"id": "file", "label": "File"}, {"id": "split", "label": "Split"}]}},
+                        {"id": "r.main/bar/1/stage-file", "k": "button", "p": {
+                            "role": "omp.btn", "text": "Stage file", "actions": {"click": "stage-file"}}},
+                        button("r.main/bar/1/close", "close", "x", "Close (q)")]}]},
+                {"id": "r.main/diff", "k": "diff", "p": {
+                    "mode": "split", "path": "notes.txt", "role": "omp.app.git.diff",
+                    "text": "@@ -0,0 +1,1 @@\n+hello page\n"}}]},
+            {"id": "r.side", "k": "col", "p": {"role": "omp.app.git.side"}, "c": [
+                {"id": "r.side/head", "k": "text", "p": {"text": "1 change on main"}}]}]});
+        let mut wire = msg(
+            Verb::Open,
+            serde_json::json!({"id": "s:2", "mode": "screen", "title": "omp", "role": "omp.session"}),
+        );
+        wire.extend(msg(
+            Verb::Frame,
+            serde_json::json!({"sf": "s:2", "s": 1, "ops": [
+                ["add", "main", "s:2", null, {"id": "main", "k": "col"}],
+                ["add", "dock", "s:2", null, {"id": "dock", "k": "col"}],
+                ["add", "layer", "s:2", null, {"id": "layer", "k": "col"}],
+                ["add", "r", "main", null, page]]}),
+        ));
+        if close_again {
+            wire.extend(msg(
+                Verb::Close,
+                serde_json::json!({"id": "s:2", "keep": false}),
+            ));
+            // A marker on the session surface, behind the close: when it is there, the page is gone.
+            wire.extend(msg(
+                Verb::Frame,
+                serde_json::json!({"sf": "s:1", "s": 64, "ops": [
+                    ["add", "zmark", "main", null, {"id": "zmark", "k": "spacer"}]]}),
+            ));
+        }
+        wire
+    }
+
+    /// The centre of the first painted galley that is exactly `text`.
+    fn centre_of(out: &egui::FullOutput, text: &str) -> Option<Pos2> {
+        galleys(out)
+            .into_iter()
+            .find(|g| g.2 == text)
+            .map(|g| g.0 + g.1 / 2.0)
+    }
+
+    fn click_at(h: &mut Harness, at: Pos2) {
+        h.frame(pointer(at, None));
+        h.frame(pointer(at, Some(true)));
+        h.frame(pointer(at, Some(false)));
+        h.frame(vec![]);
+    }
+
+    /// Frames until a galley `text` is painted.
+    fn show_until(h: &mut Harness, text: &str) -> egui::FullOutput {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            h.term.poll();
+            let out = h.frame(vec![]);
+            if centre_of(&out, text).is_some() || Instant::now() > until {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// How many Esc bytes (TSP events stripped) the child's input holds once it holds
+    /// `at_least`.
+    fn escapes(h: &mut Harness, at_least: usize) -> usize {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            h.term.poll();
+            let typed = std::fs::read(h.dir.join("typed")).unwrap_or_default();
+            let n = plain_input(&typed).matches('\u{1b}').count();
+            if n >= at_least || Instant::now() > until {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The git segment of omp's status line opens omp's git app: a fullscreen overlay, i.e. a
+    /// second `screen` surface while the inline one stays frozen. omp sends every key and click
+    /// to the overlay, so the view must draw it, address its events to it, and offer a way out;
+    /// before, the page was invisible and the chat looked dead until the session was killed.
+    #[test]
+    fn omps_fullscreen_page_is_drawn_operable_and_dismissible() {
+        let mut h = Harness::with_later_wire("page", &git_page_wire(false));
+        h.focus();
+        h.settle();
+        h.release_later();
+        let out = show_until(&mut h, "Stage file");
+        assert!(
+            centre_of(&out, "Stage file").is_some() && centre_of(&out, "Back to chat").is_some(),
+            "the page and the way out are on screen: {:?}",
+            galleys(&out)
+                .iter()
+                .map(|g| g.2.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            galleys(&out)
+                .iter()
+                .all(|g| !g.2.starts_with("Streamed answer")),
+            "the frozen conversation is not drawn under the page"
+        );
+
+        // A click on the page's button reaches omp as an action of the page's surface.
+        let at = centre_of(&out, "Stage file").expect("checked");
+        click_at(&mut h, at);
+        let typed = h.typed(b"stage-file");
+        let text = String::from_utf8_lossy(&typed);
+        assert!(
+            text.contains(r#""sf":"s:2""#) && text.contains(r#""act":"stage-file""#),
+            "{text:?}"
+        );
+
+        // The keyboard still reaches omp: Esc is what omp gets.
+        h.frame(vec![esc(true)]);
+        h.frame(vec![esc(false)]);
+        assert_eq!(escapes(&mut h, 1), 1, "Esc went to omp");
+
+        // "Back to chat" does the same with the pointer.
+        let back = centre_of(&h.frame(vec![]), "Back to chat").expect("still drawn");
+        click_at(&mut h, back);
+        assert_eq!(escapes(&mut h, 2), 2, "Back to chat sent omp an Esc");
+    }
+
+    /// A page the view cannot draw anything of still shows the strip, which is the way out.
+    #[test]
+    fn an_undrawable_page_keeps_its_way_out() {
+        use deck_tsp::stream::{Verb, encode_message};
+        let msg = |verb, body: serde_json::Value| {
+            encode_message(verb, &[], &serde_json::to_vec(&body).expect("JSON"))
+        };
+        let mut wire = msg(
+            Verb::Open,
+            serde_json::json!({"id": "s:2", "mode": "screen", "role": "omp.session"}),
+        );
+        wire.extend(msg(
+            Verb::Frame,
+            serde_json::json!({"sf": "s:2", "s": 1, "ops": [
+                ["add", "main", "s:2", null, {"id": "main", "k": "col"}],
+                ["add", "x", "main", null, {"id": "x", "k": "hologram", "p": {"role": "omp.app.future"}}]]}),
+        ));
+        let mut h = Harness::with_later_wire("page-empty", &wire);
+        h.focus();
+        h.release_later();
+        let out = show_until(&mut h, "Back to chat");
+        let back = centre_of(&out, "Back to chat").expect("the strip is drawn");
+        click_at(&mut h, back);
+        assert_eq!(escapes(&mut h, 1), 1, "Back to chat sent omp an Esc");
+    }
+
+    /// omp closing the page (`x`) brings the conversation and the composer back.
+    #[test]
+    fn the_conversation_returns_when_omp_closes_the_page() {
+        let mut h = Harness::with_later_wire("page-close", &git_page_wire(true));
+        h.focus();
+        h.release_later();
+        h.wait_for("the page closed", |d| {
+            d.surfaces().iter().any(|s| s.node("zmark").is_some())
+        });
+        h.frame(vec![]);
+        let out = h.settle();
+        assert!(centre_of(&out, "Stage file").is_none());
+        assert!(
+            galleys(&out)
+                .iter()
+                .any(|g| g.2.starts_with("Streamed answer")),
+            "the conversation is drawn again"
+        );
     }
 
     #[test]

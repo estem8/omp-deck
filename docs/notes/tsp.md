@@ -90,3 +90,25 @@ hello/ack harness and replays them through a fake omp.
 - deck-host answers every terminal query itself (`Core::answer_queries` → `Core::replies` → `send_replies`), attached
   or not ⇒ the host is where hello must be answered (ahead of the DA1 reply from the same chunk) and frames acked.
 - Host snapshots carry only the alacritty grid; TSP state must be kept beside it for reattach (later step).
+
+## Pages: omp's fullscreen overlays are `screen` surfaces (`chat_view/page.rs`)
+- Fullscreen overlays (the git app from the composer's git segment `status.git`, `/git`, `/models`, the agents hub,
+  `/settings`) make omp's native backend (`packages/tui/src/native/backend.ts` `render()`) open a **second surface with
+  `mode:"screen"`**, same `role:"omp.session"`, with its own `main`/`dock`/`layer` regions. The inline `s:1` stays
+  open but frozen, and omp routes **every key and click to the overlay**: a view that keeps drawing the inline surface
+  looks dead until the overlay is closed (this was the "branch icon freezes the chat" bug).
+- The view therefore keeps two `Snap`+`Local` pairs (node ids such as `main`, `layer`, `s` collide across surfaces):
+  `Follow::Session` = the open inline `omp.session`, `Follow::Page` = the newest open non-inline surface. While a page
+  is open (and the process has not exited) `show()` draws it instead of the transcript and dock, and TSP events are
+  addressed to the page's `sf` (`Cx::sf()`). Keys stay raw PTY bytes through `Terminal::route_keyboard`.
+- The page is drawn by the same node renderers as the session, plus `page.rs`: `button` (omp 18.15.0 sends kind
+  `button` for toolbar icons/quiet buttons; 18.12.6 used `icon` + role `omp.app.ibtn`), `omp.app.git` as a two-pane card
+  layout (main: bar + diff, side: changes + commit form), `row justify:"between"`, segmented `tabs` (`select` events whose
+  key ends `views` are handled by omp). Anything omp could not describe arrives as `rows` (ANSI lines) and is drawn too.
+- An OmpDeck-owned strip along the top is always drawn (page title + "Back to chat"). Its button sends omp an Esc,
+  exactly as typing it does (omp's overlays close on Esc/`q`; the git page also has its own `close` action), so a page
+  nothing here can render is still dismissible. omp closes the page with `x s:2`; the transcript and composer return.
+- Grid columns (`resize`) follow the page body width while a page is open (omp's git layout switches to
+  `omp.app.git-narrow` on `cols`).
+- Not covered: `deck-service` injection (`composer::TspComposer::of`) still reads the frozen inline surface while a
+  page is open.

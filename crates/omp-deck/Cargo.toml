@@ -36,8 +36,8 @@ qrcodegen.workspace = true
 zeroize.workspace = true
 # Hidden `--screenshot` flag encodes the egui screenshot; png 0.18 is already in the lockfile via eframe.
 png = "0.18"
-# Chat view images (omp sends blobs as PNG or JPEG); both codecs are already in the lockfile.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Chat view images: omp re-encodes attachment and tool-result blobs as PNG, JPEG or WebP.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Self-update downloads into a temporary folder that is removed afterwards.
 tempfile.workspace = true
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }

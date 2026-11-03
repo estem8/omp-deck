@@ -107,6 +107,11 @@ pub fn lucide(name: &str) -> &'static str {
         "circle-x" => "\u{e084}",
         "circle-stop" => "\u{e083}",
         "loader" | "spinner" => "\u{e109}",
+        "type" | "typography" => "\u{e198}",
+        "keyboard" => "\u{e284}",
+        "wand" | "wand-2" => "\u{e246}",
+        "commit" | "git-commit" => "\u{e0e3}",
+        "help" | "question" | "circle-help" => "\u{e082}",
         _ => "\u{e076}",
     }
 }
@@ -184,6 +189,13 @@ mod tests {
             "jobs",
             "refresh",
             "context.compaction",
+            "type",
+            "keyboard",
+            "wand",
+            "commit",
+            "help",
+            "chev-up",
+            "arrow-left",
         ] {
             assert!(known(n), "{n}");
         }

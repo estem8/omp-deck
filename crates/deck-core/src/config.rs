@@ -57,6 +57,10 @@ pub fn parse_config(bytes: &[u8]) -> Result<AppConfig, serde_json::Error> {
             }
             map.insert("style_rev".into(), STYLE_REV.into());
         }
+        if !map.contains_key("view_rev") {
+            map.insert("session_view".into(), "chat".into());
+            map.insert("view_rev".into(), VIEW_REV.into());
+        }
     }
     let mut cfg: AppConfig = serde_json::from_value(value)?;
     cfg.plain_folder_paths();
@@ -133,6 +137,8 @@ pub struct AppConfig {
     pub gateway_mode: GatewayMode,
     /// How new tabs open: the terminal grid or the native chat view (omp's TSP surface).
     pub session_view: SessionView,
+    /// New-tab view version this file was written with (see [`VIEW_REV`]).
+    pub view_rev: u32,
 }
 
 /// How a session is shown. `Chat` runs omp in Tern Surface Protocol mode on the OmpDeck session
@@ -280,7 +286,8 @@ impl Default for AppConfig {
             parked_branches: Vec::new(),
             split: None,
             gateway_mode: GatewayMode::Off,
-            session_view: SessionView::default(),
+            session_view: SessionView::Chat,
+            view_rev: VIEW_REV,
         }
     }
 }
@@ -374,6 +381,9 @@ pub enum Theme {
 
 /// Version of the style set; configs saved before it existed are migrated in `parse_config`.
 pub const STYLE_REV: u32 = 1;
+
+/// Version of the new-tab view default; older configs migrate to Chat in [`parse_config`].
+pub const VIEW_REV: u32 = 1;
 
 /// Smallest and largest [`AppConfig::ui_scale`] (80 %–160 %).
 pub const MIN_UI_SCALE: f32 = 0.8;
@@ -1311,7 +1321,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("state.json");
-        // A state file written before views existed: no `session_view`, tabs without `view`.
+        // A state file written before views existed: no view settings, tabs without `view`.
         fs::write(
             &p,
             r#"{"open_tabs":[{"session_name":"omp-1","cwd":"/w","session_path":null,"title":"t"}],
@@ -1319,7 +1329,8 @@ mod tests {
         )
         .unwrap();
         let cfg = AppConfig::load_from(&p);
-        assert_eq!(cfg.session_view, SessionView::Terminal);
+        assert_eq!(cfg.session_view, SessionView::Chat);
+        assert_eq!(cfg.view_rev, VIEW_REV);
         assert_eq!(cfg.open_tabs[0].view, SessionView::Terminal);
         assert_eq!(
             cfg.folder_tabs[Path::new("/w")].open_tabs[0].view,
@@ -1341,6 +1352,32 @@ mod tests {
         let back = AppConfig::load_from(&p);
         assert_eq!(back.session_view, SessionView::Chat);
         assert_eq!(back.open_tabs[0].view, SessionView::Chat);
+    }
+
+    #[test]
+    fn new_configs_default_to_chat_without_changing_the_legacy_view_default() {
+        assert_eq!(SessionView::default(), SessionView::Terminal);
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.session_view, SessionView::Chat);
+        assert_eq!(cfg.view_rev, VIEW_REV);
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.session_view, SessionView::Chat);
+        assert_eq!(cfg.view_rev, VIEW_REV);
+    }
+
+    #[test]
+    fn session_view_migrates_once_and_preserves_subsequent_terminal_choice() {
+        let cfg = parse_config(br#"{"session_view":"terminal"}"#).unwrap();
+        assert_eq!(cfg.session_view, SessionView::Chat);
+        assert_eq!(cfg.view_rev, VIEW_REV);
+
+        let cfg = parse_config(br#"{"session_view":"terminal","view_rev":1}"#).unwrap();
+        assert_eq!(cfg.session_view, SessionView::Terminal);
+        assert_eq!(cfg.view_rev, VIEW_REV);
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        let back = parse_config(&bytes).unwrap();
+        assert_eq!(back.session_view, SessionView::Terminal);
+        assert_eq!(back.view_rev, VIEW_REV);
     }
 
     #[test]

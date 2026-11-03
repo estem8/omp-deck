@@ -1,4 +1,6 @@
-//! An owned, incrementally maintained copy of the inline `omp.session` surface.
+//! An owned, incrementally maintained copy of one surface of the terminal's TSP document: the
+//! inline `omp.session` ([`Follow::Session`]) or the screen page omp puts in its place while a
+//! fullscreen overlay is open ([`Follow::Page`]).
 //!
 //! The terminal's TSP mirror lives behind a mutex the output thread also takes, so the renderer
 //! never draws from it directly: [`Snap::sync`] walks the document once per revision (inside one
@@ -12,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use deck_tsp::document::{Document, NodeRef, Surface};
+use deck_tsp::wire::Mode;
 use serde_json::{Map, Value};
 
 /// The props of one node.
@@ -19,6 +22,17 @@ pub type Props = Map<String, Value>;
 
 /// Role of the surface the chat view draws.
 pub const SESSION_ROLE: &str = "omp.session";
+
+/// Which surface of the document a [`Snap`] copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Follow {
+    /// The inline surface of the session (transcript, dock, layer).
+    #[default]
+    Session,
+    /// The newest open surface that is not inline: omp's fullscreen overlays (`/git`, the agents
+    /// hub, `/models`, …) are `screen` surfaces, the inline one stays frozen while one is open.
+    Page,
+}
 
 /// One node of the copy.
 #[derive(Debug, Clone)]
@@ -116,8 +130,11 @@ pub struct BlobBytes {
 /// The copy of one surface.
 #[derive(Default)]
 pub struct Snap {
-    /// Id of the surface (`sf` of every event).
+    follow: Follow,
+    /// Id of the surface (`sf` of every event); empty while there is none.
     pub sf: String,
+    /// The surface's `o` title.
+    pub title: String,
     nodes: HashMap<String, SNode>,
     blobs: HashMap<String, BlobBytes>,
     /// Node ids in pre-order: `order[n.ord]` is `n.id` (refilled in place by every sync).
@@ -153,10 +170,31 @@ fn hash_str(s: &str) -> u64 {
 pub fn session_surface(doc: &Document) -> Option<&Surface> {
     doc.surfaces()
         .iter()
-        .find(|s| s.is_open() && s.role() == Some(SESSION_ROLE))
+        .find(|s| s.is_open() && s.mode() == Mode::Inline && s.role() == Some(SESSION_ROLE))
+}
+
+/// The surface omp shows instead of the session: the newest open one that is not inline.
+pub fn page_surface(doc: &Document) -> Option<&Surface> {
+    doc.surfaces()
+        .iter()
+        .rev()
+        .find(|s| s.is_open() && s.mode() != Mode::Inline)
 }
 
 impl Snap {
+    /// A copy that follows `follow`.
+    pub fn following(follow: Follow) -> Snap {
+        Snap {
+            follow,
+            ..Snap::default()
+        }
+    }
+
+    /// Whether the surface exists (it is open in the document as of the last sync).
+    pub fn is_open(&self) -> bool {
+        !self.sf.is_empty()
+    }
+
     /// Whether the copy is as new as the terminal's mirror (`rev`, `epoch`: [`TspHandle::revision`]
     /// and [`TspHandle::epoch`]), so nothing needs the mirror's lock.
     pub fn is_current(&self, rev: u64, epoch: u64) -> bool {
@@ -176,7 +214,11 @@ impl Snap {
         let prog = doc.program();
         self.can_send = prog.is_some_and(|p| p.supports("send"));
         self.can_edit = prog.is_some_and(|p| p.supports("edit"));
-        let Some(surface) = session_surface(doc) else {
+        let surface = match self.follow {
+            Follow::Session => session_surface(doc),
+            Follow::Page => page_surface(doc),
+        };
+        let Some(surface) = surface else {
             let had = !self.nodes.is_empty();
             self.nodes.clear();
             self.order.clear();
@@ -190,6 +232,7 @@ impl Snap {
         if self.sf != surface.id() || replaced {
             self.nodes.clear();
             self.sf = surface.id().to_owned();
+            self.title = surface.title().unwrap_or_default().to_owned();
             self.resets += 1;
         }
         self.focus = surface.focus().map(str::to_owned);
