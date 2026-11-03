@@ -1109,6 +1109,74 @@ mod tests {
     }
 
     #[test]
+    fn recorded_jobs_overlay_keeps_both_panes_inside_sheet() {
+        // Real omp 18.15.0 PI_TUI_TSP_RECORD frame: two live background jobs,
+        // jobs.open from the HUD, first job selected. Neither split child has flex props.
+        let ops: serde_json::Value =
+            serde_json::from_str(include_str!("jobs-overlay.json")).expect("recorded ops");
+        for width in [1100.0, 700.0, 450.0] {
+            let mut h =
+                Harness::with_frames(&format!("jobs-sheet-{width}"), std::slice::from_ref(&ops));
+            h.width = width;
+            show_until(&mut h, "Background jobs");
+            let out = h.settle();
+            let header = centre_of(&out, "Background jobs").expect("sheet header");
+            let sheet = boxes(&out)
+                .into_iter()
+                .filter(|r| r.contains(header) && r.width() > 300.0 && r.height() > 100.0)
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("sheet outline");
+            let detail = centre_of(&out, "Output").expect("visible detail");
+            let master = centre_of(&out, "sleep 180 # Q5Worker2").expect("second running job");
+            assert!(
+                detail.x > master.x + 30.0,
+                "detail beside list: {master:?} {detail:?}"
+            );
+            assert!(
+                sheet.right() - detail.x > sheet.width() * 0.2,
+                "detail width: {sheet:?} {detail:?}"
+            );
+            for shape in &out.shapes {
+                // Body nodes have the sheet body's clip (or a narrower nested clip); transcript
+                // shapes behind the modal belong to a different, viewport-sized clip.
+                if (shape.clip_rect.top() - (sheet.top() + 52.0)).abs() < 1.0
+                    && shape.clip_rect.width() <= sheet.width()
+                    && shape.clip_rect.intersects(sheet)
+                {
+                    let painted = shape
+                        .shape
+                        .visual_bounding_rect()
+                        .intersect(shape.clip_rect);
+                    if painted.is_positive() {
+                        assert!(
+                            sheet.expand(1.0).contains_rect(painted),
+                            "sheet paint escaped: {painted:?}"
+                        );
+                    }
+                }
+                if let Shape::Text(t) = &shape.shape
+                    && [
+                        "Output",
+                        "No output yet",
+                        "Cancel job",
+                        "Close",
+                        "2 running",
+                    ]
+                    .contains(&t.galley.text())
+                {
+                    assert!(
+                        sheet.expand(1.0).contains_rect(
+                            Rect::from_min_size(t.pos, t.galley.size()).intersect(shape.clip_rect)
+                        ),
+                        "detail text escaped: {:?}",
+                        t.galley.text()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn agent_hub_page_grow_columns_wrap_at_their_real_minimum_widths() {
         use deck_tsp::stream::{Verb, encode_message};
         let open =

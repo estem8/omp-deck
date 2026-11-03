@@ -193,20 +193,15 @@ fn col(cx: &Cx, ui: &mut Ui, n: &SNode) {
     });
 }
 
-/// Natural width of what `f` draws on one row (nothing is painted or allocated).
-pub fn measure(ui: &mut Ui, f: &dyn Fn(&mut Ui)) -> f32 {
-    measure_salted(ui, "measure", f)
-}
-
-/// [`measure`] under its own id salt, for several measurements in one `ui`.
+/// Natural width under its own id salt (nothing is painted or allocated).
 fn measure_salted(
     ui: &mut Ui,
     salt: impl std::hash::Hash + std::fmt::Debug,
     f: &dyn Fn(&mut Ui),
 ) -> f32 {
     let rect = Rect::from_min_size(
-        ui.cursor().min,
-        vec2(4000.0, ui.available_height().max(40.0)),
+        pos2(0.0, 0.0),
+        vec2(4000.0, ui.available_height().clamp(40.0, 4000.0)),
     );
     let mut child = ui.new_child(
         UiBuilder::new()
@@ -228,70 +223,117 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
         Some("end") => Align::Max,
         _ => Align::Center,
     };
-    // The working line takes the room the HUD pill leaves instead of spanning the whole row.
-    let hud = n.role() == "omp.hud.activity";
-    let grow = kids.iter().position(|c| {
-        c.num("grow").is_some_and(|g| g > 0.0)
-            || (c.kind == "spacer" && c.flag("grow"))
-            || (hud && c.role() == "omp.hud.status")
-    });
     if n.flag("wrap") {
         wrapped(cx, ui, n, &kids, gap, align);
         return;
     }
-    // Idle, the activity row holds the todo pill alone: it sits at the right, where the pill of a
-    // run sits next to the working line.
-    let justify_end = (n.str("justify") == Some("end") || hud) && grow.is_none();
-    // `between`: the first child at the left edge, the rest as one group at the right.
-    let justify_between = n.str("justify") == Some("between") && grow.is_none() && kids.len() > 1;
-    let (left, mid, right): (&[&SNode], Option<&SNode>, &[&SNode]) = match grow {
-        Some(i) if kids[i].kind == "spacer" => (&kids[..i], None, &kids[i + 1..]),
-        Some(i) => (&kids[..i], Some(kids[i]), &kids[i + 1..]),
-        None if justify_between => (&kids[..1], None, &kids[1..]),
-        None if justify_end => (&[][..], None, &kids[..]),
-        None => (&kids[..], None, &[][..]),
+    let available_width = ui.available_width();
+    let total = if available_width.is_finite() {
+        available_width.max(0.0)
+    } else {
+        4000.0
     };
-    let draw = |ui: &mut Ui, ks: &[&SNode]| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for c in ks {
-            node(cx, ui, c);
+    let gap = gap.min(total / kids.len().saturating_sub(1).max(1) as f32);
+    let available = (total - gap * kids.len().saturating_sub(1) as f32).max(0.0);
+    let key = ui.scope_id().with(("row-widths", n.id.as_str()));
+    let mut widths = ui
+        .data_mut(|d| d.remove_temp::<Vec<f32>>(key))
+        .unwrap_or_default();
+    widths.clear();
+    let hud = n.role() == "omp.hud.activity";
+    let growth = |c: &SNode| {
+        if hud && c.role() == "omp.hud.status" {
+            1.0
+        } else {
+            grow_of(c)
         }
     };
+    let mut ch = None;
+    widths.extend(kids.iter().map(|c| {
+        let mut length = |v: &Value| len_px(v, || *ch.get_or_insert_with(|| ch_width(cx, ui)));
+        let explicit = c
+            .props
+            .get("basis")
+            .or_else(|| c.props.get("w"))
+            .and_then(&mut length);
+        let min = c
+            .obj("min")
+            .and_then(|m| m.get("w"))
+            .and_then(&mut length)
+            .unwrap_or(0.0);
+        explicit
+            .unwrap_or_else(|| {
+                if growth(c) > 0.0 {
+                    min
+                } else {
+                    measure_salted(ui, ("row-measure", c.id.as_str()), &|ui| node(cx, ui, c)) + 1.0
+                }
+            })
+            .max(min)
+            .clamp(0.0, available)
+    }));
+    // omp's jobs split conveys its native master/detail treatment through roles, not flex
+    // properties. A list otherwise measures at the entire available width.
+    if n.role() == "omp.jobs.split"
+        && widths.len() == 2
+        && kids.iter().all(|c| {
+            grow_of(c) == 0.0
+                && c.get("basis").is_none()
+                && c.get("w").is_none()
+                && c.get("min").is_none()
+        })
+    {
+        widths[0] = available * 0.4;
+        widths[1] = available * 0.6;
+    }
+    let fixed: f32 = kids
+        .iter()
+        .zip(&widths)
+        .filter(|(c, _)| growth(c) == 0.0)
+        .map(|(_, w)| w)
+        .sum();
+    let growing: f32 = kids
+        .iter()
+        .zip(&widths)
+        .filter(|(c, _)| growth(c) > 0.0)
+        .map(|(_, w)| w)
+        .sum();
+    let sum = fixed + growing;
+    let grow_total: f32 = kids.iter().map(|c| growth(c)).sum();
+    for (c, w) in kids.iter().zip(&mut widths) {
+        if sum > available {
+            // Exhaust the growing bases before shrinking fixed siblings proportionally.
+            *w *= if growth(c) > 0.0 {
+                if growing > 0.0 {
+                    ((available - fixed).max(0.0) / growing).min(1.0)
+                } else {
+                    0.0
+                }
+            } else if fixed > available {
+                available / fixed
+            } else {
+                1.0
+            };
+        } else {
+            *w = share(*w, growth(c), grow_total, available - sum);
+        }
+    }
+    let used = widths.iter().sum::<f32>() + gap * kids.len().saturating_sub(1) as f32;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        if right.is_empty() {
-            ui.with_layout(Layout::left_to_right(align), |ui| {
-                draw(ui, left);
-                if let Some(m) = mid {
-                    node(cx, ui, m);
+        ui.with_layout(Layout::left_to_right(align), |ui| {
+            if grow_total == 0.0 && (n.str("justify") == Some("end") || hud) {
+                ui.add_space((total - used).max(0.0));
+            }
+            for (i, (c, w)) in kids.iter().zip(&widths).enumerate() {
+                if i == 1 && grow_total == 0.0 && n.str("justify") == Some("between") {
+                    ui.add_space((total - used).max(0.0));
                 }
-            });
-            return;
-        }
-        let rw = measure(ui, &|ui| draw(ui, right));
-        let total = ui.available_width();
-        let lw = (total - rw - gap).max(0.0);
-        if !left.is_empty() || mid.is_some() {
-            ui.allocate_ui_with_layout(
-                vec2(lw, ui.available_height()),
-                Layout::left_to_right(align),
-                |ui| {
-                    ui.set_max_width(lw);
-                    draw(ui, left);
-                    if let Some(m) = mid {
-                        node(cx, ui, m);
-                    }
-                },
-            );
-        }
-        let used = ui.min_rect().width();
-        // A growing child was given the whole `lw`; the gap before the right group is already in
-        // `used`'s spacing, so only the spacing after the padding remains to be reserved.
-        let spacing = if mid.is_some() { gap } else { 0.0 };
-        let pad = (total - used - rw - spacing).max(0.0);
-        ui.add_space(pad);
-        draw(ui, right);
+                bounded(cx, ui, c, *w, true);
+            }
+        });
     });
+    ui.data_mut(|d| d.insert_temp(key, widths));
 }
 
 /// Role whose children omp's TUI draws one per line at full width (the jobs' tiles of `wait`).
@@ -344,10 +386,11 @@ impl Iterator for Lines<'_> {
 fn bounded(cx: &Cx, ui: &mut Ui, c: &SNode, w: f32, fill: bool) {
     let h = ui.available_height().clamp(20.0, 4000.0);
     ui.allocate_ui_with_layout(vec2(w, h), Layout::top_down(Align::Min), |ui| {
-        if fill {
-            ui.set_width(w);
-        } else {
-            ui.set_max_width(w);
+        ui.set_width(w);
+        let clip = Rect::from_x_y_ranges(ui.max_rect().x_range(), ui.clip_rect().y_range());
+        ui.set_clip_rect(clip.intersect(ui.clip_rect()));
+        if !fill {
+            ui.set_min_width(0.0);
         }
         node(cx, ui, c);
     });

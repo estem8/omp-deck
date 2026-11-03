@@ -1,0 +1,300 @@
+[
+  [
+    "add",
+    "q5.layer.ov-t",
+    "layer",
+    null,
+    {
+      "id": "q5.layer.ov-t",
+      "k": "overlay",
+      "p": {
+        "anchor": "center",
+        "size": "lg",
+        "modal": true,
+        "role": "omp.overlay.jobs",
+        "head": "Background jobs"
+      },
+      "c": [
+        {
+          "id": "q5.t",
+          "k": "col",
+          "c": [
+            {
+              "id": "q5.t.split",
+              "k": "row",
+              "p": {
+                "role": "omp.jobs.split"
+              },
+              "c": [
+                {
+                  "id": "q5.t.split/master",
+                  "k": "col",
+                  "p": {
+                    "role": "omp.jobs.master"
+                  },
+                  "c": [
+                    {
+                      "id": "q5.t.split/master/jobs",
+                      "k": "list",
+                      "p": {
+                        "selected": "q5.t.split/master/jobs/bg_1",
+                        "max": {
+                          "lines": 12
+                        },
+                        "actions": {
+                          "click": "select",
+                          "dblclick": "activate"
+                        }
+                      },
+                      "c": [
+                        {
+                          "id": "q5.t.split/master/jobs/bg_1",
+                          "k": "item",
+                          "p": {
+                            "label": [
+                              {
+                                "t": "sleep 180 # Q5Worker1",
+                                "s": "mono"
+                              }
+                            ],
+                            "value": [
+                              {
+                                "t": "1.9s",
+                                "s": "mono"
+                              }
+                            ],
+                            "icon": "bash",
+                            "tone": "pending",
+                            "title": "sleep 180 # Q5Worker1\nRunning \u00b7 bash \u00b7 bg_1",
+                            "aria": "sleep 180 # Q5Worker1, running, 1.9s"
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/master/jobs/bg_2",
+                          "k": "item",
+                          "p": {
+                            "label": [
+                              {
+                                "t": "sleep 180 # Q5Worker2",
+                                "s": "mono"
+                              }
+                            ],
+                            "value": [
+                              {
+                                "t": "1.9s",
+                                "s": "mono"
+                              }
+                            ],
+                            "icon": "bash",
+                            "tone": "pending",
+                            "title": "sleep 180 # Q5Worker2\nRunning \u00b7 bash \u00b7 bg_2",
+                            "aria": "sleep 180 # Q5Worker2, running, 1.9s"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "id": "q5.t.split/2tjcwgiwglv72",
+                  "k": "col",
+                  "p": {
+                    "role": "omp.jobs.detail"
+                  },
+                  "c": [
+                    {
+                      "id": "q5.t.split/2tjcwgiwglv72/0",
+                      "k": "row",
+                      "p": {
+                        "role": "omp.jobs.status",
+                        "gap": "sm",
+                        "align": "center"
+                      },
+                      "c": [
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/0/0",
+                          "k": "text",
+                          "p": {
+                            "role": "omp.jobs.state",
+                            "tone": "pending",
+                            "wrap": "none",
+                            "spans": [
+                              {
+                                "t": "\u25cf",
+                                "fx": "pulse"
+                              },
+                              {
+                                "t": " Running"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/0/1",
+                          "k": "elapsed",
+                          "p": {
+                            "age": 1921,
+                            "format": "short",
+                            "role": "omp.jobs.age",
+                            "title": "Running for"
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/0/2",
+                          "k": "text",
+                          "p": {
+                            "role": "omp.jobs.id",
+                            "wrap": "none",
+                            "truncate": "end",
+                            "spans": [
+                              {
+                                "t": "bash \u00b7 bg_1",
+                                "s": "mono"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/0/3",
+                          "k": "spacer",
+                          "p": {
+                            "grow": 1
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/0/cancel",
+                          "k": "button",
+                          "p": {
+                            "role": "omp.btn",
+                            "text": "Cancel job",
+                            "actions": {
+                              "click": "cancel"
+                            },
+                            "title": "Cancel job  x",
+                            "keys": [
+                              "x"
+                            ],
+                            "variant": "danger",
+                            "tone": "error"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "id": "q5.t.split/2tjcwgiwglv72/1",
+                      "k": "code",
+                      "p": {
+                        "lang": "bash",
+                        "wrap": true,
+                        "preview": {
+                          "lines": 4
+                        },
+                        "role": "omp.jobs.command",
+                        "text": "sleep 180 # Q5Worker1"
+                      }
+                    },
+                    {
+                      "id": "q5.t.split/2tjcwgiwglv72/2",
+                      "k": "kv",
+                      "p": {
+                        "items": [
+                          {
+                            "k": "Directory",
+                            "v": [
+                              {
+                                "t": "/tmp/omp-chat/q5/project",
+                                "s": "path"
+                              }
+                            ]
+                          }
+                        ],
+                        "role": "omp.jobs.facts"
+                      }
+                    },
+                    {
+                      "id": "q5.t.split/2tjcwgiwglv72/out",
+                      "k": "col",
+                      "p": {
+                        "role": "omp.jobs.out",
+                        "gap": "sm"
+                      },
+                      "c": [
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/out/0",
+                          "k": "text",
+                          "p": {
+                            "role": "omp.jobs.label",
+                            "text": "Output"
+                          }
+                        },
+                        {
+                          "id": "q5.t.split/2tjcwgiwglv72/out/1",
+                          "k": "text",
+                          "p": {
+                            "role": "omp.jobs.nooutput",
+                            "text": "No output yet"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "q5.t.actions",
+              "k": "row",
+              "p": {
+                "role": "omp.actions",
+                "gap": "sm",
+                "align": "center"
+              },
+              "c": [
+                {
+                  "id": "q5.t.actions/summary",
+                  "k": "text",
+                  "p": {
+                    "role": "omp.jobs.summary",
+                    "text": "2 running",
+                    "wrap": "none"
+                  }
+                },
+                {
+                  "id": "q5.t.actions/1",
+                  "k": "spacer",
+                  "p": {
+                    "grow": 1
+                  }
+                },
+                {
+                  "id": "q5.t.actions/close",
+                  "k": "button",
+                  "p": {
+                    "role": "omp.btn",
+                    "text": "Close",
+                    "actions": {
+                      "click": "close"
+                    },
+                    "title": "Close  esc",
+                    "keys": [
+                      "escape"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  [
+    "reveal",
+    "q5.t.split/master/jobs/bg_1",
+    "nearest"
+  ],
+  [
+    "focus",
+    null
+  ]
+]

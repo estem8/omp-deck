@@ -247,7 +247,7 @@ fn sheet(
             Stroke::new(1.0, ink.line()),
         );
         let g = p.layout_job(job);
-        p.galley(
+        p.with_clip_rect(band.intersect(ui.clip_rect())).galley(
             pos2(band.left() + pad, band.center().y - g.size().y / 2.0),
             g,
             ink.strong(),
@@ -261,6 +261,7 @@ fn sheet(
                 ))
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
+        r.set_clip_rect(band.intersect(ui.clip_rect()));
         right(&mut r);
     }
     crate::deco::gradient_outline(ui.painter(), pts, 1.0, &ink.rule_stops(), vec2(1.0, 0.3));
@@ -269,6 +270,8 @@ fn sheet(
         vec2(inner_w, size.y),
     );
     let mut child = ui.new_child(UiBuilder::new().id_salt("sheet-body").max_rect(inner));
+    child.set_width(inner_w.max(0.0));
+    child.set_clip_rect(inner.intersect(ui.clip_rect()));
     if full.y > size.y {
         egui::ScrollArea::vertical()
             .id_salt("sheet-scroll")

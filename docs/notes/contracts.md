@@ -3607,3 +3607,13 @@ Removes the step-2 known limits. Shared interfaces:
 - **Images**: `image` crate gains `webp` (omp re-encodes pasted images to WebP/JPEG); `image.max` accepts
   `{"w":"12ch","h":"4lines"}` objects (and px/numbers); `w`/`h` reserve space before the blob; failed decodes are cached;
   click opens a lightbox (Esc/outside closes); "Open" menu works on image nodes. Hello `kinds` omit `media`.
+
+### 0.25.2 (2026-11-03)
+- **Bounded non-wrapping rows** (`render.rs` `row`): children get explicit `basis`/`w`/`min.w`, else their natural
+  width capped so siblings never exceed the row; `grow` children share the remainder; when the row cannot fit, grow
+  children shrink first, then siblings proportionally; every child is clipped to its slot. Measurement uses a finite
+  independent origin. Cause of the `/jobs` overshoot: omp's `omp.jobs.split` row and its `omp.jobs.master`/
+  `omp.jobs.detail` columns carry only roles (no flex props), so the list took the full width and the detail pane
+  painted outside the sheet; role default 40 % master / 60 % detail, explicit props win. Layer `sheet()` bounds and
+  clips its body and header band. Gate: `recorded_jobs_overlay_keeps_both_panes_inside_sheet` (real 18.15.0 ops,
+  `chat_view/jobs-overlay.json`, widths 1100/700/450).

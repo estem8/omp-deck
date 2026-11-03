@@ -4,7 +4,7 @@ members = ["crates/deck-core", "crates/deck-host", "crates/deck-term", "crates/d
 
 [workspace.package]
 edition = "2024"
-version = "0.25.1"
+version = "0.25.2"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Desktop wrapper for the omp coding-agent TUI: session sidebar, tabs, embedded terminal backed by tmux or its own session host (Linux, Windows)"
