@@ -1,6 +1,7 @@
 //! Blocking client API: start sessions, attach (controller), observe (read-only), stream
 //! events.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::namespace::{Conn, Namespace, remote_error, valid_session_name};
 use crate::protocol::{
-    self, AttachParams, ExitedPayload, Grid, HostInfo, Kind, MAX_FRAME, ObserveParams, Palette,
-    PeekParams, ResizeParams, SessionSpec, SpawnRequest,
+    self, AttachParams, BLOB_ID_LEN, BlobHead, BlobRequest, ExitedPayload, Grid, HostInfo, Kind,
+    MAX_FRAME, ObserveParams, Palette, PeekParams, ResizeParams, SessionSpec, SpawnRequest,
 };
 use crate::spawn;
 use crate::transport::Stream;
@@ -191,6 +192,7 @@ fn startup_failure(
 pub fn attach(ns: &Namespace, name: &str, params: AttachParams) -> Result<Attached> {
     let mut conn = ns.connect(name, ATTACH_TIMEOUT)?;
     conn.check_protocol()?;
+    let blob_fetch = daemon_blob_fetch(&mut conn, name)?;
     conn.send_json(Kind::Attach, &params)?;
     conn.stream.set_read_timeout(None)?;
     let Conn {
@@ -205,16 +207,38 @@ pub fn attach(ns: &Namespace, name: &str, params: AttachParams) -> Result<Attach
             stream,
             payload,
             snapshot: Vec::new(),
+            blobs: HashMap::new(),
             closed: false,
         },
-        tx: AttachedTx(Arc::new(TxInner {
-            conn: Mutex::new(TxConn {
-                stream: tx_stream,
-                buf: out,
+        tx: AttachedTx(
+            Arc::new(TxInner {
+                conn: Mutex::new(TxConn {
+                    stream: tx_stream,
+                    buf: out,
+                }),
+                done: AtomicBool::new(false),
             }),
-            done: AtomicBool::new(false),
-        })),
+            blob_fetch,
+        ),
     })
+}
+
+/// Whether the daemon behind `conn` answers `BlobGet` (asked before attaching, so the answer
+/// is known before the first snapshot; a daemon that predates it closes the connection on an
+/// unknown frame kind).
+fn daemon_blob_fetch(conn: &mut Conn, name: &str) -> Result<bool> {
+    conn.send(Kind::Info, &[])?;
+    loop {
+        match conn.recv()? {
+            Some(Kind::Info) => {
+                let info: HostInfo = protocol::parse(&conn.payload)?;
+                return Ok(info.blob_fetch);
+            }
+            Some(Kind::Error) => return Err(remote_error(&conn.payload)),
+            None => return Err(Error::NotRunning(name.to_owned())),
+            Some(_) => {}
+        }
+    }
 }
 
 /// Non-displacing snapshot of a live session (`dump`): its info and a VT replay with up to
@@ -267,6 +291,12 @@ pub enum HostEvent {
     Snapshot(Vec<u8>),
     /// Live PTY output.
     Output(Vec<u8>),
+    /// The answer to [`AttachedTx::blob`]: the blob (`None`: the host holds no such blob).
+    Blob {
+        id: String,
+        mime: Option<String>,
+        bytes: Option<Vec<u8>>,
+    },
     /// The session's program exited (code `None` when killed by a signal).
     Exited(Option<i32>),
     /// Another client attached; this connection is closed.
@@ -293,6 +323,8 @@ pub struct AttachedRx {
     stream: Stream,
     payload: Vec<u8>,
     snapshot: Vec<u8>,
+    /// Blobs whose `BlobData` frames are still arriving, by id.
+    blobs: HashMap<String, PartialBlob>,
     closed: bool,
 }
 
@@ -325,10 +357,89 @@ impl AttachedRx {
                     self.closed = true;
                     return Ok(HostEvent::Displaced);
                 }
+                Some(Kind::BlobHead) => {
+                    if let Some(event) = self.blob_head()? {
+                        return Ok(event);
+                    }
+                }
+                Some(Kind::BlobData) => {
+                    if let Some(event) = self.blob_data()? {
+                        return Ok(event);
+                    }
+                }
                 Some(Kind::Error) => return Err(remote_error(&self.payload)),
                 Some(_) => {}
             }
         }
+    }
+}
+
+/// A blob whose `BlobData` frames are still arriving.
+struct PartialBlob {
+    mime: Option<String>,
+    len: usize,
+    bytes: Vec<u8>,
+}
+
+/// Blobs that may be arriving at once on one connection.
+const MAX_PARTIAL_BLOBS: usize = 8;
+
+impl AttachedRx {
+    /// `BlobHead`: an absent or empty blob completes now, any other starts collecting.
+    fn blob_head(&mut self) -> Result<Option<HostEvent>> {
+        let head: BlobHead = protocol::parse(&self.payload)?;
+        let BlobHead { id, mime, len } = head;
+        let Some(len) = len else {
+            return Ok(Some(HostEvent::Blob {
+                id,
+                mime: None,
+                bytes: None,
+            }));
+        };
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        if len > deck_tsp::document::MAX_BLOB
+            || (self.blobs.len() >= MAX_PARTIAL_BLOBS && !self.blobs.contains_key(&id))
+        {
+            return Err(Error::Protocol(format!(
+                "blob answer of {len} bytes refused"
+            )));
+        }
+        if len == 0 {
+            return Ok(Some(HostEvent::Blob {
+                id,
+                mime,
+                bytes: Some(Vec::new()),
+            }));
+        }
+        let bytes = Vec::with_capacity(len.min(MAX_FRAME));
+        self.blobs.insert(id, PartialBlob { mime, len, bytes });
+        Ok(None)
+    }
+
+    /// `BlobData`: appends to its blob; the last chunk completes it.
+    fn blob_data(&mut self) -> Result<Option<HostEvent>> {
+        let (id, chunk) = self
+            .payload
+            .split_at_checked(BLOB_ID_LEN)
+            .ok_or_else(|| Error::Protocol("short BlobData frame".into()))?;
+        let id = std::str::from_utf8(id)
+            .map_err(|_| Error::Protocol("BlobData id is not text".into()))?;
+        let Some(part) = self.blobs.get_mut(id) else {
+            return Ok(None);
+        };
+        if part.bytes.len() + chunk.len() > part.len {
+            return Err(Error::Protocol("BlobData past the announced length".into()));
+        }
+        part.bytes.extend_from_slice(chunk);
+        if part.bytes.len() < part.len {
+            return Ok(None);
+        }
+        let id = id.to_owned();
+        Ok(self.blobs.remove(&id).map(|p| HostEvent::Blob {
+            id,
+            mime: p.mime,
+            bytes: Some(p.bytes),
+        }))
     }
 }
 
@@ -579,9 +690,26 @@ impl Drop for TxInner {
 
 /// Sending half; clones share the connection. Dropping the last clone detaches.
 #[derive(Clone)]
-pub struct AttachedTx(Arc<TxInner>);
+pub struct AttachedTx(Arc<TxInner>, bool);
 
 impl AttachedTx {
+    /// The daemon answers [`AttachedTx::blob`] (older daemons do not, and drop a connection
+    /// that asks).
+    pub fn blob_fetch(&self) -> bool {
+        self.1
+    }
+
+    /// Asks the daemon for the blob `id` (lowercase hex SHA-256) of the session's TSP
+    /// document. The answer arrives as [`HostEvent::Blob`]. Fails with `Unsupported` I/O when
+    /// the daemon cannot answer.
+    pub fn blob(&self, id: &str) -> Result<()> {
+        if !self.1 {
+            return Err(Error::Io(std::io::ErrorKind::Unsupported.into()));
+        }
+        self.0
+            .send_json(Kind::BlobGet, &BlobRequest { id: id.to_owned() })
+    }
+
     /// Bytes for the session's PTY (split into ≤ 1 MiB frames).
     pub fn input(&self, bytes: &[u8]) -> Result<()> {
         for chunk in bytes.chunks(MAX_FRAME) {

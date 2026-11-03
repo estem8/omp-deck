@@ -3,7 +3,7 @@
 //! texture cache, omp's own mark for `builtin:"omp"`).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::text::LayoutJob;
 use egui::{
@@ -12,19 +12,17 @@ use egui::{
 };
 use serde_json::Value;
 
-use super::ctx::{Cx, Toast};
+use super::ctx::{Cx, Toast, ToastGalleys};
 use super::dock::{self, Tone};
 use super::events;
 use super::glyphs;
 use super::paint;
 use super::render;
-use super::snap::{SNode, Snap};
+use super::snap::SNode;
 use super::style::LABEL;
 use super::text::{self, Base};
 use super::transcript::measure_size;
 
-/// How long a toast stays when omp gave no `ttl` (ms).
-const TOAST_MS: u64 = 2400;
 /// Largest image side kept as a texture (px).
 const MAX_TEXTURE: u32 = 1800;
 
@@ -375,46 +373,78 @@ fn menu_sheet(cx: &Cx, ui: &mut Ui, w: f32, n: &SNode) {
 
 // ---- toasts ---------------------------------------------------------------------------------
 
-/// Records the toasts currently in the tree; omp deletes them a frame later, so they are kept here
-/// for their time to live.
-pub fn collect_toasts(snap: &Snap, now: std::time::Instant, toasts: &mut Vec<Toast>) {
-    toasts.retain(|t| t.until > now);
-    let regions = ["main", "layer"].into_iter().filter_map(|r| snap.region(r));
-    for region in regions {
-        for n in snap.kids(region).filter(|n| n.kind == "toast") {
-            if toasts.iter().any(|t| t.id == n.id) {
-                continue;
-            }
-            let text = text::node_plain(n);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let ttl = n
-                .num("ttl")
-                .map_or(TOAST_MS, |t| t.clamp(800.0, 8000.0) as u64);
-            toasts.push(Toast {
-                id: n.id.clone(),
-                text,
-                sub: n.str("sub").map(str::to_owned),
-                tone: n.tone().map(str::to_owned),
-                until: now + Duration::from_millis(ttl),
-            });
-        }
+/// Fade-in of a toast (seconds).
+const TOAST_IN: f32 = 0.18;
+/// Fade-out of a toast (seconds).
+const TOAST_OUT: f32 = 0.3;
+/// Toasts kept on screen at once (the document's ring holds as many).
+const TOAST_MAX: usize = 8;
+
+/// The ring's record as a shown toast.
+pub fn toast_of(r: &deck_tsp::document::ToastRecord) -> Toast {
+    Toast {
+        seq: r.seq,
+        text: text::clean(&r.text).into(),
+        sub: r.sub.as_deref().map(|s| text::clean(s).into()),
+        at: r.at,
+        ttl: r.ttl,
     }
 }
 
-fn toast_pill(cx: &Cx, ui: &mut Ui, text: &str, sub: Option<&str>, tone: Option<&str>) {
+/// Adds the ring's toasts that are not shown yet (by `seq`) and drops the expired ones. The ring
+/// is the only source: omp deletes a toast's node the frame after adding it, so the tree never
+/// shows one for its time to live.
+pub fn merge_toasts(shown: &mut Vec<Toast>, ring: impl IntoIterator<Item = Toast>, now: Instant) {
+    shown.retain(|t| now < t.at + t.ttl);
+    for t in ring {
+        if now < t.at + t.ttl && !shown.iter().any(|s| s.seq == t.seq) {
+            shown.push(t);
+        }
+    }
+    shown.sort_by_key(|t| t.seq);
+    if shown.len() > TOAST_MAX {
+        shown.drain(..shown.len() - TOAST_MAX);
+    }
+}
+
+/// Opacity of a toast `age` after it appeared, for a time to live of `ttl`: fades in, holds,
+/// fades out over its last [`TOAST_OUT`] seconds (a short toast splits its time between both).
+pub fn toast_alpha(age: Duration, ttl: Duration) -> f32 {
+    let age = age.as_secs_f32();
+    let left = ttl.as_secs_f32() - age;
+    ((age / TOAST_IN).min(1.0) * (left / TOAST_OUT).min(1.0)).clamp(0.0, 1.0)
+}
+
+fn toast_galleys(cx: &Cx, ui: &Ui, t: &Toast) -> ToastGalleys {
     let ink = cx.ink;
-    let c = tone.map_or(ink.b, |t| ink.tone(t));
-    let g = ui.painter().layout_no_wrap(
-        text::clean(text).into_owned(),
-        ink.prose(13.5),
-        ink.strong(),
-    );
-    let sg = sub.map(|s| {
-        ui.painter()
-            .layout_no_wrap(text::clean(s).into_owned(), ink.label(12.0), ink.dim())
-    });
+    let ppp = ui.pixels_per_point();
+    let colors = [ink.strong(), ink.dim()];
+    if let Some(g) = cx.loc(|l| l.toast_galleys.get(&t.seq).cloned())
+        && g.ppp == ppp
+        && g.colors == colors
+    {
+        return g;
+    }
+    let p = ui.painter();
+    let g = ToastGalleys {
+        ppp,
+        colors,
+        text: p.layout_no_wrap(t.text.to_string(), ink.prose(13.5), colors[0]),
+        sub: t
+            .sub
+            .as_ref()
+            .map(|s| p.layout_no_wrap(s.to_string(), ink.label(12.0), colors[1])),
+    };
+    cx.loc(|l| l.toast_galleys.insert(t.seq, g.clone()));
+    g
+}
+
+fn toast_pill(cx: &Cx, ui: &mut Ui, t: &Toast) {
+    let ink = cx.ink;
+    let c = ink.b;
+    let ToastGalleys {
+        text: g, sub: sg, ..
+    } = toast_galleys(cx, ui, t);
     let w = g.size().x.max(sg.as_ref().map_or(0.0, |s| s.size().x)) + 44.0;
     let h = g.size().y + sg.as_ref().map_or(0.0, |s| s.size().y + 2.0) + 18.0;
     let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
@@ -444,19 +474,34 @@ fn toast_pill(cx: &Cx, ui: &mut Ui, text: &str, sub: Option<&str>, tone: Option<
 }
 
 fn toasts(cx: &Cx, ctx: &Context, rect: Rect, salt: Id) {
-    let live: Vec<Toast> = cx.loc(|l| l.toasts.clone());
-    for (i, t) in live.iter().enumerate() {
-        let left = t.until.saturating_duration_since(cx.now);
-        cx.animate_in(left.min(Duration::from_millis(250)));
-        let fade = (left.as_secs_f32() / 0.3).clamp(0.0, 1.0);
-        Area::new(salt.with(("toast", &t.id)))
+    // One toast at a time (a clone is a few refcounts): the list itself is not copied per frame.
+    for i in 0..cx.loc(|l| l.toasts.len()) {
+        let Some(t) = cx.loc(|l| l.toasts.get(i).cloned()) else {
+            break;
+        };
+        let age = cx.now.saturating_duration_since(t.at);
+        let left = (t.at + t.ttl).saturating_duration_since(cx.now);
+        // Moving while it fades; the last wake-up lands on the end of its life.
+        cx.animate_in(
+            if age.as_secs_f32() < TOAST_IN || left.as_secs_f32() < TOAST_OUT {
+                Duration::from_millis(16)
+            } else {
+                left.saturating_sub(Duration::from_secs_f32(TOAST_OUT))
+            },
+        );
+        let alpha = toast_alpha(age, t.ttl);
+        let slide = (1.0 - (age.as_secs_f32() / TOAST_IN).min(1.0)) * -6.0;
+        Area::new(salt.with(("toast", t.seq)))
             .order(Order::Tooltip)
-            .fixed_pos(pos2(rect.center().x, rect.top() + 20.0 + i as f32 * 56.0))
+            .fixed_pos(pos2(
+                rect.center().x,
+                rect.top() + 20.0 + i as f32 * 56.0 + slide,
+            ))
             .pivot(Align2::CENTER_TOP)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.set_opacity(fade);
-                toast_pill(cx, ui, &t.text, t.sub.as_deref(), t.tone.as_deref());
+                ui.set_opacity(alpha);
+                toast_pill(cx, ui, &t);
             });
     }
 }
@@ -765,7 +810,7 @@ fn picker_body(cx: &Cx, ui: &mut Ui, n: &SNode, items: &[Value], list_h: f32) {
         };
         ui.horizontal(|ui| {
             if state == "loading" {
-                render::spin(cx, ui, 14.0, ink.b);
+                render::spin(cx, ui, 14.0, ink.accent_text());
             }
             let c = if state == "error" {
                 ink.p.danger
@@ -1061,5 +1106,70 @@ mod tests {
             .expect("png encodes");
         let c = decode(&png).expect("png decodes");
         assert_eq!(c.size, [3, 2]);
+    }
+
+    fn toast(seq: u64, at: Instant, ms: u64) -> Toast {
+        Toast {
+            seq,
+            text: format!("t{seq}").into(),
+            sub: None,
+            at,
+            ttl: Duration::from_millis(ms),
+        }
+    }
+
+    #[test]
+    fn the_ring_is_merged_by_seq_so_a_repeat_read_never_doubles_a_toast() {
+        let t0 = Instant::now();
+        let mut shown = Vec::new();
+        merge_toasts(&mut shown, [toast(1, t0, 2400), toast(2, t0, 2400)], t0);
+        // The next sync reads the same ring, plus a new toast.
+        let later = t0 + Duration::from_millis(100);
+        merge_toasts(
+            &mut shown,
+            [
+                toast(1, t0, 2400),
+                toast(2, t0, 2400),
+                toast(3, later, 2400),
+            ],
+            later,
+        );
+        assert_eq!(shown.iter().map(|t| t.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        // A toast the ring no longer has (omp deleted its node) still shows until it expires.
+        let mid = t0 + Duration::from_millis(2000);
+        merge_toasts(&mut shown, [toast(3, later, 2400)], mid);
+        assert_eq!(shown.iter().map(|t| t.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        let end = t0 + Duration::from_millis(2450);
+        merge_toasts(&mut shown, [], end);
+        assert_eq!(shown.iter().map(|t| t.seq).collect::<Vec<_>>(), [3]);
+        // Expired entries of the ring are not adopted, and the stack is capped.
+        let mut shown = Vec::new();
+        let ring: Vec<Toast> = (0..12).map(|s| toast(s, t0, 60_000)).collect();
+        merge_toasts(&mut shown, ring, t0);
+        assert_eq!(shown.len(), TOAST_MAX);
+        assert_eq!(shown[0].seq, 4, "the oldest give way");
+        let mut shown = Vec::new();
+        merge_toasts(&mut shown, [toast(9, t0, 100)], t0 + Duration::from_secs(1));
+        assert!(shown.is_empty());
+    }
+
+    #[test]
+    fn a_toast_fades_in_holds_and_fades_out_over_its_life() {
+        let ttl = Duration::from_millis(2400);
+        let a = |ms: u64| toast_alpha(Duration::from_millis(ms), ttl);
+        assert!(a(0) < 0.01, "starts transparent");
+        assert!((a(90) - 0.5).abs() < 0.01, "half-way through the fade-in");
+        assert!((a(180) - 1.0).abs() < 1e-4 && (a(1200) - 1.0).abs() < 1e-4);
+        assert!(
+            (a(2250) - 0.5).abs() < 0.01,
+            "half-way through the fade-out"
+        );
+        assert!(
+            a(2400) < 0.01 && a(5000) < 0.01,
+            "gone at and after its end"
+        );
+        // A very short toast never exceeds 1 and never goes negative.
+        let short = toast_alpha(Duration::from_millis(50), Duration::from_millis(100));
+        assert!((0.0..=1.0).contains(&short));
     }
 }

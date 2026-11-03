@@ -247,6 +247,7 @@ fn event(e: HostEvent) -> RemoteEvent {
     match e {
         HostEvent::Snapshot(b) => RemoteEvent::Snapshot(b),
         HostEvent::Output(b) => RemoteEvent::Output(b),
+        HostEvent::Blob { id, mime, bytes } => RemoteEvent::Blob { id, mime, bytes },
         HostEvent::Exited(code) => RemoteEvent::Exited(code),
         HostEvent::Displaced => RemoteEvent::Displaced,
         HostEvent::Closed => RemoteEvent::Closed,
@@ -341,6 +342,23 @@ impl RemoteTx for HostTx {
             }
         };
         tx.palette(&palette).map_err(io_err)
+    }
+    fn blob(&self, id: &str) -> io::Result<()> {
+        let tx = {
+            let phase = self.link.lock();
+            match &*phase {
+                Phase::Ready(tx) => tx.clone(),
+                // Asked after the snapshot arrived, so the connection is up; anything else
+                // is a detached terminal.
+                Phase::Connecting { .. } | Phase::Dead => {
+                    return Err(io::ErrorKind::NotConnected.into());
+                }
+            }
+        };
+        if !tx.blob_fetch() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        tx.blob(id).map_err(io_err)
     }
 
     fn kill(&self) -> io::Result<()> {

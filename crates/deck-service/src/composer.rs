@@ -439,7 +439,7 @@ impl TspComposer {
             return missing(scan.chips, popup);
         }
         TspComposer {
-            state: draft_of(text),
+            state: draft_with_chips(text, scan.chips),
             target: Some((surface.id().to_owned(), editor.to_owned())),
             can_send,
             chips: scan.chips,
@@ -453,6 +453,14 @@ impl TspComposer {
             Composer::Draft(d) => format!("{}\u{0}{d}", self.chips),
             _ => format!("{}\u{0}", self.chips),
         }
+    }
+}
+
+/// [`draft_of`], except that attachments alone (no text) are a draft too: a send would drop them.
+fn draft_with_chips(text: &str, chips: usize) -> Composer {
+    match draft_of(text) {
+        Composer::Empty if chips > 0 => Composer::Draft(format!("[{chips} attachment(s)]")),
+        state => state,
     }
 }
 

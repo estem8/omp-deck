@@ -15,6 +15,7 @@ use super::render::{self, blank};
 use super::snap::SNode;
 use super::style::{Ink, LABEL, MEASURE, PROSE, PROSE_LINE};
 use super::text::{self, Base};
+use super::tsel::RunOpts;
 
 /// Horizontal padding of the column inside the pane.
 const PAD: f32 = 36.0;
@@ -100,6 +101,19 @@ fn estimate(cx: &Cx, n: &SNode, cw: f32) -> f32 {
     }
 }
 
+/// The conversation's items: the kids of `main` that draw something.
+pub(super) fn items<'a>(cx: &Cx<'a>) -> Vec<&'a SNode> {
+    cx.snap
+        .region("main")
+        .map(|m| {
+            cx.snap
+                .kids(m)
+                .filter(|c| !matches!(c.kind.as_str(), "spacer" | "toast") && !blank(cx, c))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Shows the conversation in `rect`.
 ///
 /// `end_pad` is the room kept below the last line: the part of `rect` that the floating dock and
@@ -108,16 +122,7 @@ fn estimate(cx: &Cx, n: &SNode, cw: f32) -> f32 {
 /// Returns whether the reader is away from the end (scrolled up): the caller then draws the
 /// [`jump_pill`], after everything that floats over the transcript's bottom edge.
 pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
-    let items: Vec<&SNode> = cx
-        .snap
-        .region("main")
-        .map(|m| {
-            cx.snap
-                .kids(m)
-                .filter(|c| !matches!(c.kind.as_str(), "spacer" | "toast") && !blank(cx, c))
-                .collect()
-        })
-        .unwrap_or_default();
+    let items = items(cx);
     let cw = column_width(rect.width());
     let left = ((rect.width() - cw) / 2.0).max(0.0);
     // A new or replaced surface opens at its end, like a live session does.
@@ -128,86 +133,99 @@ pub fn show(cx: &Cx, ui: &mut Ui, rect: Rect, id: Id, end_pad: f32) -> bool {
             l.jump = true;
         }
     });
+    // A drag that selects text scrolls the view at its edges: that is the reader's own scrolling.
+    let auto = cx.loc(|l| std::mem::take(&mut l.tsel.scroll_dy));
+    if auto < 0.0 {
+        cx.loc(|l| l.follow = false);
+    }
     let follow = cx.loc(|l| l.follow);
     // The reader is scrolling this frame (wheel, or a drag on the scrollbar strip).
-    let scrolling = ui.input(|i| {
-        i.smooth_scroll_delta.y != 0.0
-            || (i.pointer.primary_down()
-                && i.pointer
-                    .interact_pos()
-                    .is_some_and(|p| rect.right() - 14.0 <= p.x && rect.contains(p)))
-    });
+    let scrolling = auto != 0.0
+        || ui.input(|i| {
+            i.smooth_scroll_delta.y != 0.0
+                || (i.pointer.primary_down()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| rect.right() - 14.0 <= p.x && rect.contains(p)))
+        });
     let mut child = ui.new_child(UiBuilder::new().id_salt(id.with("main")).max_rect(rect));
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    // Text is selected by the chat view's own selection: egui's labels stay out of it.
+    child.style_mut().interaction.selectable_labels = false;
     let mut moved = false;
     let wbucket = cw.round() as i32;
-    let out = ScrollArea::vertical()
+    let mut area = ScrollArea::vertical()
         .id_salt(id.with("scroll"))
         .auto_shrink([false, false])
-        .stick_to_bottom(follow)
-        .show_viewport(&mut child, |ui, viewport| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let x0 = ui.max_rect().left() + left;
-            // Prefix sums of the item heights (measured, else estimated).
-            let mut offsets = cx.loc(|l| std::mem::take(&mut l.offsets));
-            offsets.clear();
-            offsets.push(0.0);
-            let mut y = TOP;
-            for it in &items {
-                // The measured height; while an item changes (a streaming reply grows every
-                // frame) its last measurement stands in until the new one is taken. An estimate
-                // says nothing about an item that is already thousands of lines long, and one
-                // that came out far shorter than the drawn item would leave the offset past the
-                // content end (a blank transcript).
-                let h = cx.loc(|l| l.heights.get(&it.id).map(|e| e.2));
-                let h = h.unwrap_or_else(|| estimated(cx, it, cw, wbucket));
-                y += h + GAP;
-                offsets.push(y);
-            }
-            let total = y + end_pad;
-            let n = items.len();
-            let lo = viewport.min.y - OVERSCAN;
-            let hi = viewport.max.y + OVERSCAN;
-            let first = offsets[1..].partition_point(|&o| o <= lo).min(n);
-            let end = offsets[..n].partition_point(|&o| o < hi).max(first);
-            ui.add_space(if first == 0 { TOP } else { offsets[first] });
-            let mut prev_user = first == 0;
-            if first > 0
-                && let Some(p) = items.get(first - 1)
-            {
-                prev_user = p.role() == "omp.user";
-            }
-            for it in items.iter().take(end).skip(first) {
-                let top = ui.cursor().top();
-                let r = Rect::from_min_size(pos2(x0, top), vec2(cw, 10_000.0));
-                let byline = prev_user && it.role() == "omp.assistant";
-                let inner = ui.scope_builder(UiBuilder::new().max_rect(r), |ui| {
-                    ui.set_width(cw);
-                    item(cx, ui, it, byline);
-                });
-                let h = inner.response.rect.height();
-                prev_user = it.role() == "omp.user";
-                cx.loc(|l| {
-                    let e = l.heights.get(&it.id).copied();
-                    if e.is_none_or(|(sub, w, old)| {
-                        sub != it.sub || w != wbucket || (old - h).abs() > 0.5
-                    }) {
-                        l.heights.insert(it.id.clone(), (it.sub, wbucket, h));
-                        moved |= e.is_some_and(|(_, w, old)| w == wbucket && (old - h).abs() > 0.5);
-                    }
-                });
-                ui.add_space(GAP);
-            }
-            ui.add_space((total - offsets[end]).max(0.0));
-            cx.loc(|l| l.offsets = offsets);
-            let (marker, _) = ui.allocate_exact_size(vec2(1.0, 1.0), Sense::hover());
-            // A chase of the end gives way to the reader's own scrolling.
-            let chase = cx.loc(|l| std::mem::take(&mut l.chase)) && !scrolling;
-            if cx.loc(|l| std::mem::take(&mut l.jump)) || chase {
-                ui.scroll_to_rect(marker, Some(Align::BOTTOM));
-                moved = true;
-            }
-        });
+        .stick_to_bottom(follow);
+    if auto != 0.0 {
+        let at = cx.loc(|l| l.tsel.scroll_y);
+        area = area.vertical_scroll_offset((at + auto).max(0.0));
+    }
+    let out = area.show_viewport(&mut child, |ui, viewport| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let x0 = ui.max_rect().left() + left;
+        // Prefix sums of the item heights (measured, else estimated).
+        let mut offsets = cx.loc(|l| std::mem::take(&mut l.offsets));
+        offsets.clear();
+        offsets.push(0.0);
+        let mut y = TOP;
+        for it in &items {
+            // The measured height; while an item changes (a streaming reply grows every
+            // frame) its last measurement stands in until the new one is taken. An estimate
+            // says nothing about an item that is already thousands of lines long, and one
+            // that came out far shorter than the drawn item would leave the offset past the
+            // content end (a blank transcript).
+            let h = cx.loc(|l| l.heights.get(&it.id).map(|e| e.2));
+            let h = h.unwrap_or_else(|| estimated(cx, it, cw, wbucket));
+            y += h + GAP;
+            offsets.push(y);
+        }
+        let total = y + end_pad;
+        let n = items.len();
+        let lo = viewport.min.y - OVERSCAN;
+        let hi = viewport.max.y + OVERSCAN;
+        let first = offsets[1..].partition_point(|&o| o <= lo).min(n);
+        let end = offsets[..n].partition_point(|&o| o < hi).max(first);
+        ui.add_space(if first == 0 { TOP } else { offsets[first] });
+        let mut prev_user = first == 0;
+        if first > 0
+            && let Some(p) = items.get(first - 1)
+        {
+            prev_user = p.role() == "omp.user";
+        }
+        for it in items.iter().take(end).skip(first) {
+            let top = ui.cursor().top();
+            let r = Rect::from_min_size(pos2(x0, top), vec2(cw, 10_000.0));
+            let byline = prev_user && it.role() == "omp.assistant";
+            let inner = ui.scope_builder(UiBuilder::new().max_rect(r), |ui| {
+                ui.set_width(cw);
+                item(cx, ui, it, byline);
+            });
+            let h = inner.response.rect.height();
+            prev_user = it.role() == "omp.user";
+            cx.loc(|l| {
+                let e = l.heights.get(&it.id).copied();
+                if e.is_none_or(|(sub, w, old)| {
+                    sub != it.sub || w != wbucket || (old - h).abs() > 0.5
+                }) {
+                    l.heights.insert(it.id.clone(), (it.sub, wbucket, h));
+                    moved |= e.is_some_and(|(_, w, old)| w == wbucket && (old - h).abs() > 0.5);
+                }
+            });
+            ui.add_space(GAP);
+        }
+        ui.add_space((total - offsets[end]).max(0.0));
+        cx.loc(|l| l.offsets = offsets);
+        let (marker, _) = ui.allocate_exact_size(vec2(1.0, 1.0), Sense::hover());
+        // A chase of the end gives way to the reader's own scrolling.
+        let chase = cx.loc(|l| std::mem::take(&mut l.chase)) && !scrolling;
+        if cx.loc(|l| std::mem::take(&mut l.jump)) || chase {
+            ui.scroll_to_rect(marker, Some(Align::BOTTOM));
+            moved = true;
+        }
+    });
+    cx.loc(|l| l.tsel.scroll_y = out.state.clamped_offset().y);
     if moved {
         ui.ctx().request_repaint();
     }
@@ -282,11 +300,11 @@ pub fn jump_pill(cx: &Cx, ui: &mut Ui, x: f32, bottom: f32) {
 }
 
 /// One top-level transcript item.
-fn item(cx: &Cx, ui: &mut Ui, n: &SNode, byline: bool) {
-    match (n.kind.as_str(), n.role()) {
+pub(super) fn item(cx: &Cx, ui: &mut Ui, n: &SNode, byline: bool) {
+    cx.in_node(n.ord, || match (n.kind.as_str(), n.role()) {
         ("col", "omp.assistant") => assistant(cx, ui, n, byline),
         _ => render::node(cx, ui, n),
-    }
+    });
 }
 
 /// Role-specific nodes of the transcript; `true` when handled.
@@ -413,12 +431,11 @@ fn usage_job(ink: &Ink, s: &str) -> LayoutJob {
 fn recap(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let ink = cx.ink;
     let s = text::node_plain(&flatten_text(cx, n));
-    ui.label(
-        RichText::new(format!("※ {}", s.trim()))
-            .italics()
-            .font(ink.prose(13.5))
-            .color(ink.dim()),
-    );
+    let mut format = TextFormat::simple(ink.prose(13.5), ink.dim());
+    format.italics = true;
+    let mut job = LayoutJob::default();
+    job.append(&format!("※ {}", s.trim()), 0.0, format);
+    render::para(cx, ui, job, ink.dim(), &[], RunOpts::LINE);
 }
 
 /// A synthetic text node standing for the first text descendant of `n`.
@@ -741,7 +758,7 @@ pub fn welcome(cx: &Cx, ui: &mut Ui, n: &SNode) {
             base.line_height = tx.line;
             let mut job = egui::text::LayoutJob::default();
             md_inline(&mut job, ink, &base, &tip);
-            let _ = render::para(ui, job, tx.color, &[]);
+            let _ = render::para(cx, ui, job, tx.color, &[], RunOpts::LINE);
         });
     }
 }

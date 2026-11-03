@@ -28,6 +28,9 @@ egui_commonmark.workspace = true
 # The chat view parses assistant markdown itself (line height, selectable runs, streaming); the version
 # egui_commonmark already pulls in.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Chat view syntax highlighting: pure Rust (fancy-regex, no onig); the syntaxes are bat's set (TypeScript, TOML,
+# ...) from two-face, scopes are mapped onto the active style's palette, never to syntect themes.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 # Mobile access: the pairing QR code is painted from its module grid; the typed room key is wiped after use.
 qrcodegen.workspace = true
 zeroize.workspace = true
@@ -37,6 +40,7 @@ png = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Self-update downloads into a temporary folder that is removed afterwards.
 tempfile.workspace = true
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Desktop notifications: one session-bus connection (Notify, ActivationToken, ActionInvoked) and the

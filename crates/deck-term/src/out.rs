@@ -98,6 +98,8 @@ pub(crate) struct WriteProgress {
     state: Mutex<Written>,
     changed: Condvar,
     failed: AtomicBool,
+    /// The session host cannot serve blob requests (set by the remote writer).
+    blob_unsupported: AtomicBool,
 }
 
 #[derive(Default)]
@@ -108,6 +110,11 @@ struct Written {
 }
 
 impl WriteProgress {
+    /// The remote host cannot serve blob requests.
+    pub(crate) fn mark_blob_unsupported(&self) {
+        self.blob_unsupported.store(true, Ordering::Release);
+    }
+
     pub(crate) fn record(&self, n: usize, success: bool) {
         let mut w = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         w.bytes += n as u64;
@@ -375,6 +382,21 @@ impl PtyOut {
         {
             let _ = s.send(FrontendCmd::ClipboardReply(bytes));
         }
+    }
+
+    /// Remote controller: asks the session host for the TSP blob `id`. `false`: nothing was
+    /// queued (not a host connection, or it is closed).
+    pub(crate) fn blob(&self, id: &str) -> bool {
+        !self.lock().closed
+            && matches!(
+                self.sink.get(),
+                Some(Sink::Remote(s)) if s.send(RemoteCmd::Blob(id.to_owned())).is_ok()
+            )
+    }
+
+    /// The host answered a blob request with "unsupported" (an older daemon): never ask again.
+    pub(crate) fn blob_unsupported(&self) -> bool {
+        self.progress.blob_unsupported.load(Ordering::Acquire)
     }
 
     fn emit(&self, d: Deferred) {

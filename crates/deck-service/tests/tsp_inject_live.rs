@@ -267,6 +267,22 @@ impl Rig<'_> {
     }
 }
 
+/// The composer's text once it differs from `before` (`None`: it did not change for a while, as
+/// at the end of the recall history).
+fn wait_for_change(rig: &mut Rig<'_>, before: &str) -> Option<String> {
+    let end = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < end {
+        rig.ctl.tick(Instant::now());
+        if let Some(text) = draft(&rig.peek())
+            && text != before
+        {
+            return Some(text);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    None
+}
+
 #[test]
 fn injected_commands_reach_a_tsp_session() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -274,7 +290,12 @@ fn injected_commands_reach_a_tsp_session() {
         eprintln!("skipped: omp is not installed");
         return;
     };
-    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    // omp recalls drafts cleared with Ctrl+C by default (`composer.recallClearedDrafts`, true);
+    // off, only a draft a `send` displaces would be in the recall history.
+    let config = format!(
+        "{OMP_CONFIG}composer:\n  recallClearedDrafts: false\nmodelRoles:\n  default: {}\n",
+        fm::MODEL
+    );
     let sb = Sandbox::new("tspinj", &config);
     ensure_host_exe();
     let model = FakeModel::start(script());
@@ -423,7 +444,8 @@ fn injected_commands_reach_a_tsp_session() {
     assert_eq!(draft(&rig.peek()).as_deref(), Some("my draft added"));
     assert_eq!(model.count(), n, "nothing reached the model");
 
-    // Confirming sends only the prompt (the draft goes to omp's recall history, not the model).
+    // Confirming clears the draft with Ctrl+C (the editor reads empty before the `send`, and the
+    // draft is not displaced into omp's recall history) and sends only the prompt.
     let id = rig.submit(Command::Prompt {
         text: "clean prompt".to_owned(),
     });
@@ -440,6 +462,37 @@ fn injected_commands_reach_a_tsp_session() {
     });
     rig.wait_activity(Activity::Idle);
     assert_eq!(draft(&rig.peek()).as_deref(), Some(""));
+    // Walk omp's recall history with Up in the empty composer: the prompt just sent is the
+    // newest entry, older prompts follow, the cleared draft is nowhere in it.
+    let mut recalled: Vec<String> = Vec::new();
+    for _ in 0..12 {
+        let before = draft(&rig.peek()).unwrap_or_default();
+        rig.ctl.terminal().write(b"\x1b[A");
+        let next = wait_for_change(&mut rig, &before);
+        match next {
+            Some(text) => recalled.push(text),
+            None => break,
+        }
+    }
+    assert_eq!(
+        recalled.first().map(String::as_str),
+        Some("clean prompt"),
+        "Up recalls the newest entry: {recalled:?}"
+    );
+    assert!(
+        recalled.len() >= 3,
+        "older prompts are in recall too: {recalled:?}"
+    );
+    assert!(
+        !recalled.iter().any(|t| t.contains("my draft added")),
+        "the cleared draft must not be in recall: {recalled:?}"
+    );
+    // Ctrl+C leaves the recalled text: back to an empty composer for what follows.
+    rig.ctl.terminal().write(b"\x03");
+    wait_for("an empty composer", TURN, || {
+        rig.ctl.tick(Instant::now());
+        (draft(&rig.peek()).as_deref() == Some("")).then_some(())
+    });
 
     // (g) An `ask` holds the composer: the question is an attention state, a prompt is refused
     // for it, and an insert (which needs the composer, not an idle omp) as a dialog.

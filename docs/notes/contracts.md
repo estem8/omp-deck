@@ -3484,3 +3484,88 @@ Default view stays **Terminal**; chat is opt-in (user).
   `Splitter::resume_bytes(now, out)` carries skipping + sequence age (`x-resume-skip`, `x-resume-age`); a join waiting
   on an abandoned chunk sequence completes after `CHUNK_IDLE` (`tsp-expiry` wake). Queued restores keep their real
   backend in the manifest (`Owner::Restored`). `PROTOCOL` stays 1: gateway and clients are replaced together.
+
+## Native chat view (TSP) step 3: polish (user, 2026-11-02: "fix those limits elegantly")
+Removes the step-2 known limits. Shared interfaces:
+- **Toast ring** (`deck-tsp`): omp appends a `toast` to `main` and deletes it in the next frame, so a GUI can miss it.
+  `Document::apply` records every created `toast` node into a bounded ring (≤ 8):
+  `Document::toasts(now) -> impl Iterator<Item = &ToastRecord>`, `ToastRecord { seq: u64, text: String, sub:
+  Option<String>, ttl: Duration, at: Instant }`, entries expire at `at + ttl` (default 2400 ms when omp sends none).
+  The ring is part of `replay` only while unexpired. The chat view draws toasts only from the ring, keyed by `seq`.
+- **Blob fetch** (`deck-host` + `deck-term`): a mirror node may reference a blob the client never received (sent before
+  attach, referenced later). deck-term's remote mirror asks the host for missing blob ids referenced by live nodes
+  (new request kind, one in flight per id, bounded, no retry storm); the host answers from its document's blob store
+  or "absent". The mirror inserts the blob and bumps its revision. Invisible to the view; local (non-host) terminals
+  have the whole stream and never fetch.
+- **Draft clear under TSP** (`deck-service::inject`): "Clear and run" clears the editor exactly like classic (Ctrl+C,
+  observed as editor `text` empty in the document) before the `send`, so the draft is not pushed into omp's recall
+  history. Classic behavior is unchanged.
+- **Syntax highlighting** (`omp-deck` `chat_view`): `syntect` 5.3 (`default-features = false`, features
+  `default-syntaxes`, `regex-fancy`; pure Rust, no onig) for `code`, fenced `md` code and `diff` lines; scopes map to
+  the active style's terminal palette (the same 16 ANSI colors the terminal uses), never to syntect themes. Syntax set
+  loads lazily off the UI thread; highlighting runs on a worker, results cached by (node id, generation); plain text is
+  shown until ready. Unknown language ⇒ plain.
+- **Diff split mode**: `diff.mode` `split` ⇒ side-by-side old/new columns with aligned hunks; `auto` ⇒ split when the
+  card is wide enough for two ≥ 60-column panes, else unified; `unified` ⇒ unified.
+- **md `marks`**: chip tokens in sent prompts styled as inline chips.
+- **Selection**: transcript text is selectable and copyable (drag + Ctrl+C/Ctrl+Shift+C, context menu Copy); the
+  composer supports drag selection mapped onto omp's editor (`edit`/`anchor` when the program advertises `edit`, else
+  a local selection that only copies).
+- **Tool actions**: every tool-card action omp advertises (e.g. rerun) is offered as a hover button + context menu.
+- **IME**: preedit drawn at the caret, commit sent as text; covered by an egui-level test with synthetic `Event::Ime`.
+- **Thinking**: live thinking body clamped to its tail (last lines, fade on top); idle todo pill right-aligned.
+
+### Step 3 as built (2026-11-02)
+- **Highlighting**: `syntect` 5.3 (`parsing`, `regex-fancy`) + `two-face` 0.5 (`syntect-fancy`; bat's syntax set incl.
+  TypeScript/TSX/TOML, ≈ +0.6 MB; no onig). One `chat-highlight` worker (set loaded there), LRU 192 resumable at
+  32-line checkpoints; scopes → `Tok` classes colored at paint time from the style palette with OKLab hue steering
+  (keyword/string/number/function/type kept apart and off the text color on all 20 style classes). Diffs: header
+  `+N −M` + Unified | Split switch (per card, local); absent `mode` = unified (omp's edit tool), `auto` splits at
+  ≥ 2 × 60 columns; old/new sides highlighted as separate streams. `md.marks` chips on plain text.
+- **Transcript selection** (`chat_view/tsel.rs`; egui label selection is off in the chat, `selectable_labels = false`):
+  OmpDeck-owned, independent of painting, so it spans virtualized items. Position = node id (resolved to the per-revision
+  pre-order `ord`) + run `seq` (reserved for every run a renderer visits, painted or not) + char. Deleted endpoint ⇒
+  start of what followed; epoch reset clears. Painted runs register `(key, galley, rect)` each frame for hit-testing
+  and highlight; copy re-renders the selected items invisibly and joins their runs in document order (so copied text
+  = painted text; blank line between items/md blocks, tab between table cells, list/diff markers only when the
+  selection starts at the run's first char; unified diffs keep `+`/`-`/space, split diffs copy one side). Gestures:
+  drag, wheel-or-edge auto-scroll while dragging, click sets the anchor, Shift+click extends, double-click word,
+  triple-click line; links/fold toggles never start one; a split-diff drag past a column's last row stays in that
+  column; dock/composer chrome is never selectable. Menu: Copy, Select all (from the first conversation item, welcome
+  card excluded). Copy keeps the selection; a plain click or Esc clears it — Esc is also sent to omp while a turn runs
+  (`Snap::busy`), swallowed when idle. Not selectable: card/tool/agent heads, badges, kbd, icons, live status lines,
+  meters, picker/list rows, gutters, code headers, kv keys, table heads.
+- **Composer selection** (`select.rs` `ComposerSel`) is local (omp's `anchor` is vim-visual only): release sends a
+  caret `edit`; typing/delete/cut/paste over it send a replacing `edit`; without `edit` in hello it is copy-only. The
+  composer context menu has no hover buttons (standard text-field actions, all on shortcuts).
+- **Tool actions**: omp 18.15.0 has no tool rerun (`tools[]` reserved, never filled). Cards offer `tools[]`,
+  `actions.menu`, `href`, and local Copy command/output/task + Open as hover buttons and a context menu.
+- **Toasts** only from `Document::toasts(now)` (ring ≤ 8, default ttl 2.4 s, cap 60 s, replayed while unexpired).
+- **Blob fetch**: `Kind::{BlobGet, BlobHead, BlobData}`, `HostInfo.blob_fetch` (attach asks `Info` first so an old
+  daemon never sees the new kind); the owning connection fetches blobs its mirror lacks and forwards them to
+  subscribers between sequences; observers/frontends never ask.
+- **Draft clear**: TSP "Clear and run" = Ctrl+C, wait for editor `text` empty, then `send` (never sends over a draft).
+  omp's `composer.recallClearedDrafts` (default true) puts a Ctrl+C-cleared draft into recall in both views — omp's
+  behavior, identical to classic.
+- **Fake model**: `fm::task_script(req, hold)`; prompts `TASK-MARK` (plain subagent) / `TASK-YIELD-MARK` (needs
+  `task.structured: true`). Gate `tsp_task_live.rs`.
+- **Clipboard bridge**: egui copies a label selection in its end-of-pass step, after the app ran, so
+  `clipboard_bridge::forward_copies` missed it; replaced by `clipboard_bridge::install` (an egui output-hook plugin)
+  that forwards every `OutputCommand::CopyText` to the app clipboard. Chat menu Copy is requested at the start of the
+  press frame (egui clears label selections on a press outside text).
+- **Chords**: `clipboard_shortcuts: false` delivers Ctrl+C/X/V as `Event::Key` while a terminal/chat has focus, so
+  `select::plan` takes them directly: with a selection Ctrl+C copies, Ctrl+X cuts (composer, needs `edit`), Ctrl+V
+  replaces the composer selection then pastes; press and release are swallowed. No selection ⇒ the chord reaches omp.
+  `clipboard_bridge::install` runs once in `App::new`.
+- **Highlight worker**: generation checked every 32 lines (stale parses abandoned, done lines kept), 200 ms budget per
+  request, lines > 1000 bytes stay plain; eviction keeps every slot asked for in the current frame; word operators
+  (`in`, `as`, `and`, `not`, `is`, `instanceof`) are keywords. Wrapped code/diff rows hang at the line's own indent
+  (≤ ⅓ pane). `\ No newline at end of file` is `NoEol` (no banner/reset/pairing break; dropped in split).
+- **Blobs**: `Blob.bytes: Arc<[u8]>`; host caps unwritten blob answers at 64 MiB per connection (over ⇒ "absent"),
+  a full client queue closes the connection; clients ask only when `blob_fetch`, at most 3 times per blob per
+  snapshot (15 s loss timeout), only on a revision change; absent/forged answers make the mirror forget the blob; the
+  wanted set is recomputed from live nodes on delete.
+- **Toast age**: replay adds `age` (ms) to a toast node omp has not deleted yet; the ring backdates it, so an expired
+  toast never reappears on reopen. omp 18.15.0 reuses one toast node while idle (first toast `add`, later ones `set`
+  on the same id, recorded live): `set`/`text`/`splice` on a `toast` node record a fresh toast. Gate `tsp_toast_live.rs`.
+- **Attachments**: a TSP composer with chips and no text is `Draft("[n attachment(s)]")` ⇒ confirmation before `send`.

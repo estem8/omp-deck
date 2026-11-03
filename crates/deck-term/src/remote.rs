@@ -7,6 +7,7 @@
 //! timeout) and a writer (drains [`RemoteCmd`]s into [`RemoteTx`], so the UI thread never
 //! blocks on the connection).
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,6 +21,7 @@ use crate::core::Notice;
 use crate::engine::{Engine, OutputEvent};
 use crate::frontend::FrontendState;
 use crate::out::{PtyOut, WriteProgress};
+use crate::tsp::TspShared;
 use crate::wake::Wake;
 
 /// What a session host (or, for a frontend, the gateway) sends.
@@ -49,6 +51,13 @@ pub enum RemoteEvent {
     /// until a fresh [`Self::Snapshot`] (a re-established, identity-checked attach). Not an
     /// exit. Other remotes treat it as [`Self::Closed`].
     Disconnected,
+    /// The answer to a [`RemoteTx::blob`] request: the TSP blob `id` (`None`: the host holds no
+    /// such blob). Controller connections only.
+    Blob {
+        id: String,
+        mime: Option<String>,
+        bytes: Option<Vec<u8>>,
+    },
     /// The connection ended.
     Closed,
 }
@@ -79,6 +88,12 @@ pub trait RemoteTx: Send + Sync {
     fn kill(&self) -> io::Result<()>;
     /// Leaves the session running.
     fn detach(&self) -> io::Result<()>;
+    /// Asks the host for the TSP blob `id` (lowercase hex SHA-256) a mirrored node refers to
+    /// that was sent before this connection attached. The answer arrives as
+    /// [`RemoteEvent::Blob`]. A host that cannot serve blobs refuses (the default).
+    fn blob(&self, _id: &str) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Read-only connection to a session's output. It cannot acquire controller rights.
@@ -126,6 +141,9 @@ impl RemoteTx for ReadOnlyTx {
     fn detach(&self) -> io::Result<()> {
         self.0.detach()
     }
+    fn blob(&self, _: &str) -> io::Result<()> {
+        read_only()
+    }
 }
 
 /// Work for the writer thread, in order.
@@ -135,6 +153,7 @@ pub(crate) enum RemoteCmd {
     Palette([[u8; 3]; 19]),
     Detach,
     Kill,
+    Blob(String),
 }
 
 /// How long after a grid resize the scroll position is held (see [`ScrollKeep`]).
@@ -218,6 +237,12 @@ pub(crate) fn run_writer(
             RemoteCmd::Palette(p) => report("palette", tx.palette(p)),
             RemoteCmd::Detach => return report("detach", tx.detach()),
             RemoteCmd::Kill => return report("kill", tx.kill()),
+            RemoteCmd::Blob(id) => match tx.blob(&id) {
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                    progress.mark_blob_unsupported()
+                }
+                result => report("blob request", result),
+            },
         }
     }
 }
@@ -244,11 +269,40 @@ pub(crate) struct Feeder {
     pub(crate) wake: Wake,
     /// A gateway frontend (state and connectivity events apply).
     pub(crate) frontend: bool,
+    /// The program's TSP mirror (what to ask the host for).
+    pub(crate) tsp: Arc<TspShared>,
+    /// A host controller connection: it asks for the blobs its mirror lacks. Frontends have
+    /// them streamed by their owner, observers cannot ask.
+    pub(crate) fetch_blobs: bool,
+}
+
+/// Most blob requests outstanding at once.
+const MAX_BLOBS_IN_FLIGHT: usize = 4;
+/// Most distinct blobs asked for per snapshot.
+const MAX_BLOBS_ASKED: usize = 512;
+/// Times one blob is asked for per snapshot: an answer lost with the connection is asked again
+/// once the mirror changed, an "absent" answer never is.
+const MAX_BLOB_ATTEMPTS: u8 = 3;
+/// A request unanswered this long counts as lost.
+const BLOB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Most blob bytes accepted per snapshot; the mirror's own store is bounded the same way.
+const MAX_BLOB_BYTES: usize = deck_tsp::document::BLOB_BUDGET;
+
+/// What a feeder asked the host for since the last snapshot.
+#[derive(Default)]
+struct BlobRequests {
+    /// Attempts per blob id.
+    asked: HashMap<String, u8>,
+    in_flight: HashMap<String, Instant>,
+    received: usize,
+    /// The mirror's revision at the last round of requests (rounds run on change only).
+    last_rev: u64,
 }
 
 impl Feeder {
     /// Runs until the reader is gone or the connection closed.
     pub(crate) fn run(self, events: Receiver<RemoteEvent>) {
+        let mut blobs = BlobRequests::default();
         loop {
             let event = match self.engine.sync_deadline() {
                 Some(deadline) => {
@@ -270,9 +324,13 @@ impl Feeder {
             match event {
                 RemoteEvent::Snapshot(bytes) => {
                     self.engine.reset(&bytes);
+                    blobs = BlobRequests::default();
                     self.notify(Notice::Reset);
                 }
                 RemoteEvent::Output(bytes) => self.engine.feed(&bytes),
+                RemoteEvent::Blob { id, mime, bytes } => {
+                    self.blob_arrived(&mut blobs, id, mime, bytes);
+                }
                 RemoteEvent::Resize {
                     cols,
                     rows,
@@ -310,6 +368,71 @@ impl Feeder {
                 }
                 RemoteEvent::Disconnected | RemoteEvent::Closed => return self.close(),
             }
+            self.request_blobs(&mut blobs);
+        }
+    }
+
+    /// Asks the host for the blobs the mirror's nodes refer to and it never received, each at
+    /// most once per snapshot and a few at a time.
+    fn request_blobs(&self, blobs: &mut BlobRequests) {
+        let rev = self.tsp.revision();
+        if rev == blobs.last_rev {
+            return;
+        }
+        blobs.last_rev = rev;
+        if self.out.blob_unsupported() {
+            // The host cannot serve blobs (an older daemon): nothing is outstanding or coming.
+            blobs.in_flight.clear();
+            return;
+        }
+        blobs.in_flight.retain(|_, at| at.elapsed() < BLOB_TIMEOUT);
+        if !self.fetch_blobs {
+            return;
+        }
+        for id in self.tsp.missing_blobs() {
+            if blobs.in_flight.len() >= MAX_BLOBS_IN_FLIGHT {
+                break;
+            }
+            let tries = blobs.asked.get(&id).copied();
+            if blobs.in_flight.contains_key(&id)
+                || tries.is_some_and(|n| n >= MAX_BLOB_ATTEMPTS)
+                || (tries.is_none() && blobs.asked.len() >= MAX_BLOBS_ASKED)
+                || !self.out.blob(&id)
+            {
+                continue;
+            }
+            *blobs.asked.entry(id.clone()).or_insert(0) += 1;
+            blobs.in_flight.insert(id, Instant::now());
+        }
+    }
+
+    /// The host's answer: the blob goes into the mirror (UI woken), an absent one is left.
+    fn blob_arrived(
+        &self,
+        blobs: &mut BlobRequests,
+        id: String,
+        mime: Option<String>,
+        bytes: Option<Vec<u8>>,
+    ) {
+        if blobs.in_flight.remove(&id).is_none() {
+            return;
+        }
+        // Absent, or more than this snapshot may take: stop wanting it.
+        let Some(bytes) = bytes else {
+            self.engine.forget_blob(&id);
+            return;
+        };
+        if blobs.received + bytes.len() > MAX_BLOB_BYTES {
+            log::debug!("remote terminal: blob {id} over the byte budget; not stored");
+            self.engine.forget_blob(&id);
+            return;
+        }
+        blobs.received += bytes.len();
+        if self.engine.insert_blob(&id, mime, bytes) {
+            self.wake.now();
+        } else {
+            // Not the blob the id names: the host's answer is no use.
+            self.engine.forget_blob(&id);
         }
     }
 
@@ -389,6 +512,7 @@ pub(crate) mod tests {
         Palette([[u8; 3]; 19]),
         Kill,
         Detach,
+        Blob(String),
     }
 
     pub(crate) type Log = Arc<Mutex<Vec<Sent>>>;
@@ -441,6 +565,9 @@ pub(crate) mod tests {
 
         fn detach(&self) -> io::Result<()> {
             self.push(Sent::Detach)
+        }
+        fn blob(&self, id: &str) -> io::Result<()> {
+            self.push(Sent::Blob(id.to_owned()))
         }
     }
 

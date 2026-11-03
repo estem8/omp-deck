@@ -24,6 +24,9 @@ pub(crate) struct TspShared {
     /// document, even when both happen to carry the same document revision.
     epoch: AtomicU64,
     live: AtomicBool,
+    /// Some node refers to a blob the document lacks (see `Document::missing_blobs`); read
+    /// without the lock so the output thread can skip asking on every chunk.
+    wants_blobs: AtomicBool,
 }
 
 impl TspShared {
@@ -33,6 +36,7 @@ impl TspShared {
             revision: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             live: AtomicBool::new(false),
+            wants_blobs: AtomicBool::new(false),
         }
     }
 
@@ -50,6 +54,8 @@ impl TspShared {
             let step = mirror.document().revision().wrapping_sub(before);
             self.revision.fetch_add(step.max(1), Ordering::Release);
             self.live.store(mirror.live(), Ordering::Release);
+            self.wants_blobs
+                .store(mirror.document().wants_blobs(), Ordering::Release);
         }
         mirror.is_idle()
     }
@@ -64,11 +70,49 @@ impl TspShared {
         self.revision.fetch_add(1, Ordering::Release);
         drop(mirror);
         self.live.store(false, Ordering::Release);
+        self.wants_blobs.store(false, Ordering::Release);
     }
 
     /// Appends the replay of the document (see `Document::replay`).
     pub(crate) fn replay(&self, now: Instant, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.lock().document().replay(now));
+    }
+    /// Blob ids some node refers to that the document does not hold (cheap when none).
+    pub(crate) fn missing_blobs(&self) -> Vec<String> {
+        if !self.wants_blobs.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.lock().document().missing_blobs()
+    }
+    /// Stores a blob the session host supplied, its bytes already hashed to `id` by the caller
+    /// (outside any lock). Counts as a change.
+    pub(crate) fn put_verified_blob(
+        &self,
+        id: &str,
+        mime: Option<String>,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> bool {
+        let mut mirror = self.lock();
+        let stored = mirror.put_verified_blob(id, mime, bytes);
+        if stored {
+            self.revision.fetch_add(1, Ordering::Release);
+            self.wants_blobs
+                .store(mirror.document().wants_blobs(), Ordering::Release);
+        }
+        stored
+    }
+
+    /// Stops wanting `id`: the host holds no such blob.
+    pub(crate) fn forget_blob(&self, id: &str) {
+        let mut mirror = self.lock();
+        mirror.forget_blob(id);
+        self.wants_blobs
+            .store(mirror.document().wants_blobs(), Ordering::Release);
+    }
+
+    /// Bumped by every change of the mirror.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 }
 
@@ -419,5 +463,236 @@ pub(crate) mod tests {
         until(&mut t, "displaced", |t| t.is_displaced());
         assert_eq!(t.send_tsp(&event()), Err(TspRefused::Detached));
         assert_eq!(host_inputs(&log), b"");
+    }
+    const PIXEL: &[u8] = b"pixel-a";
+    const PIXEL_ID: &str = "6fe2d5846e515bc9f48577f0d0a5c72e8935655af5e138b26face383b3d2174b";
+
+    /// A frame adding an image node that refers to `PIXEL_ID`.
+    fn image_frame() -> Vec<u8> {
+        encode_message(
+            Verb::Frame,
+            &[],
+            format!(
+                r#"{{"sf":"s1","s":2,"ops":[["add","main","s1",null,{{"id":"img","k":"image","p":{{"blob":"{PIXEL_ID}"}}}}]]}}"#
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn blob_requests(log: &Log) -> Vec<String> {
+        log.lock()
+            .expect("log")
+            .iter()
+            .filter_map(|s| match s {
+                Sent::Blob(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_pixel(t: &Terminal) -> bool {
+        t.tsp().with(|d| d.blob(PIXEL_ID).is_some())
+    }
+
+    /// The blob went to the host before this client attached, so the snapshot replay lacks it
+    /// and only the later frame refers to it: the terminal must ask the host and show it.
+    #[test]
+    fn a_blob_sent_before_attaching_is_fetched_from_the_host_when_a_node_refers_to_it() {
+        let (mut t, host, log) = connect();
+        let mut wire = hello();
+        wire.extend(open());
+        wire.extend(frame1());
+        host.send(RemoteEvent::Snapshot(wire)).expect("send");
+        until(&mut t, "live", |t| t.tsp().live());
+        assert_eq!(blob_requests(&log), Vec::<String>::new(), "nothing to ask");
+
+        send(&host, &image_frame());
+        until(&mut t, "the request", |_| blob_requests(&log) == [PIXEL_ID]);
+        assert!(!has_pixel(&t));
+        let before = t.tsp().revision();
+
+        host.send(RemoteEvent::Blob {
+            id: PIXEL_ID.into(),
+            mime: Some("image/png".into()),
+            bytes: Some(PIXEL.to_vec()),
+        })
+        .expect("send");
+        until(&mut t, "the blob in the mirror", has_pixel);
+        assert!(t.tsp().revision() > before, "a repaint is due");
+        assert_eq!(
+            t.tsp()
+                .with(|d| d.blob(PIXEL_ID).and_then(|b| b.mime.clone())),
+            Some("image/png".to_owned())
+        );
+
+        // Once held, a later change asks for nothing more.
+        send(&host, b"more");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(blob_requests(&log), [PIXEL_ID]);
+    }
+
+    #[test]
+    fn an_absent_or_forged_blob_is_asked_once_and_never_stored() {
+        let (mut t, host, log) = connect();
+        let mut wire = hello();
+        wire.extend(open());
+        wire.extend(frame1());
+        wire.extend(image_frame());
+        host.send(RemoteEvent::Snapshot(wire)).expect("send");
+        until(&mut t, "the request", |_| blob_requests(&log) == [PIXEL_ID]);
+
+        host.send(RemoteEvent::Blob {
+            id: PIXEL_ID.into(),
+            mime: None,
+            bytes: Some(b"forged".to_vec()),
+        })
+        .expect("send");
+        // A second answer for the same request is ignored; so is absence.
+        host.send(RemoteEvent::Blob {
+            id: PIXEL_ID.into(),
+            mime: None,
+            bytes: None,
+        })
+        .expect("send");
+        send(&host, b"tick");
+        until(&mut t, "the tick", |t| {
+            t.screen_text().lines.join("\n").contains("tick")
+        });
+        assert!(!has_pixel(&t));
+        assert_eq!(blob_requests(&log), [PIXEL_ID], "asked once, not again");
+        assert!(
+            t.tsp().0.missing_blobs().is_empty(),
+            "the host has none: the mirror stops wanting it"
+        );
+    }
+
+    /// The owner of a host-backed session passes a fetched blob on to its subscribers as the
+    /// `b` message the program would have sent, so a frontend mirror gets it too.
+    #[test]
+    fn a_fetched_blob_reaches_a_subscriber_mirror() {
+        let (mut owner, host, log) = connect();
+        let mut wire = hello();
+        wire.extend(open());
+        wire.extend(frame1());
+        host.send(RemoteEvent::Snapshot(wire)).expect("send");
+        until(&mut owner, "live", |t| t.tsp().live());
+
+        let sub = owner.subscribe_output(std::sync::Arc::new(|| {}));
+        let mut mirror = deck_tsp::mirror::Mirror::new();
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let feed = |mirror: &mut deck_tsp::mirror::Mirror, ev: Option<OutputEvent>| {
+            if let Some(OutputEvent::Snapshot(b) | OutputEvent::Output(b)) = ev {
+                mirror.feed(&b, std::time::Instant::now());
+            }
+        };
+        while !mirror.live() {
+            assert!(std::time::Instant::now() < deadline, "no snapshot");
+            feed(&mut mirror, sub.recv_timeout(Duration::from_millis(50)));
+        }
+
+        send(&host, &image_frame());
+        until(&mut owner, "the request", |_| {
+            blob_requests(&log) == [PIXEL_ID]
+        });
+        host.send(RemoteEvent::Blob {
+            id: PIXEL_ID.into(),
+            mime: Some("image/png".into()),
+            bytes: Some(PIXEL.to_vec()),
+        })
+        .expect("send");
+        while mirror.document().blob(PIXEL_ID).is_none() {
+            assert!(std::time::Instant::now() < deadline, "blob never reached");
+            feed(&mut mirror, sub.recv_timeout(Duration::from_millis(50)));
+        }
+        assert!(mirror.is_idle());
+        assert_eq!(
+            serde_json::to_value(mirror.document()).expect("document JSON"),
+            doc_json(&owner)
+        );
+        assert_eq!(host_inputs(&log), b"");
+    }
+
+    /// A blob arriving while the program is half way through a sequence waits for its end.
+    #[test]
+    fn a_blob_for_subscribers_waits_until_the_stream_is_between_messages() {
+        let (mut owner, host, log) = connect();
+        let mut wire = hello();
+        wire.extend(open());
+        wire.extend(frame1());
+        host.send(RemoteEvent::Snapshot(wire)).expect("send");
+        until(&mut owner, "live", |t| t.tsp().live());
+        let sub = owner.subscribe_output(std::sync::Arc::new(|| {}));
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut mirror = deck_tsp::mirror::Mirror::new();
+        let mut stream = Vec::new();
+        let pump = |mirror: &mut deck_tsp::mirror::Mirror, stream: &mut Vec<u8>| {
+            while let Some(ev) = sub.recv_timeout(Duration::from_millis(60)) {
+                match ev {
+                    OutputEvent::Snapshot(b) => {
+                        mirror.feed(&b, std::time::Instant::now());
+                    }
+                    OutputEvent::Output(b) => {
+                        stream.extend_from_slice(&b);
+                        mirror.feed(&b, std::time::Instant::now());
+                    }
+                    _ => {}
+                }
+            }
+        };
+        while !mirror.live() {
+            assert!(std::time::Instant::now() < deadline, "no snapshot");
+            pump(&mut mirror, &mut stream);
+        }
+
+        send(&host, &image_frame());
+        until(&mut owner, "the request", |_| {
+            blob_requests(&log) == [PIXEL_ID]
+        });
+        // A third frame in chunks; the blob arrives between its first two and its end.
+        let chunks = encode_chunked(
+            Verb::Frame,
+            &[],
+            br#"{"sf":"s1","s":3,"ops":[["text","t","append"," and more of it"]]}"#,
+            24,
+            "c2",
+        );
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for i in 0..chunks.len() - 1 {
+            if chunks[i] == 0x1b && chunks[i + 1] == b'\\' {
+                parts.push(chunks[start..i + 2].to_vec());
+                start = i + 2;
+            }
+        }
+        assert!(parts.len() >= 3);
+        send(&host, &parts[0]);
+        send(&host, &parts[1]);
+        host.send(RemoteEvent::Blob {
+            id: PIXEL_ID.into(),
+            mime: None,
+            bytes: Some(PIXEL.to_vec()),
+        })
+        .expect("send");
+        until(&mut owner, "the blob in the owner mirror", has_pixel);
+        pump(&mut mirror, &mut stream);
+        assert!(
+            !String::from_utf8_lossy(&stream).contains("\x1b_tsp;b;"),
+            "the blob message must not split the chunked frame: {stream:?}"
+        );
+        assert!(mirror.document().blob(PIXEL_ID).is_none());
+
+        for part in &parts[2..] {
+            send(&host, part);
+        }
+        while mirror.document().blob(PIXEL_ID).is_none() {
+            assert!(std::time::Instant::now() < deadline, "blob never reached");
+            pump(&mut mirror, &mut stream);
+        }
+        assert!(mirror.is_idle());
+        assert_eq!(
+            serde_json::to_value(mirror.document()).expect("document JSON"),
+            doc_json(&owner),
+            "the frame completed and the blob followed it"
+        );
     }
 }

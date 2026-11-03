@@ -15,13 +15,16 @@ use egui::{
 };
 use serde_json::Value;
 
-use super::ctx::{Cx, Tx};
+use super::ansi::more_button;
+use super::ctx::{Claim, Cx, RowGrid, Tx};
+use super::events;
 use super::glyphs;
 use super::paint;
 use super::render;
-use super::snap::{Props, SNode};
+use super::snap::{Props, SNode, Snap};
 use super::style::{Ink, LABEL};
 use super::text::{self, Base};
+use super::tsel::{Lead, RunOpts};
 use crate::deco;
 use crate::theme::mix;
 
@@ -409,6 +412,295 @@ pub fn copy_text(n: &SNode) -> Option<String> {
     wants.then_some(t)
 }
 
+// ---- card actions ---------------------------------------------------------------------------
+
+/// What an action of a card does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum What {
+    /// Copy the command line (or the command-kind target).
+    CopyCommand,
+    /// Copy the text of the card's body (command output, file content, a diff).
+    CopyOutput,
+    /// Copy a subagent's task.
+    CopyTask,
+    /// Open this path/URL.
+    Open(String),
+    /// An action omp offers: goes back as an `action` event with this `act`.
+    Send(String),
+}
+
+/// One action of a tool or agent card: a hover button on its head and an entry of its context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardAct {
+    pub label: String,
+    /// Tern icon name (see `glyphs`).
+    pub icon: &'static str,
+    /// Key hint omp gave (`tools[].keys`).
+    pub keys: Option<String>,
+    pub danger: bool,
+    pub disabled: bool,
+    pub what: What,
+    /// Key of the "Copied" feedback in `Local.copied`.
+    pub flash_key: String,
+}
+
+impl CardAct {
+    fn new(n: &SNode, what: What, label: &str, icon: &'static str) -> CardAct {
+        let tag = match &what {
+            What::CopyCommand => "command",
+            What::CopyOutput => "output",
+            What::CopyTask => "task",
+            What::Open(_) => "open",
+            What::Send(a) => a.as_str(),
+        };
+        CardAct {
+            label: label.to_owned(),
+            icon,
+            keys: None,
+            danger: false,
+            disabled: false,
+            flash_key: format!("{}\0{tag}", n.id),
+            what,
+        }
+    }
+
+    /// Copies something (and flashes a check afterwards).
+    pub fn copies(&self) -> bool {
+        matches!(
+            self.what,
+            What::CopyCommand | What::CopyOutput | What::CopyTask
+        )
+    }
+}
+
+/// The actions of card `n`, cached by its subtree generation.
+pub fn card_acts(cx: &Cx, n: &SNode) -> Arc<Vec<CardAct>> {
+    let hit = cx.loc(|l| {
+        l.acts
+            .get(&n.id)
+            .filter(|(sub, _)| *sub == n.sub)
+            .map(|(_, a)| Arc::clone(a))
+    });
+    hit.unwrap_or_else(|| {
+        let acts = Arc::new(build_acts(cx.snap, n));
+        cx.loc(|l| l.acts.insert(n.id.clone(), (n.sub, Arc::clone(&acts))));
+        acts
+    })
+}
+
+/// Whether a card's body shows text a "Copy output" can take.
+fn has_output(snap: &Snap, n: &SNode) -> bool {
+    snap.find(n, &|c| {
+        c.id != n.id && matches!(c.kind.as_str(), "ansi" | "rows" | "code" | "diff" | "md")
+    })
+    .is_some()
+}
+
+/// An action omp named for a card (`tools[]`, `actions.menu`).
+#[derive(Default)]
+struct Offered {
+    id: String,
+    label: Option<String>,
+    keys: Option<String>,
+    danger: bool,
+    disabled: bool,
+}
+
+/// The actions a card offers, in this order: what omp attached (`tools[]`, then `actions.menu`),
+/// then what the terminal can do with the card itself. omp 18.15.0 attaches none to tool cards (its
+/// `tools` slot is reserved for `copy`/`rerun`/`open`, never filled, and it has no rerun), so for
+/// now these are the local ones; whatever omp adds later shows up here without a code change.
+fn build_acts(snap: &Snap, n: &SNode) -> Vec<CardAct> {
+    let mut acts: Vec<CardAct> = Vec::new();
+    let is_agent = n.kind == "agent";
+    let command = !is_agent && copy_text(n).is_some();
+    let output = has_output(snap, n);
+    let task = is_agent && n.get("task").is_some_and(|t| !tplain(t).trim().is_empty());
+    let href = n
+        .str("href")
+        .filter(|_| n.str("targetKind") == Some("path"))
+        .map(str::to_owned);
+    let add = |acts: &mut Vec<CardAct>, a: CardAct| {
+        if !acts.iter().any(|b| b.what == a.what) {
+            acts.push(a);
+        }
+    };
+    let local = |id: &str, n: &SNode| -> Option<CardAct> {
+        match id {
+            "copy" if command => Some(CardAct::new(n, What::CopyCommand, "Copy command", "copy")),
+            "copy" if task => Some(CardAct::new(n, What::CopyTask, "Copy task", "copy")),
+            "copy" if output => Some(CardAct::new(
+                n,
+                What::CopyOutput,
+                "Copy output",
+                "file-text",
+            )),
+            "open" => href
+                .clone()
+                .map(|h| CardAct::new(n, What::Open(h), "Open", "external-link")),
+            _ => None,
+        }
+    };
+    let mut offered: Vec<Offered> = Vec::new();
+    for t in n.arr("tools") {
+        if let Some(id) = t.get("id").and_then(Value::as_str) {
+            let text = |key: &str| t.get(key).and_then(Value::as_str).map(str::to_owned);
+            offered.push(Offered {
+                id: id.to_owned(),
+                label: text("label"),
+                keys: text("keys"),
+                danger: t.get("danger").and_then(Value::as_bool).unwrap_or(false),
+                disabled: t
+                    .get("disabled")
+                    .is_some_and(|d| d.as_bool() != Some(false)),
+            });
+        }
+    }
+    for m in n
+        .obj("actions")
+        .and_then(|a| a.get("menu"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        offered.push(Offered {
+            id: m.to_owned(),
+            ..Offered::default()
+        });
+    }
+    for Offered {
+        id,
+        label,
+        keys,
+        danger,
+        disabled,
+    } in offered
+    {
+        let act = match id.as_str() {
+            // The terminal's own gestures: a fold has its chevron, an image its zoom.
+            "toggle" | "zoom" | "select" | "activate" => continue,
+            "copy" | "open" => local(&id, n),
+            _ => {
+                let label = label.clone().unwrap_or_else(|| title_case(&id));
+                Some(CardAct::new(
+                    n,
+                    What::Send(id.clone()),
+                    &label,
+                    glyph_of(&id),
+                ))
+            }
+        };
+        if let Some(mut a) = act {
+            if let Some(l) = label {
+                a.label = l;
+            }
+            a.keys = keys;
+            a.danger = danger;
+            a.disabled = disabled;
+            add(&mut acts, a);
+        }
+    }
+    for id in ["open", "copy"] {
+        if let Some(a) = local(id, n) {
+            add(&mut acts, a);
+        }
+    }
+    // The command (or task) is copied by `copy`; the output is its own action.
+    if output {
+        add(
+            &mut acts,
+            CardAct::new(n, What::CopyOutput, "Copy output", "file-text"),
+        );
+    }
+    acts
+}
+
+/// The Tern icon for an action id omp named (`retry` → refresh, unknown ids get the neutral dot).
+fn glyph_of(id: &str) -> &'static str {
+    match id {
+        "rerun" | "retry" | "refresh" => "refresh",
+        "stop" | "cancel" | "kill" | "abort" => "stop",
+        "rewind" | "undo" => "rewind",
+        "edit" => "edit",
+        "delete" | "remove" => "trash",
+        "expand" | "collapse" => "chev",
+        _ => "dot",
+    }
+}
+
+/// `rerun-last` → `Rerun last`.
+fn title_case(id: &str) -> String {
+    let s = id.replace(['-', '_'], " ");
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
+}
+
+/// Whether a node is what a card ran (a bash command, eval source) rather than its output.
+fn is_run_input(kind: &str, role: &str) -> bool {
+    kind == "code" && (role.ends_with(".command") || role.ends_with(".input"))
+}
+
+/// The body text of a card: ANSI output without escapes, code, markdown, diffs, in order.
+fn output_text(cx: &Cx, n: &SNode) -> String {
+    fn walk(cx: &Cx, n: &SNode, out: &mut String) {
+        for c in cx.snap.kids(n) {
+            // What was run (a bash command, eval source) is not its output.
+            if is_run_input(&c.kind, c.role()) {
+                continue;
+            }
+            let piece = match c.kind.as_str() {
+                "ansi" | "rows" => super::ansi::plain(cx, c),
+                "code" | "md" | "diff" => c.text().to_owned(),
+                _ => {
+                    walk(cx, c, out);
+                    continue;
+                }
+            };
+            if piece.trim().is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(piece.trim_end_matches('\n'));
+        }
+    }
+    let mut out = String::new();
+    walk(cx, n, &mut out);
+    out
+}
+
+/// Runs `act` on card `n`: a copy goes to the clipboard, `open` opens, an action omp offered is
+/// sent back to it as an `action` event for the card's node.
+pub fn perform(cx: &Cx, n: &SNode, act: &CardAct) {
+    let text = match &act.what {
+        What::Open(h) => return cx.open(h.clone()),
+        What::Send(a) => return cx.send(events::action(cx.sf(), &n.id, a)),
+        What::CopyCommand => copy_text(n),
+        What::CopyOutput => Some(output_text(cx, n)),
+        What::CopyTask => n.get("task").map(tplain),
+    };
+    if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
+        cx.copy(t);
+        cx.loc(|l| {
+            l.copied.insert(act.flash_key.clone(), cx.now);
+        });
+    }
+}
+
+/// A right click inside `rect` (this card) claims the context menu for `n`; cards inside cards
+/// draw first, so the innermost wins.
+fn claim(cx: &Cx, n: &SNode, rect: Rect) {
+    cx.loc(|l| {
+        if l.ctx_claim.is_none() && l.ctx_click.is_some_and(|p| rect.contains(p)) {
+            l.ctx_claim = Some(Claim::Card(n.id.clone()));
+        }
+    });
+}
+
 // ---- shapes ---------------------------------------------------------------------------------
 
 /// Header band polygon: the right end leans by `slant`, the top-right corner follows the card's
@@ -730,12 +1022,19 @@ fn tool_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
             .ctx()
             .animate_bool_with_time(hid.with("card"), head.contains_pointer(), 0.12);
         paint::pop(ui.painter(), head_rect, 3, ink, t);
+        let bottom = ui.min_rect().bottom().max(head_rect.bottom());
+        claim(
+            cx,
+            n,
+            Rect::from_min_max(head_rect.min, pos2(head_rect.right(), bottom)),
+        );
         return;
     }
 
     // The card around everything.
     let bottom = ui.min_rect().bottom().max(head_rect.bottom());
     let rect = Rect::from_min_max(head_rect.min, pos2(head_rect.right(), bottom));
+    claim(cx, n, rect);
     let t = ui
         .ctx()
         .animate_bool_with_time(hid.with("card"), ui.rect_contains_pointer(rect), 0.12);
@@ -838,56 +1137,45 @@ fn head_right(
     }
 }
 
-/// Copy / open buttons of a head: always laid out (so the target does not jump), drawn and
-/// clickable only while the pointer is over the head.
+/// Most action buttons a head shows on hover (the context menu lists them all).
+const HOVER_MAX: usize = 4;
+
+/// Action buttons of a head: always laid out (so the target does not jump), drawn and clickable
+/// only while the pointer is over the head. The same actions fill the card's context menu.
 fn hover_buttons(cx: &Cx, ui: &mut Ui, n: &SNode, hot: f32) {
     let ink = cx.ink;
     let live = hot > 0.35;
     let a = hot.clamp(0.0, 1.0);
-    if let Some(href) = n
-        .str("href")
-        .filter(|_| n.str("targetKind") == Some("path"))
-    {
-        let sense = if live { Sense::click() } else { Sense::hover() };
-        let r = glyphs::icon(
-            ui,
-            "external-link",
-            13.0,
-            ink.dim().gamma_multiply(a),
-            sense,
-        );
-        if live {
-            let r = r
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("Open");
-            if r.clicked() {
-                cx.open(href.to_owned());
-            }
-        }
-    }
-    if let Some(text) = copy_text(n) {
-        let copied = cx.loc(|l| l.copied.get(&n.id).copied());
-        let flash = copied.is_some_and(|t| cx.now.saturating_duration_since(t).as_millis() < 1200);
+    for act in card_acts(cx, n).iter().take(HOVER_MAX) {
+        let flash = act.copies()
+            && cx
+                .loc(|l| l.copied.get(&act.flash_key).copied())
+                .is_some_and(|t| cx.now.saturating_duration_since(t).as_millis() < 1200);
         if flash {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(1300));
         }
-        let sense = if live { Sense::click() } else { Sense::hover() };
+        let sense = if live && !act.disabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
         let (name, color) = if flash {
             ("check", ink.p.ok)
+        } else if act.danger {
+            (act.icon, ink.p.danger.gamma_multiply(a))
         } else {
-            ("copy", ink.dim().gamma_multiply(a))
+            (act.icon, ink.dim().gamma_multiply(a))
         };
         let r = glyphs::icon(ui, name, 13.0, color, sense);
         if live {
-            let r = r
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("Copy");
-            if r.clicked() {
-                cx.copy(text);
-                cx.loc(|l| {
-                    l.copied.insert(n.id.clone(), cx.now);
-                });
+            let tip = match &act.keys {
+                Some(k) => format!("{}  ({k})", act.label),
+                None => act.label.clone(),
+            };
+            let r = r.on_hover_text(tip);
+            if !act.disabled && r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                perform(cx, n, act);
             }
         }
     }
@@ -1078,24 +1366,25 @@ fn body_scope(
         return;
     };
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&tx.font)).max(10.0);
-    let max_h = rows.max(1) as f32 * row_h;
+    let m = measure_body(cx, ui, n, w, &tx);
+    let plan = plan_clamp(rows.max(1), tail, row_h, m.h, m.grid.as_ref());
+    let more_id = ui.scope_id().with(("tool-more", n.id.as_str()));
+    // A tail keeps its end, so what was left out sits above it.
+    let more_label = plan.cut.then(|| more_label(ui, more_id, plan.hidden, tail));
+    if let Some(label) = &more_label
+        && tail
+        && more_button(cx, ui, more_id, label, false).clicked()
+    {
+        cx.toggle(n);
+    }
+    let top = ui.cursor().top();
     let origin = pos2(left, top);
-    let area = Rect::from_min_size(origin, vec2(w, max_h));
-    let full = if tail {
-        cached_height(ui, n, w, |ui| body_children(cx, ui, n, &tx))
-    } else {
-        f32::INFINITY
-    };
-    let shift = if tail && full.is_finite() {
-        (full - max_h).max(0.0)
-    } else {
-        0.0
-    };
+    let area = Rect::from_min_size(origin, vec2(w, plan.max_h));
     let mut child = ui.new_child(
         UiBuilder::new()
             .id_salt(("tool-preview", n.id.as_str()))
             .max_rect(Rect::from_min_size(
-                pos2(left, top - shift),
+                pos2(left, top - plan.shift),
                 vec2(w, 10_000.0),
             ))
             .layout(Layout::top_down(Align::Min)),
@@ -1104,11 +1393,10 @@ fn body_scope(
     child.set_width(w);
     body_children(cx, &mut child, n, &tx);
     let used = child.min_rect().height();
-    let h = (if tail { used - shift } else { used }).min(max_h).max(0.0);
+    let h = (used - plan.shift).min(plan.max_h).max(0.0);
     ui.allocate_rect(Rect::from_min_size(origin, vec2(w, h)), Sense::hover());
-    // Soft edge where rows were cut off.
-    let cut = used > max_h + 0.5;
-    if cut && h > 6.0 {
+    // Soft edge where a body was cut through its text; a cut between rows shows whole ones.
+    if plan.cut && plan.hidden.is_none() && h > 6.0 {
         let fade = h.min(14.0);
         let clear = fill.gamma_multiply(0.0);
         let (r, a, b) = if tail {
@@ -1135,6 +1423,70 @@ fn body_scope(
             b,
         );
     }
+    if let Some(label) = &more_label
+        && !tail
+        && more_button(cx, ui, more_id, label, false).clicked()
+    {
+        cx.toggle(n);
+    }
+}
+
+/// How a collapsed tool body is cut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClampPlan {
+    /// Height of the window shown.
+    max_h: f32,
+    /// How far the body is moved up inside it (a tail keeps its end).
+    shift: f32,
+    /// Something is cut off.
+    cut: bool,
+    /// How many rows of the body's text are cut off, when its renderers said how they are laid out.
+    hidden: Option<usize>,
+}
+
+/// The window onto a body of height `full` that shows `rows` lines (the first ones, or the last
+/// when `tail`). With the text's own `grid` the cut falls between rows and counts them; without
+/// one it is `rows` of the body font's row height `row_h`.
+fn plan_clamp(rows: usize, tail: bool, row_h: f32, full: f32, grid: Option<&RowGrid>) -> ClampPlan {
+    let whole = ClampPlan {
+        max_h: full,
+        shift: 0.0,
+        cut: false,
+        hidden: None,
+    };
+    // The rows decide when the body has any; font rows only for a body without text rows.
+    match grid {
+        Some(g) if g.count() <= rows => whole,
+        Some(g) if tail => {
+            let hidden = g.count() - rows;
+            let shift = g.edge(hidden);
+            ClampPlan {
+                max_h: full - shift,
+                shift,
+                cut: true,
+                hidden: Some(hidden),
+            }
+        }
+        Some(g) => ClampPlan {
+            max_h: g.edge(rows).min(full),
+            shift: 0.0,
+            cut: true,
+            hidden: Some(g.count() - rows),
+        },
+        None => {
+            let max_h = rows as f32 * row_h;
+            if full <= max_h + 0.5 {
+                whole
+            } else {
+                ClampPlan {
+                    max_h,
+                    shift: if tail { full - max_h } else { 0.0 },
+                    cut: true,
+                    hidden: None,
+                }
+            }
+        }
+    }
 }
 
 /// Renders the children of `n` as a tool body (one level deeper than the tool itself).
@@ -1146,15 +1498,43 @@ fn body_children(cx: &Cx, ui: &mut Ui, n: &SNode, tx: &Tx) {
     ui.data_mut(|d| d.insert_temp(depth_id(), depth));
 }
 
-/// Height `f` lays out to at width `w`, remembered per node until its subtree or width changes.
-fn cached_height(ui: &mut Ui, n: &SNode, w: f32, f: impl Fn(&mut Ui)) -> f32 {
+/// The label of a clipped body's expand chip, formatted when `hidden`/`tail` change, not per frame.
+fn more_label(ui: &Ui, id: Id, hidden: Option<usize>, tail: bool) -> Arc<str> {
+    type Cached = (Option<usize>, bool, Arc<str>);
+    if let Some((h, t, label)) = ui.data(|d| d.get_temp::<Cached>(id))
+        && h == hidden
+        && t == tail
+    {
+        return label;
+    }
+    let label: Arc<str> = match (hidden, tail) {
+        (Some(k), true) => format!("{k} earlier line{}", if k == 1 { "" } else { "s" }).into(),
+        (Some(k), false) => format!("{k} more line{}", if k == 1 { "" } else { "s" }).into(),
+        (None, _) => "Show more".into(),
+    };
+    ui.data_mut(|d| d.insert_temp::<Cached>(id, (hidden, tail, label.clone())));
+    label
+}
+
+/// What a tool body lays out to.
+#[derive(Debug, Clone)]
+struct BodyMeasure {
+    sub: u64,
+    bucket: i32,
+    h: f32,
+    /// The first run of text rows its renderers reported, `top` relative to the body's top.
+    grid: Option<RowGrid>,
+}
+
+/// [`BodyMeasure`] of `n`'s body at width `w`, remembered until its subtree or the width changes.
+fn measure_body(cx: &Cx, ui: &mut Ui, n: &SNode, w: f32, tx: &Tx) -> BodyMeasure {
     let key = ui.scope_id().with(("tool-body-h", n.id.as_str()));
     let bucket = w.round() as i32;
-    if let Some((sub, b, h)) = ui.data(|d| d.get_temp::<(u64, i32, f32)>(key))
-        && sub == n.sub
-        && b == bucket
+    if let Some(m) = ui.data(|d| d.get_temp::<BodyMeasure>(key))
+        && m.sub == n.sub
+        && m.bucket == bucket
     {
-        return h;
+        return m;
     }
     let rect = Rect::from_min_size(ui.cursor().min, vec2(w, 10_000.0));
     let mut probe = ui.new_child(
@@ -1166,10 +1546,17 @@ fn cached_height(ui: &mut Ui, n: &SNode, w: f32, f: impl Fn(&mut Ui)) -> f32 {
             .sizing_pass(),
     );
     probe.set_width(w);
-    f(&mut probe);
-    let h = probe.min_rect().height();
-    ui.data_mut(|d| d.insert_temp(key, (n.sub, bucket, h)));
-    h
+    cx.loc(|l| l.row_grids = Some(Vec::new()));
+    body_children(cx, &mut probe, n, tx);
+    let grids = cx.loc(|l| l.row_grids.take()).unwrap_or_default();
+    let m = BodyMeasure {
+        sub: n.sub,
+        bucket,
+        h: probe.min_rect().height(),
+        grid: RowGrid::merged(grids.into_iter().map(|g| g.moved(-rect.top())).collect()),
+    };
+    ui.data_mut(|d| d.insert_temp(key, m.clone()));
+    m
 }
 
 // ---- agent ----------------------------------------------------------------------------------
@@ -1177,6 +1564,12 @@ fn cached_height(ui: &mut Ui, n: &SNode, w: f32, f: impl Fn(&mut Ui)) -> f32 {
 /// `agent` node: one subagent as a nested card (name, type, model, progress), children expanded.
 pub fn agent(cx: &Cx, ui: &mut Ui, n: &SNode) {
     ui.scope(|ui| agent_inner(cx, ui, n));
+}
+
+/// Whether an agent of `status` still shows its thinking-effort ring: a finished one has no
+/// effort left to show, and the arc reads as a running spinner next to the done mark.
+fn shows_effort(status: &str) -> bool {
+    !matches!(status, "done" | "failed" | "aborted")
 }
 
 fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -1220,6 +1613,7 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
             if collapsible {
                 render::chevron(ui, ink.dim(), !collapsed);
             }
+            hover_buttons(cx, ui, n, hot);
             let status = head_status(lk, ms);
             if !status.is_empty() {
                 let c = if lk.hue == Hue::Ok { ink.dim() } else { accent };
@@ -1244,9 +1638,9 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 job.wrap.max_rows = 1;
                 job.wrap.max_width = (ui.available_width() - 16.0).max(20.0);
                 chip(ui, ink, job, ink.chip(), ink.line(), Sense::hover());
-                if let Some(level) = n.str("thinking") {
+                if let Some(level) = n.str("thinking").filter(|_| shows_effort(status)) {
                     let level = level.trim_start_matches("thinking").to_ascii_lowercase();
-                    render::ring(cx, ui, render::effort_fill(&level), 11.0, ink.b);
+                    render::ring(cx, ui, render::effort_fill(&level), 11.0, ink.accent_text());
                 }
             }
         },
@@ -1294,7 +1688,7 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     if let Some(task) = n.get("task").filter(|t| !tplain(t).trim().is_empty()) {
         let job = tjob(ink, &base, task);
         detail(ui, &mut |ui: &mut Ui| {
-            render::para(ui, job.clone(), ink.dim(), &[]);
+            render::para(cx, ui, job.clone(), ink.dim(), &[], RunOpts::LINE);
         });
     }
     if running
@@ -1410,6 +1804,7 @@ fn agent_inner(cx: &Cx, ui: &mut Ui, n: &SNode) {
     // Frame behind it all.
     let bottom = ui.min_rect().bottom().max(head_rect.bottom());
     let rect = Rect::from_min_max(pos2(left, top), pos2(left + w, bottom));
+    claim(cx, n, rect);
     let corner = CornerRadius {
         nw: 0,
         ne: 6,
@@ -1597,7 +1992,14 @@ fn item_row(cx: &Cx, ui: &mut Ui, it: &Value, live: bool, indent: bool) {
         mark(cx, &mut m, lk, 13.0, live && st == "active");
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            render::para(ui, job, color, &[]);
+            render::para(
+                cx,
+                ui,
+                job,
+                color,
+                &[],
+                RunOpts::LINE.lead(Lead::Task(st == "done")),
+            );
             if let Some(note) = note {
                 let c = if st == "blocked" {
                     ink.p.warn
@@ -1751,12 +2153,14 @@ fn render_half(cx: &Cx, ui: &mut Ui, at: Pos2) {
             .max_rect(r.expand(2.0))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    render::ring(cx, &mut child, Some(0.5), 13.0, ink.b);
+    render::ring(cx, &mut child, Some(0.5), 13.0, ink.accent_text());
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use super::super::ctx::RowEnds;
 
     use super::*;
 
@@ -1783,6 +2187,72 @@ mod tests {
         assert_eq!(h.target, tplain(tool.get("target").expect("target")));
         assert_eq!(h.meta, meta_line(tool.arr("meta")));
         assert_eq!(h, HeadText::of(tool), "a pure function of the props");
+    }
+
+    fn grid(top: f32, pitch: f32, count: usize) -> RowGrid {
+        RowGrid {
+            top,
+            ends: RowEnds::Even { pitch, count },
+        }
+    }
+
+    #[test]
+    fn a_clamped_body_is_cut_between_rows_of_its_own_pitch() {
+        // 12 diff rows of 20 px under a 26 px header, 4 rows shown: the cut is the 4th row's end.
+        let g = grid(26.0, 20.0, 12);
+        let p = plan_clamp(4, false, 16.0, 26.0 + 12.0 * 20.0, Some(&g));
+        assert_eq!(
+            p,
+            ClampPlan {
+                max_h: 106.0,
+                shift: 0.0,
+                cut: true,
+                hidden: Some(8)
+            }
+        );
+        // A tail keeps the last rows, starting on a row edge.
+        let full = 26.0 + 12.0 * 20.0 + 30.0;
+        let p = plan_clamp(4, true, 16.0, full, Some(&g));
+        assert_eq!((p.shift, p.hidden), (26.0 + 8.0 * 20.0, Some(8)));
+        assert_eq!(p.max_h, full - p.shift);
+        // Rows that fit are the whole body, whatever the font rows would say.
+        assert!(!plan_clamp(12, false, 16.0, 190.0, Some(&g)).cut);
+        assert!(!plan_clamp(12, false, 16.0, 300.0, Some(&g)).cut);
+        // A command above its output: the runs count as one.
+        let merged = RowGrid::merged(vec![grid(70.0, 20.0, 6), grid(0.0, 20.0, 3)]).expect("rows");
+        assert_eq!(merged.count(), 9);
+        assert_eq!(merged.edge(3), 60.0);
+        assert_eq!(merged.edge(9), 190.0);
+        assert!(RowGrid::merged(Vec::new()).is_none());
+        // Wrapped rows of different heights cut on their own edges.
+        let wrapped = RowGrid {
+            top: 0.0,
+            ends: RowEnds::Prefix(vec![0.0, 20.0, 60.0, 80.0, 120.0].into()),
+        };
+        let p = plan_clamp(2, false, 16.0, 120.0, Some(&wrapped));
+        assert_eq!((p.max_h, p.hidden), (60.0, Some(2)));
+        // Without row information it is rows of the font's height, and only when taller.
+        let p = plan_clamp(5, false, 16.0, 200.0, None);
+        assert_eq!((p.max_h, p.cut, p.hidden), (80.0, true, None));
+        assert!(!plan_clamp(5, false, 16.0, 70.0, None).cut);
+    }
+
+    #[test]
+    fn copy_output_leaves_out_what_the_card_ran() {
+        assert!(is_run_input("code", "omp.tool.bash.command"));
+        assert!(is_run_input("code", "omp.tool.eval.input"));
+        assert!(!is_run_input("ansi", "omp.tool.bash.output"));
+        assert!(!is_run_input("code", "omp.tool.write.preview"));
+    }
+
+    #[test]
+    fn a_finished_agent_shows_no_effort_ring() {
+        for s in ["done", "failed", "aborted"] {
+            assert!(!shows_effort(s), "{s}");
+        }
+        for s in ["pending", "running", "idle", "parked"] {
+            assert!(shows_effort(s), "{s}");
+        }
     }
 
     #[test]

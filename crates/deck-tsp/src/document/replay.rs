@@ -79,6 +79,14 @@ fn advance_timers(kind: &str, props: &mut Map<String, Value>, ms: u64) {
     }
     let running = props.get("status").and_then(Value::as_str) == Some("running");
     match kind {
+        // A toast omp has not deleted yet replays with its age, so the receiving document counts
+        // its lifetime from when it was created, not from the replay.
+        "toast" => match props.get_mut("age") {
+            Some(age) => bump(age, ms),
+            None => {
+                props.insert("age".to_owned(), Value::from(ms));
+            }
+        },
         "elapsed" if props.get("stopped").is_none_or(Value::is_null) => {
             if let Some(age) = props.get_mut("age") {
                 bump(age, ms);
@@ -106,7 +114,7 @@ fn advance_timers(kind: &str, props: &mut Map<String, Value>, ms: u64) {
 
 /// Adds to `out` every string in `props` that has the shape of a blob id (64 lowercase hex
 /// digits), at any depth: a node refers to a blob by its id in some prop (`blob` of an image).
-fn note_blob_ids(props: &Map<String, Value>, out: &mut HashSet<String>) {
+pub(super) fn note_blob_ids(props: &Map<String, Value>, out: &mut HashSet<String>) {
     fn walk(v: &Value, out: &mut HashSet<String>) {
         match v {
             Value::String(s) => {
@@ -168,7 +176,7 @@ impl<'a> Frames<'a> {
 }
 
 impl Surface {
-    fn replay(&self, now: Instant, w: &mut Writer) {
+    fn replay(&self, now: Instant, toasts: &[&ToastRecord], w: &mut Writer) {
         w.json(
             Verb::Open,
             &Open {
@@ -242,6 +250,33 @@ impl Surface {
                     },
                 );
             });
+            // A toast is created and deleted by one frame, as omp sent it, with what is left
+            // of its lifetime; the mirror's ring then holds it. Before the `settle` marks: an
+            // add unsettles the parent chain.
+            for t in toasts {
+                let left = t.ttl.saturating_sub(now.saturating_duration_since(t.at));
+                let Some(parent) = self.node(&t.parent) else {
+                    continue;
+                };
+                if left.is_zero() || self.node(&t.node.id).is_some() {
+                    continue;
+                }
+                let mut node = t.node.clone();
+                node.c.clear();
+                let ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1);
+                node.p.insert("ttl".to_owned(), Value::from(ms));
+                let id = node.id.clone();
+                frames.push(
+                    w,
+                    &Op::Add {
+                        id: id.clone(),
+                        parent: parent.id().to_owned(),
+                        before: None,
+                        node,
+                    },
+                );
+                frames.push(w, &Op::Del { id });
+            }
             for id in settled {
                 frames.push(w, &Op::Settle { id: id.to_owned() });
             }
@@ -307,7 +342,15 @@ impl Document {
             );
         }
         for surface in &self.surfaces {
-            surface.replay(now, &mut w);
+            let toasts: Vec<&ToastRecord> = if surface.open {
+                self.toasts
+                    .iter()
+                    .filter(|t| t.sf == surface.id && !t.expired(now))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            surface.replay(now, &toasts, &mut w);
         }
         if let Some(refs) = w.refs.take() {
             let mut blobs: Vec<(&String, &(Blob, u64))> = self
@@ -847,5 +890,115 @@ mod tests {
             "n39",
             "document order is kept across frames"
         );
+    }
+
+    #[test]
+    fn unexpired_toasts_replay_with_what_is_left_of_their_lifetime() {
+        let t0 = Instant::now();
+        let mut doc = Document::new();
+        doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": "s1", "mode": "inline", "role": "omp.session"}),
+            ),
+            t0,
+        );
+        let frame = |s: u64, ops: Value| msg(Verb::Frame, &json!({"sf": "s1", "s": s, "ops": ops}));
+        doc.apply(
+            &frame(
+                1,
+                json!([
+                    ["add", "main", "s1", null, {"id": "main", "k": "col"}],
+                    ["add", "m", "main", null, {"id": "m", "k": "md", "p": {"text": "hi"}}],
+                    ["settle", "main"],
+                ]),
+            ),
+            t0,
+        );
+        let toast = |id: &str, ttl: u64| {
+            json!(["add", id, "main", null,
+                {"id": id, "k": "toast", "p": {"text": id, "sub": "sub", "ttl": ttl, "role": "omp.toast.status"}}])
+        };
+        doc.apply(&frame(2, json!([toast("short", 1000)])), t0);
+        doc.apply(
+            &frame(3, json!([toast("long", 5000), ["del", "short"]])),
+            t0,
+        );
+        doc.apply(&frame(4, json!([["del", "long"]])), t0);
+
+        let t1 = t0 + Duration::from_millis(1500);
+        let mut mirror = Mirror::new();
+        mirror.feed(&doc.replay(t1), t1);
+        let now = t1 + Duration::from_millis(10);
+        let got: Vec<_> = mirror.document().toasts(now).collect();
+        assert_eq!(got.len(), 1, "`short` expired before the replay");
+        assert_eq!(
+            (got[0].text.as_str(), got[0].sub.as_deref()),
+            ("long", Some("sub"))
+        );
+        assert_eq!(got[0].ttl, Duration::from_millis(3500));
+        assert_eq!(
+            mirror
+                .document()
+                .toasts(t1 + Duration::from_millis(3500))
+                .count(),
+            0
+        );
+
+        // Not a node of the replayed tree, and the tree equals the source's.
+        assert_eq!(
+            serde_json::to_value(mirror.document().surfaces()).unwrap(),
+            serde_json::to_value(doc.surfaces()).unwrap()
+        );
+
+        // Past every lifetime the replay carries no toast at all.
+        let late = t0 + Duration::from_secs(9);
+        let mut later = Mirror::new();
+        later.feed(&doc.replay(late), late);
+        assert_eq!(later.document().toasts(late).count(), 0);
+    }
+
+    #[test]
+    fn a_toast_node_omp_has_not_deleted_yet_keeps_its_age_through_a_replay() {
+        let t0 = Instant::now();
+        let mut doc = Document::new();
+        doc.apply(
+            &msg(
+                Verb::Open,
+                &json!({"id": "s1", "mode": "inline", "role": "omp.session"}),
+            ),
+            t0,
+        );
+        let frame = |s: u64, ops: Value| msg(Verb::Frame, &json!({"sf": "s1", "s": s, "ops": ops}));
+        doc.apply(
+            &frame(
+                1,
+                json!([
+                    ["add", "main", "s1", null, {"id": "main", "k": "col"}],
+                    ["add", "t", "main", null,
+                        {"id": "t", "k": "toast", "p": {"text": "Saved", "ttl": 4000}}],
+                    ["settle", "main"],
+                ]),
+            ),
+            t0,
+        );
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+
+        // The session idles: the toast node is still in the host's tree after its lifetime.
+        let late = t0 + Duration::from_secs(10);
+        let mut fresh = Mirror::new();
+        fresh.feed(&doc.replay(late), late);
+        assert_eq!(fresh.document().toasts(late).count(), 0, "expired for good");
+
+        // Unexpired: the lifetime left is kept, and a second replay adds to the age.
+        let mut part = Mirror::new();
+        part.feed(&doc.replay(ms(1500)), ms(1500));
+        assert_eq!(part.document().toasts(ms(1500)).count(), 1);
+        assert_eq!(part.document().toasts(ms(3999)).count(), 1);
+        assert_eq!(part.document().toasts(ms(4000)).count(), 0);
+        let mut twice = Mirror::new();
+        twice.feed(&part.document().replay(ms(3000)), ms(3000));
+        assert_eq!(twice.document().toasts(ms(3999)).count(), 1);
+        assert_eq!(twice.document().toasts(ms(4000)).count(), 0);
     }
 }

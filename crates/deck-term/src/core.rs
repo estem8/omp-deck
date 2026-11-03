@@ -369,13 +369,15 @@ impl Parts {
         }
     }
 
-    fn feeder(&self, frontend: bool) -> Feeder {
+    fn feeder(&self, frontend: bool, fetch_blobs: bool) -> Feeder {
         Feeder {
             engine: self.engine.clone(),
             out: self.out.clone(),
             notices: self.tx.clone(),
             wake: self.wake.clone(),
             frontend,
+            tsp: self.tsp.clone(),
+            fetch_blobs,
         }
     }
 
@@ -597,7 +599,7 @@ impl Terminal {
         let (cmds, writer) = remote::spawn_writer(tx, parts.progress.clone());
         // Before the feeder runs, so no clipboard reply can be dropped.
         parts.out.set_sink(Sink::Remote(cmds));
-        remote::start(rx, parts.feeder(false));
+        remote::start(rx, parts.feeder(false, !read_only));
         if !read_only {
             parts
                 .out
@@ -628,7 +630,7 @@ impl Terminal {
         let (rx, tx) = frontend.split();
         let (cmds, writer) = frontend::spawn_writer(tx, parts.progress.clone());
         parts.out.set_sink(Sink::Frontend(cmds));
-        remote::start(rx, parts.feeder(true));
+        remote::start(rx, parts.feeder(true, false));
         let mut terminal = parts.into_terminal(opts, false, true, writer);
         // Focus, palette and requested size go out with the first snapshot.
         terminal.frontend = Some(FrontendView {

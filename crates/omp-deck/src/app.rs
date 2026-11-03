@@ -697,6 +697,8 @@ impl App {
         if let Some(url) = cli.open_url {
             app.open_external(url);
         }
+        // Widget copies (a selection in the chat transcript) go to the system clipboard.
+        clipboard_bridge::install(&cc.egui_ctx, &app.clipboard);
         app
     }
 
@@ -2595,8 +2597,6 @@ impl App {
                 ctx.request_repaint_after(WINDOW_TITLE_EVERY - since);
             }
         }
-
-        clipboard_bridge::forward_copies(ctx, &self.clipboard);
 
         if self.dirty {
             let since = self.last_save.elapsed();

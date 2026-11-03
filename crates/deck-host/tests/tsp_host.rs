@@ -439,3 +439,112 @@ fn a_client_attaching_between_two_chunks_of_a_frame_still_gets_the_whole_frame()
     let host_doc = deck_host::tsp_peek(&ns.0, "mid").unwrap();
     assert_eq!(doc_json(&m), host_doc);
 }
+
+#[test]
+fn an_attached_client_fetches_blobs_the_program_sent_before_it_attached() {
+    use sha2::{Digest, Sha256};
+
+    let ns = TestNs::new();
+    let rec = scratch("tsp-fetch.rec");
+    let frame_file = scratch("tsp-fetch.frame");
+    let go = scratch("tsp-fetch.go");
+    for f in [&rec, &frame_file, &go] {
+        let _ = std::fs::remove_file(f);
+    }
+    // `pixel-a` (small) and a 319 992-byte blob sent as eight chunks (two BlobData frames
+    // on the way back); the frame that refers to them is sent only after the client attached.
+    let big_chunk =
+        r#"printf '\033_tsp;b;c=big;m=1;'; head -c 39999 /dev/zero | base64 -w0; printf '\033\\'"#;
+    let big_last =
+        r#"printf '\033_tsp;b;c=big;'; head -c 39999 /dev/zero | base64 -w0; printf '\033\\'"#;
+    let body = format!(
+        "printf '{OPEN}'\n\
+         printf '\\033_tsp;b;mime=image/png;cGl4ZWwtYQ==\\033\\\\'\n\
+         {}\n{big_last}\n\
+         while [ ! -e '{}' ]; do sleep 0.02; done\n\
+         cat '{}'",
+        [big_chunk; 7].join("\n"),
+        go.display(),
+        frame_file.display()
+    );
+    deck_host::start(&ns.0, &scripted("fetch", &rec, &body), 100, 30).unwrap();
+    let big_id = deck_tsp::document::hex(&Sha256::digest(vec![0u8; 39999 * 8]));
+    wait_until("both blobs held by the host", || {
+        let doc = deck_host::tsp_peek(&ns.0, "fetch").unwrap();
+        doc["blobs"].as_array().is_some_and(|b| b.len() == 2)
+            && doc["blobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["id"] == big_id.as_str())
+    });
+
+    let attached = deck_host::attach(&ns.0, "fetch", common::params(100, 30)).unwrap();
+    let mut c = Client::new(attached, 100, 30);
+    assert!(c.tx.blob_fetch(), "the daemon announces blob fetching");
+    let HostEvent::Snapshot(bytes) = c.next() else {
+        panic!("the first event is the snapshot")
+    };
+    let mut m = mirror_of(&bytes);
+    assert!(
+        m.document().blob(BLOB_A).is_none() && m.document().blob(&big_id).is_none(),
+        "nothing refers to the blobs yet, so the snapshot carries none"
+    );
+
+    let frame = format!(
+        r#"{{"sf":"s1","s":1,"ops":[["add","main","s1",null,{{"id":"main","k":"col","c":[{{"id":"a","k":"image","p":{{"blob":"{BLOB_A}"}}}},{{"id":"b","k":"image","p":{{"blob":"{big_id}"}}}}]}}]]}}"#
+    );
+    std::fs::write(&frame_file, format!("\x1b_tsp;f;{frame}\x1b\\")).unwrap();
+    std::fs::write(&go, b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while m
+        .document()
+        .surface("s1")
+        .and_then(|s| s.node("b"))
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the frame never arrived");
+        if let HostEvent::Output(out) = c.next() {
+            m.feed(&out, Instant::now());
+        }
+    }
+    let mut missing = m.document().missing_blobs();
+    missing.sort();
+    let mut expected = vec![BLOB_A.to_owned(), big_id.clone()];
+    expected.sort();
+    assert_eq!(missing, expected, "the mirror knows what it lacks");
+
+    let absent = "0".repeat(64);
+    for id in [BLOB_A, big_id.as_str(), absent.as_str()] {
+        c.tx.blob(id).unwrap();
+    }
+    let mut answers = Vec::new();
+    while answers.len() < 3 {
+        if let HostEvent::Blob { id, mime, bytes } = c.next() {
+            answers.push((id, mime, bytes));
+        }
+    }
+    answers.sort();
+    let by = |id: &str| answers.iter().find(|a| a.0 == id).unwrap();
+    assert_eq!(
+        (by(BLOB_A).1.as_deref(), by(BLOB_A).2.as_deref()),
+        (Some("image/png"), Some(&b"pixel-a"[..]))
+    );
+    assert_eq!(by(&big_id).2.as_deref(), Some(&vec![0u8; 39999 * 8][..]));
+    assert_eq!(
+        by(&absent).2,
+        None,
+        "no such blob is an answer, not silence"
+    );
+
+    for (id, mime, bytes) in answers {
+        if let Some(bytes) = bytes {
+            assert!(m.put_blob(&id, mime, bytes));
+        }
+    }
+    assert!(m.document().missing_blobs().is_empty());
+    assert!(
+        !m.put_blob(BLOB_A, None, b"forged".to_vec()),
+        "hash checked"
+    );
+}

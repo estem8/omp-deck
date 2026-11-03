@@ -8,6 +8,7 @@
 //! A mirror can only start from the stream at a point where [`Mirror::is_idle`]: a chunked
 //! message joined half way would lose its first chunks.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::document::Document;
@@ -39,6 +40,21 @@ impl Mirror {
 
     pub fn document(&self) -> &Document {
         &self.document
+    }
+
+    /// Stores a blob learned out of band (see [`Document::put_blob`]).
+    pub fn put_blob(&mut self, id: &str, mime: Option<String>, bytes: Vec<u8>) -> bool {
+        self.document.put_blob(id, mime, bytes)
+    }
+
+    /// [`Mirror::put_blob`] for bytes already hashed to `id` by the caller.
+    pub fn put_verified_blob(&mut self, id: &str, mime: Option<String>, bytes: Arc<[u8]>) -> bool {
+        self.document.put_verified_blob(id, mime, bytes)
+    }
+
+    /// Gives up on a blob the host does not hold (see [`Document::forget_blob`]).
+    pub fn forget_blob(&mut self, id: &str) {
+        self.document.forget_blob(id);
     }
 
     /// No APC string is half read and no chunked message is waiting for its next chunk.

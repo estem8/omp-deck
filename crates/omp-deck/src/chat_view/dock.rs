@@ -10,11 +10,11 @@ use egui::{
 };
 use serde_json::Value;
 
-use super::ctx::{Cx, Tx};
-use super::events;
+use super::ctx::{Claim, Cx, Tx};
 use super::glyphs;
 use super::paint;
 use super::render::{self, blank};
+use super::select::{self, ComposerSel};
 use super::snap::SNode;
 use super::style::{LABEL, PROSE, PROSE_LINE};
 use super::text::{self, Base};
@@ -625,10 +625,12 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
     let text = n.text();
     let max_h = max_lines * line;
     let h = galley.size().y.max(line).min(max_h);
-    let sense = if n.flag("readonly") {
+    let readonly = n.flag("readonly");
+    // Dragged to select, never focusable: the chat view owns the keyboard focus.
+    let sense = if readonly {
         Sense::hover()
     } else {
-        Sense::click()
+        Sense::click_and_drag() - Sense::FOCUSABLE
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(width, h), sense);
     let is_focus = cx.focused
@@ -637,7 +639,11 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
     let cursor16 = n.num("cursor").map_or(utf16_len(text), |c| c as usize);
     let anchor16 = n.num("anchor").map_or(cursor16, |c| c as usize);
     let (cur, anc) = (utf16_to_char(text, cursor16), utf16_to_char(text, anchor16));
-    let caret_rect = galley.pos_from_cursor(CCursor::new(cur));
+    // The galley is laid out over the cleaned text (no private-use characters), `text` is omp's:
+    // everything omp tells or is told is a char index of `text`, the galley wants shown ones.
+    let pua = text.chars().any(text::is_pua);
+    let shown_at = |raw: usize| if pua { shown_index(text, raw) } else { raw };
+    let caret_rect = galley.pos_from_cursor(CCursor::new(shown_at(cur)));
     // Show the end of a taller-than-allowed text, caret in view.
     let off = (caret_rect.max.y - h)
         .max(0.0)
@@ -646,12 +652,20 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
     let p = ui
         .painter()
         .with_clip_rect(rect.expand2(vec2(2.0, 0.0)).intersect(ui.clip_rect()));
+    // The reader's selection (a drag here), else omp's own (vim's visual mode).
+    let picked = cx.loc(|l| {
+        l.sel
+            .as_ref()
+            .filter(|s| s.is_for(&n.id, text))
+            .map(|s| (s.anchor, s.head))
+    });
+    let (anc, cur_sel) = picked.unwrap_or((anc, cur));
     let mut shown = galley.clone();
-    if cur != anc && !text.is_empty() {
+    if cur_sel != anc && !text.is_empty() {
         egui::text_selection::visuals::paint_text_selection(
             &mut shown,
             ui.visuals(),
-            &CCursorRange::two(CCursor::new(anc), CCursor::new(cur)),
+            &CCursorRange::two(CCursor::new(shown_at(anc)), CCursor::new(shown_at(cur_sel))),
             None,
         );
     }
@@ -717,30 +731,112 @@ pub fn editor_box(cx: &Cx, ui: &mut Ui, n: &SNode) -> Response {
             });
         }
     }
-    // Click places the caret (omp applies it and echoes the new cursor).
-    if cx.can_edit
-        && !n.flag("readonly")
-        && resp.clicked()
-        && let Some(pos) = resp.interact_pointer_pos()
-    {
-        let ci = galley.cursor_from_pos(pos - origin).index.0;
-        let u = char_to_utf16(text, ci) as u32;
-        cx.send(events::edit(
-            cx.sf(),
-            &n.id,
-            u,
-            u,
-            "",
-            u,
-            utf16_len(text) as u32,
-        ));
-        cx.loc(|l| l.blink_epoch = Some(cx.now));
+    if !readonly && ui.is_visible() {
+        select_by_pointer(cx, ui, n, &resp, &galley, origin, (anc, cur_sel));
     }
-    if !n.flag("readonly") {
+    if !readonly {
         resp.on_hover_cursor(CursorIcon::Text)
     } else {
         resp
     }
+}
+
+/// Char index in the cleaned text (private-use characters dropped, as the editor draws it) of the
+/// char index `raw` of `text`.
+fn shown_index(text: &str, raw: usize) -> usize {
+    text.chars().take(raw).filter(|c| !text::is_pua(*c)).count()
+}
+
+/// Char index in `text` of the char index `shown` of its cleaned form (the end for anything
+/// past it, such as the ghost suggestion).
+fn raw_index(text: &str, shown: usize) -> usize {
+    let mut seen = 0;
+    for (i, c) in text.chars().enumerate() {
+        if text::is_pua(c) {
+            continue;
+        }
+        if seen == shown {
+            return i;
+        }
+        seen += 1;
+    }
+    text.chars().count()
+}
+
+/// Mouse selection in the composer. A press anchors a selection that follows the drag (double and
+/// triple click take a word and a line, shift extends); a click without a drag places omp's caret.
+/// Releasing a selection moves omp's caret to its moving end (`edit` with no text), which is what
+/// typing, deleting and pasting over the selection then address (`select::plan`).
+fn select_by_pointer(
+    cx: &Cx,
+    ui: &Ui,
+    n: &SNode,
+    resp: &Response,
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+    shown: (usize, usize),
+) {
+    let text = n.text();
+    let at = |pos: egui::Pos2| raw_index(text, galley.cursor_from_pos(pos - origin).index.0);
+    let ci = resp.interact_pointer_pos().map(at);
+    let sel_of = |a: usize, b: usize| ComposerSel::new(&n.id, text, a, b);
+    let caret_to = |ci: usize| {
+        if cx.can_edit {
+            cx.send(select::caret_edit(cx.sf(), &n.id, text, ci));
+        }
+        cx.loc(|l| l.blink_epoch = Some(cx.now));
+    };
+    if resp.hovered()
+        && ui.input(|i| i.pointer.primary_pressed())
+        && let Some(p) = resp.hover_pos()
+    {
+        let ci = at(p);
+        let anchor = if ui.input(|i| i.modifiers.shift) {
+            shown.0
+        } else {
+            ci
+        };
+        cx.loc(|l| l.sel = Some(sel_of(anchor, ci)));
+    }
+    let Some(ci) = ci else { return };
+    if resp.dragged() {
+        cx.loc(|l| {
+            if let Some(s) = l.sel.as_mut().filter(|s| s.is_for(&n.id, text)) {
+                s.head = ci.min(text.chars().count());
+            }
+        });
+        ui.ctx().request_repaint();
+    }
+    let (word, line) = (resp.double_clicked(), resp.triple_clicked());
+    if line || word {
+        let (a, b) = if line {
+            select::line_at(text, ci)
+        } else {
+            select::word_at(text, ci)
+        };
+        cx.loc(|l| l.sel = Some(sel_of(a, b)));
+        caret_to(b);
+    } else if resp.clicked() {
+        // A click (no drag) is a caret move, not a selection.
+        cx.loc(|l| l.sel = None);
+        caret_to(ci);
+    } else if resp.drag_stopped() {
+        let head = cx.loc(|l| {
+            l.sel
+                .as_ref()
+                .filter(|s| s.is_for(&n.id, text) && !s.is_empty())
+                .map(|s| s.head)
+        });
+        match head {
+            Some(h) => caret_to(h),
+            None => cx.loc(|l| l.sel = None),
+        }
+    }
+    cx.loc(|l| {
+        if l.ctx_claim.is_none() && l.ctx_click.is_some_and(|p| resp.rect.contains(p)) {
+            l.ctx_claim = Some(Claim::Composer(n.id.clone()));
+        }
+    });
 }
 
 /// How long the caret keeps blinking after the last keystroke or click.
@@ -749,6 +845,26 @@ const BLINK_FOR: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_positions_map_between_the_drawn_and_the_raw_text() {
+        // Two icons (private use) sit in omp's text; the editor draws "a b" without them.
+        let raw = "a\u{e000} \u{f0001}b";
+        assert_eq!(raw.chars().count(), 5);
+        // drawn index -> char index of the raw text (the icons are skipped)
+        let raw_of: Vec<usize> = (0..=3).map(|i| raw_index(raw, i)).collect();
+        assert_eq!(raw_of, [0, 2, 4, 5]);
+        // and back
+        let drawn_of: Vec<usize> = (0..=5).map(|i| shown_index(raw, i)).collect();
+        assert_eq!(drawn_of, [0, 1, 1, 2, 2, 3]);
+        for drawn in 0..=3 {
+            assert_eq!(shown_index(raw, raw_index(raw, drawn)), drawn);
+        }
+        // Text without icons is the identity; a ghost past the end clamps to the end.
+        assert_eq!(raw_index("abc", 2), 2);
+        assert_eq!(raw_index("abc", 9), 3);
+        assert_eq!(shown_index("abc", 2), 2);
+    }
 
     #[test]
     fn the_exit_banner_reads_like_the_terminals() {

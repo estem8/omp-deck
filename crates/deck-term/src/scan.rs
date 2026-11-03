@@ -164,6 +164,22 @@ impl OutputScan {
         self.tsp.replay(now, out);
     }
 
+    /// Stores a blob the session host supplied for the mirror, already hashed to `id`. Not part
+    /// of the byte stream: see `Engine::insert_blob`.
+    pub(crate) fn tsp_put_blob(
+        &self,
+        id: &str,
+        mime: Option<String>,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> bool {
+        self.tsp.put_verified_blob(id, mime, bytes)
+    }
+
+    /// The host holds no blob `id`: the mirror stops wanting it.
+    pub(crate) fn tsp_forget_blob(&self, id: &str) {
+        self.tsp.forget_blob(id);
+    }
+
     /// Appends the APC replay of the retained images (nothing unless this is an owner).
     pub(crate) fn image_replay(&self, out: &mut Vec<u8>) {
         if let Some(replay) = &self.replay {

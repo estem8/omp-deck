@@ -13,6 +13,13 @@
 //! `TspPeek` (additive, no payload) asks a session started with [`SessionSpec::tsp`] for its
 //! TSP document: `Snapshot`… `SnapshotEnd` carrying one JSON document (see
 //! `deck_tsp::document::Document`'s `Serialize`), or `Error` when the session is not a TSP one.
+//!
+//! `BlobGet` (additive, attached connections only, announced by [`HostInfo::blob_fetch`]) asks
+//! a TSP session for one blob its document holds, by id (lowercase hex SHA-256): a mirror that
+//! attached after the program sent the blob never saw it. The answer is a `BlobHead` (JSON
+//! [`BlobHead`]; no `len` means the daemon holds no such blob) followed, for a blob, by
+//! `BlobData` frames, each `64 ASCII id bytes + a chunk`, in order. Frames of other kinds may
+//! fall between them.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -29,6 +36,12 @@ pub const MAX_FRAME: usize = 1 << 20;
 
 /// Snapshot replay is split into chunks of this size.
 pub(crate) const SNAPSHOT_CHUNK: usize = 256 * 1024;
+
+/// A blob answer is split into `BlobData` chunks of this size.
+pub(crate) const BLOB_CHUNK: usize = 256 * 1024;
+
+/// Length of a blob id (lowercase hex SHA-256).
+pub const BLOB_ID_LEN: usize = 64;
 
 /// Frame kinds. Values are part of the wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +68,8 @@ pub enum Kind {
     /// TSP document request: no payload, answered with `Snapshot`… `SnapshotEnd` (the JSON
     /// document) or `Error` for a session without TSP.
     TspPeek = 0x0c,
+    /// Attached connections: JSON [`BlobRequest`], answered with `BlobHead` (+ `BlobData`).
+    BlobGet = 0x0d,
     // Daemon -> client (`Info` reuses 0x08 with a `HostInfo` payload).
     Snapshot = 0x21,
     SnapshotEnd = 0x22,
@@ -66,6 +81,10 @@ pub enum Kind {
     /// Observers only: the session's grid (JSON [`Grid`]), before the snapshot and on every
     /// size change.
     Resized = 0x28,
+    /// The answer to a `BlobGet`: JSON [`BlobHead`].
+    BlobHead = 0x29,
+    /// A chunk of a blob: its id ([`BLOB_ID_LEN`] ASCII bytes), then up to 256 KiB of it.
+    BlobData = 0x2a,
 }
 
 impl Kind {
@@ -83,6 +102,7 @@ impl Kind {
             0x0a => Kind::Peek,
             0x0b => Kind::Observe,
             0x0c => Kind::TspPeek,
+            0x0d => Kind::BlobGet,
             0x21 => Kind::Snapshot,
             0x22 => Kind::SnapshotEnd,
             0x23 => Kind::Output,
@@ -91,6 +111,8 @@ impl Kind {
             0x26 => Kind::Error,
             0x27 => Kind::Pong,
             0x28 => Kind::Resized,
+            0x29 => Kind::BlobHead,
+            0x2a => Kind::BlobData,
             _ => return None,
         })
     }
@@ -258,6 +280,23 @@ pub struct ObserveParams {
     pub history_lines: u32,
 }
 
+/// `BlobGet` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRequest {
+    /// Lowercase hex SHA-256 of the blob.
+    pub id: String,
+}
+
+/// `BlobHead` payload: the answer to a [`BlobRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobHead {
+    pub id: String,
+    pub mime: Option<String>,
+    /// The blob's size, which `BlobData` frames carry in full; `None`: the daemon holds no
+    /// such blob (and nothing follows).
+    pub len: Option<u64>,
+}
+
 /// A session's terminal grid as observers see it (`Resized` payload): cells plus cell pixels
 /// (0 when no controller reported them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +371,10 @@ pub struct HostInfo {
     /// or an older daemon).
     #[serde(default)]
     pub tsp_facts: Option<crate::run_state::TspFacts>,
+    /// The daemon answers [`Kind::BlobGet`] (older daemons close the connection on the unknown
+    /// kind, so a client asks only when this is set).
+    #[serde(default)]
+    pub blob_fetch: bool,
 }
 
 #[cfg(test)]

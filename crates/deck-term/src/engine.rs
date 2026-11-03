@@ -133,6 +133,11 @@ struct Serve {
     end: Option<OutputEvent>,
     /// The expiry timer runs (see [`Engine::arm_expiry`]).
     expiry_armed: bool,
+    /// Blob messages (`b` APC strings) for the subscribers, waiting for the stream to be
+    /// between sequences (see [`Engine::insert_blob`]).
+    blobs: VecDeque<Arc<[u8]>>,
+    /// Numbers the chunk sequences of those messages.
+    blob_seq: u64,
 }
 
 impl Serve {
@@ -184,6 +189,8 @@ impl Engine {
             pending: Vec::new(),
             end: None,
             expiry_armed: false,
+            blobs: VecDeque::new(),
+            blob_seq: 0,
         });
         Arc::new_cyclic(|me| Engine {
             term,
@@ -260,7 +267,80 @@ impl Engine {
                 broadcast(&mut s.subs, &OutputEvent::Output(output));
             }
         }
+        if publish {
+            Self::flush_blobs(inner);
+        }
         self.listener.send_event(Event::Wakeup);
+    }
+    /// Sends the queued blob messages to the subscribers once the stream they share is between
+    /// sequences (an APC string inside another sequence would corrupt it), the owner's
+    /// mirror is between messages and no join waits.
+    fn flush_blobs(inner: &mut Inner) {
+        let Inner {
+            parser,
+            scan,
+            serve,
+        } = inner;
+        let Some(s) = serve else { return };
+        while !s.blobs.is_empty()
+            && s.pending.is_empty()
+            && s.ground.is_ground()
+            && scan.tsp_idle()
+            && !syncing(parser)
+        {
+            if let Some(bytes) = s.blobs.pop_front() {
+                broadcast(&mut s.subs, &OutputEvent::Output(bytes));
+            }
+        }
+    }
+
+    /// A blob the session host supplied for the TSP mirror after it was sent (see
+    /// `RemoteEvent::Blob`): stored in the mirror at once (`false`: its bytes do not hash to
+    /// `id`), and, for an owner, passed to the subscribers as the `b` message the program
+    /// would have sent, so frontends that joined earlier (their own mirrors only see the
+    /// stream) hold it too. Hashing and encoding happen outside the engine lock.
+    pub(crate) fn insert_blob(&self, id: &str, mime: Option<String>, bytes: Vec<u8>) -> bool {
+        if bytes.len() > deck_tsp::document::MAX_BLOB || deck_tsp::document::blob_id(&bytes) != id {
+            return false;
+        }
+        let bytes: Arc<[u8]> = bytes.into();
+        let encode = |seq: u64| {
+            deck_tsp::document::encode_blob(mime.as_deref(), &bytes, &format!("blob{seq}"))
+        };
+        let seq = {
+            let mut inner = self.lock();
+            inner
+                .serve
+                .as_mut()
+                .filter(|s| !s.subs.is_empty())
+                .map(|s| {
+                    s.blob_seq += 1;
+                    s.blob_seq
+                })
+        };
+        let mut message = seq.map(encode);
+        let mut inner = self.lock();
+        if !inner.scan.tsp_put_blob(id, mime.clone(), bytes.clone()) {
+            return false;
+        }
+        if let Some(s) = inner.serve.as_mut() {
+            // A subscriber that joined since the check above has a snapshot without the blob.
+            if message.is_none() && !s.subs.is_empty() {
+                s.blob_seq += 1;
+                message = Some(encode(s.blob_seq));
+            }
+            if let Some(message) = message {
+                s.blobs.push_back(Arc::from(message));
+            }
+        }
+        Self::flush_blobs(&mut inner);
+        self.listener.send_event(Event::Wakeup);
+        true
+    }
+
+    /// The session host holds no blob `id`: the mirror stops asking for it.
+    pub(crate) fn forget_blob(&self, id: &str) {
+        self.lock().scan.tsp_forget_blob(id);
     }
 
     /// Whether a subscriber can join now (`None`: not an owner). An abandoned chunk sequence
@@ -378,6 +458,7 @@ impl Engine {
             s.ground = GroundTracker::default();
             s.prefix = Vec::new();
             s.prefix_lost = false;
+            s.blobs.clear();
         }
         for chunk in bytes.chunks(MAX_LOCKED) {
             self.parse(&mut inner, chunk, false);

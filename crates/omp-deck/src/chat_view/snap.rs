@@ -35,6 +35,10 @@ pub struct SNode {
     pub gen_: u64,
     /// Fingerprint of the whole subtree (every `gen_`, the order of every child list).
     pub sub: u64,
+    /// Pre-order index of the node in the surface (`main` first, then `dock`, `layer`): the
+    /// total document order of the transcript's text runs. Valid for the revision of the sync
+    /// that set it; renumbered on every sync, so only compare it within one frame.
+    pub ord: u32,
     seen: u64,
 }
 
@@ -116,9 +120,13 @@ pub struct Snap {
     pub sf: String,
     nodes: HashMap<String, SNode>,
     blobs: HashMap<String, BlobBytes>,
+    /// Node ids in pre-order: `order[n.ord]` is `n.id` (refilled in place by every sync).
+    order: Vec<String>,
     next_gen: u64,
     /// Counts sync passes; a node not touched by the latest one is gone.
     pass: u64,
+    /// Next pre-order index while a sync walks the tree.
+    next_ord: usize,
     /// Bumped whenever the copy starts over: the first surface, another one replacing it, or the
     /// terminal replacing the whole document (a restart or a full replay of the session). The
     /// transcript follows the end again.
@@ -171,6 +179,7 @@ impl Snap {
         let Some(surface) = session_surface(doc) else {
             let had = !self.nodes.is_empty();
             self.nodes.clear();
+            self.order.clear();
             self.blobs.clear();
             self.sf.clear();
             if replaced {
@@ -186,7 +195,9 @@ impl Snap {
         self.focus = surface.focus().map(str::to_owned);
         self.pass += 1;
         let root = surface.root();
+        self.next_ord = 0;
         self.sync_node(doc, root, None);
+        self.order.truncate(self.next_ord);
         let pass = self.pass;
         self.nodes.retain(|_, n| n.seen == pass);
         // Blobs of images that are gone go with them.
@@ -227,6 +238,7 @@ impl Snap {
                     changed: n.changed_at(),
                     gen_: self.next_gen,
                     sub: 0,
+                    ord: 0,
                     seen: 0,
                 },
             );
@@ -236,6 +248,7 @@ impl Snap {
         let mut blob = None;
         if let Some(node) = self.nodes.get_mut(id) {
             node.seen = pass;
+            node.ord = self.next_ord as u32;
             if node.parent.as_deref() != parent {
                 node.parent = parent.map(str::to_owned);
             }
@@ -247,6 +260,15 @@ impl Snap {
             }
             sub = mix(node.gen_, node.children.len() as u64);
         }
+        match self.order.get_mut(self.next_ord) {
+            Some(slot) => {
+                if slot != id {
+                    id.clone_into(slot);
+                }
+            }
+            None => self.order.push(id.to_owned()),
+        }
+        self.next_ord += 1;
         if let Some(blob) = blob
             && !self.blobs.contains_key(&blob)
             && let Some(b) = doc.blob(&blob)
@@ -254,7 +276,7 @@ impl Snap {
             self.blobs.insert(
                 blob,
                 BlobBytes {
-                    bytes: b.bytes.as_slice().into(),
+                    bytes: Arc::clone(&b.bytes),
                 },
             );
         }
@@ -270,6 +292,16 @@ impl Snap {
 
     pub fn get(&self, id: &str) -> Option<&SNode> {
         self.nodes.get(id)
+    }
+
+    /// The id of the node at pre-order index `ord` (see [`SNode::ord`]).
+    pub fn id_at(&self, ord: u32) -> Option<&str> {
+        self.order.get(ord as usize).map(String::as_str)
+    }
+
+    /// How many nodes the surface has (the length of the pre-order).
+    pub fn node_count(&self) -> usize {
+        self.order.len()
     }
 
     pub fn parent_of(&self, id: &str) -> Option<&SNode> {
@@ -302,6 +334,13 @@ impl Snap {
     /// The first descendant of `n` whose `role` is exactly `role`.
     pub fn by_role<'a>(&'a self, n: &'a SNode, role: &str) -> Option<&'a SNode> {
         self.find(n, &|c| c.role() == role)
+    }
+
+    /// Whether a turn runs: the dock shows the working row (role `omp.working`), the same signal
+    /// the Stop control hangs off.
+    pub fn busy(&self) -> bool {
+        self.region("dock")
+            .is_some_and(|d| self.by_role(d, "omp.working").is_some())
     }
 
     pub fn blob(&self, id: &str) -> Option<&BlobBytes> {
@@ -339,7 +378,15 @@ pub(crate) mod tests {
 
     /// Feeds program messages `range` (counted over the fixture's `out` lines) into `m`.
     pub(crate) fn feed_fixture(m: &mut Mirror, range: std::ops::Range<usize>) {
+        for wire in fixture_wire(range) {
+            m.feed(&wire, Instant::now());
+        }
+    }
+
+    /// Program messages `range` (counted over the fixture's `out` lines) as wire bytes.
+    pub(crate) fn fixture_wire(range: std::ops::Range<usize>) -> Vec<Vec<u8>> {
         let mut taken = 0;
+        let mut wire = Vec::new();
         for line in FIXTURE.lines() {
             let v: Value = serde_json::from_str(line).expect("fixture line is JSON");
             if v["dir"] != "out" {
@@ -373,8 +420,9 @@ pub(crate) mod tests {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             let body = serde_json::to_vec(&v["body"]).expect("body JSON");
-            m.feed(&encode_message(verb, &refs, &body), Instant::now());
+            wire.push(encode_message(verb, &refs, &body));
         }
+        wire
     }
 
     #[test]

@@ -47,15 +47,43 @@ pub fn rewrite_raw_input(raw: &mut egui::RawInput, clipboard: &Clipboard) {
     rewrite_events(&mut raw.events, || clipboard.get_text());
 }
 
-/// After each frame: widget copies (`OutputCommand::CopyText`) go to the system clipboard.
-pub fn forward_copies(ctx: &egui::Context, clipboard: &Clipboard) {
-    ctx.output(|o| {
-        for cmd in &o.commands {
+/// Sends `OutputCommand::CopyText` to the system clipboard.
+///
+/// It is an egui plugin acting on the finished frame's output, because some copies are only
+/// issued while the pass ends: a selection in labels (the chat transcript) is copied by egui's
+/// own end-of-pass step, after the app's `ui` has returned.
+struct CopyOutput {
+    sink: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl egui::Plugin for CopyOutput {
+    fn debug_name(&self) -> &'static str {
+        "CopyOutput"
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        for cmd in &output.platform_output.commands {
             if let OutputCommand::CopyText(text) = cmd {
-                clipboard.set_text(text);
+                (self.sink)(text);
             }
         }
+    }
+}
+
+/// Routes widget copies (`OutputCommand::CopyText`) to `clipboard`, from now on. Call once, when
+/// the egui context is created; a second call keeps the first sink.
+pub fn install(ctx: &egui::Context, clipboard: &Clipboard) {
+    let clipboard = clipboard.clone();
+    install_with(ctx, move || {
+        let clipboard = clipboard.clone();
+        Box::new(move |text| clipboard.set_text(text))
     });
+}
+
+fn install_with(ctx: &egui::Context, sink: impl FnOnce() -> Box<dyn Fn(&str) + Send + Sync>) {
+    if ctx.plugin_opt::<CopyOutput>().is_none() {
+        ctx.add_plugin(CopyOutput { sink: sink() });
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +144,23 @@ mod tests {
         let mut ev = vec![Event::Text("x".into())];
         rewrite_events(&mut ev, || panic!("must not read clipboard"));
         assert_eq!(ev, vec![Event::Text("x".into())]);
+    }
+
+    #[test]
+    fn copies_issued_in_any_pass_reach_the_clipboard_once() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let seen = Arc::clone(&seen);
+            install_with(&ctx, move || {
+                Box::new(move |t| seen.lock().expect("test mutex").push(t.to_owned()))
+            });
+        }
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().copy_text("hello".to_owned());
+        });
+        out.textures_delta.clear();
+        assert_eq!(*seen.lock().expect("test mutex"), ["hello"]);
     }
 }

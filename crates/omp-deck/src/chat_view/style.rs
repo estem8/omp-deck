@@ -101,6 +101,15 @@ impl Ink {
         }
     }
 
+    /// [`Ink::tone`] for a glyph or line drawn thin on the card: the accent tones keep the
+    /// contrast floor of [`Ink::accent_text`] (the plain accent is pale on light styles).
+    pub fn glyph_tone(&self, tone: &str) -> Color32 {
+        match tone {
+            "accent" | "info" => self.accent_text(),
+            t => self.tone(t),
+        }
+    }
+
     pub fn text(&self) -> Color32 {
         self.p.text
     }
@@ -264,6 +273,16 @@ mod tests {
         assert_eq!(ink.tone("user"), ink.a);
         assert_eq!(ink.tone("neutral"), ink.p.text);
         assert_eq!(ink.tone("no-such-tone"), ink.p.text);
+    }
+
+    #[test]
+    fn glyph_tones_keep_the_accent_contrast_floor_and_other_tones_are_unchanged() {
+        let ink = ink();
+        assert_eq!(ink.glyph_tone("accent"), ink.accent_text());
+        assert_eq!(ink.glyph_tone("info"), ink.accent_text());
+        for t in ["success", "error", "warning", "muted", "user", "neutral"] {
+            assert_eq!(ink.glyph_tone(t), ink.tone(t), "{t}");
+        }
     }
 
     #[test]

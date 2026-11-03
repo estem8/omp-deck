@@ -6,7 +6,9 @@
 //! of the galley's text), code blocks and tables are framed cards with cut corners and an accent
 //! hairline, everything is coloured from [`Ink`] only.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use egui::epaint::text::VariationCoords;
@@ -18,12 +20,15 @@ use egui::{
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd, TextMergeStream,
 };
+use serde_json::Value;
 
 use super::ctx::{Cx, Tx};
+use super::highlight;
 use super::render::{self, Link};
 use super::snap::SNode;
 use super::style::{Ink, LABEL, PROSE, PROSE_LINE};
 use super::text::{self, Base};
+use super::tsel::{Lead, RunOpts, Sep};
 use super::{glyphs, paint};
 use crate::{deco, theme};
 
@@ -56,6 +61,107 @@ const DIM: u8 = 32;
 struct Run {
     text: String,
     marks: u8,
+    /// Style tokens of a prompt chip (a `marks` entry of the node); the run is drawn as a chip.
+    chip: Option<Arc<str>>,
+}
+
+/// A chip token of a sent prompt: every occurrence of `t` in the text is drawn as a chip styled by
+/// the tokens `s` (omp's `tokenMarks`: skills, mentions, references).
+#[derive(Debug, Clone, PartialEq)]
+struct Mark {
+    t: String,
+    s: Arc<str>,
+}
+
+/// The usable entries of a node's `marks` prop.
+fn marks_of(raw: &[Value]) -> Vec<Mark> {
+    raw.iter()
+        .filter_map(|m| {
+            let t = m
+                .get("t")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())?;
+            let s = m.get("s").and_then(Value::as_str).unwrap_or("");
+            Some(Mark {
+                t: t.to_owned(),
+                s: s.into(),
+            })
+        })
+        .collect()
+}
+
+/// A cheap fingerprint of a node's `marks` prop: the count and the byte lengths of its tokens, no
+/// hashing (a changed generation already says the node changed; this guards a reused one).
+fn marks_sig(raw: &[Value]) -> u64 {
+    raw.iter().fold(raw.len() as u64, |acc, m| {
+        ["t", "s"].iter().fold(acc, |a, k| {
+            let len = m.get(k).and_then(Value::as_str).map_or(0, str::len);
+            a.wrapping_mul(31).wrapping_add(len as u64 + 1)
+        })
+    })
+}
+
+/// Appends `text` as a run of `marks`, joined to the last run when that is the same look.
+fn push_run(runs: &mut Vec<Run>, text: &str, marks: u8) {
+    match runs.last_mut() {
+        Some(r) if r.marks == marks && r.chip.is_none() => r.text.push_str(text),
+        _ => runs.push(Run {
+            text: text.to_owned(),
+            marks,
+            chip: None,
+        }),
+    }
+}
+
+/// Appends `seg` (runs of plain text) to `out` with the occurrences of `marks` in their
+/// concatenated text as chip runs; the rest keeps the runs' looks.
+fn chip_runs(out: &mut Vec<Run>, seg: &[Run], marks: &[Mark]) {
+    let text: String = seg.iter().map(|r| r.text.as_str()).collect();
+    let mut starts = Vec::with_capacity(seg.len() + 1);
+    let mut end = 0;
+    for r in seg {
+        starts.push(end);
+        end += r.text.len();
+    }
+    starts.push(end);
+    let plain = |out: &mut Vec<Run>, from: usize, to: usize| {
+        for (r, w) in seg.iter().zip(starts.windows(2)) {
+            let (a, b) = (w[0].max(from), w[1].min(to));
+            if a < b {
+                push_run(out, &text[a..b], r.marks);
+            }
+        }
+    };
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let hit = marks
+            .iter()
+            .filter_map(|m| rest.find(m.t.as_str()).map(|i| (i, m)))
+            .min_by_key(|(i, m)| (*i, std::cmp::Reverse(m.t.len())));
+        let Some((i, m)) = hit else {
+            plain(out, at, text.len());
+            return;
+        };
+        plain(out, at, at + i);
+        let from = at + i;
+        let k = starts
+            .partition_point(|&s| s <= from)
+            .saturating_sub(1)
+            .min(seg.len() - 1);
+        out.push(Run {
+            text: m.t.clone(),
+            marks: seg[k].marks,
+            chip: Some(Arc::clone(&m.s)),
+        });
+        at = from + m.t.len();
+    }
+}
+
+fn hash_of(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// A line of styled runs; `links` are char ranges of the runs' concatenated text.
@@ -73,12 +179,34 @@ impl Inline {
             return;
         }
         self.len += text.chars().count();
-        match self.runs.last_mut() {
-            Some(r) if r.marks == marks => r.text.push_str(text),
-            _ => self.runs.push(Run {
-                text: text.to_owned(),
-                marks,
-            }),
+        push_run(&mut self.runs, text, marks);
+    }
+
+    /// Draws every occurrence of a mark as a chip (the earliest match wins, the longest one on a
+    /// tie). Matches the text of the whole line, so a token that emphasis split into several
+    /// runs (`@pkg/__init__.py`) is still found; code and links are left alone.
+    fn apply_marks(&mut self, marks: &[Mark]) {
+        if marks.is_empty() {
+            return;
+        }
+        let open = |r: &Run| r.chip.is_none() && r.marks & (CODE | LINK) == 0;
+        let old = std::mem::take(&mut self.runs);
+        let mut i = 0;
+        while i < old.len() {
+            let end = if open(&old[i]) {
+                old[i..]
+                    .iter()
+                    .position(|r| !open(r))
+                    .map_or(old.len(), |p| i + p)
+            } else {
+                i + 1
+            };
+            if open(&old[i]) {
+                chip_runs(&mut self.runs, &old[i..end], marks);
+            } else {
+                self.runs.extend_from_slice(&old[i..end]);
+            }
+            i = end;
         }
     }
 
@@ -115,7 +243,7 @@ impl Inline {
     fn job(&self, ink: &Ink, base: &Base, bold: bool, caret: Option<Color32>) -> LayoutJob {
         let mut job = LayoutJob::default();
         for r in &self.runs {
-            job.append(&r.text, 0.0, run_format(ink, base, r.marks, bold));
+            job.append(&r.text, 0.0, run_format(ink, base, r, bold));
         }
         if let Some(c) = caret {
             job.append(" ", 0.0, caret_format(base, c));
@@ -149,8 +277,11 @@ enum Block {
     Code {
         lang: String,
         text: String,
-        /// Key of the Copy button's feedback in `Local.copied` (and the scroll area's id).
+        /// Key of the Copy button's feedback in `Local.copied` (and the scroll area's id, and of
+        /// the highlight).
         id: String,
+        /// Fingerprint of `text`: the generation of its highlight.
+        hash: u64,
     },
     Rule,
     Table(Table),
@@ -162,6 +293,8 @@ struct Doc {
     blocks: Vec<Block>,
     /// Byte length of the source (a cheap guard against a caller reusing a generation).
     src_len: usize,
+    /// Fingerprint of the `marks` the text was parsed with.
+    marks_sig: u64,
 }
 
 /// Parsed documents by node id (or the caller's key), valid for one generation.
@@ -171,17 +304,19 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn doc(&mut self, key: &str, gen_: u64, text: &str) -> Arc<Doc> {
+    fn doc(&mut self, key: &str, gen_: u64, text: &str, marks: &[Value]) -> Arc<Doc> {
+        let sig = marks_sig(marks);
         if let Some((g, d)) = self.docs.get(key)
             && *g == gen_
             && d.src_len == text.len()
+            && d.marks_sig == sig
         {
             return Arc::clone(d);
         }
         if self.docs.len() >= MAX_DOCS {
             self.docs.clear();
         }
-        let doc = Arc::new(parse(key, text));
+        let doc = Arc::new(parse_doc(key, text, marks));
         self.docs.insert(key.to_owned(), (gen_, Arc::clone(&doc)));
         doc
     }
@@ -189,16 +324,66 @@ impl Cache {
 
 // ---- parsing --------------------------------------------------------------------------------
 
-fn parse(key: &str, src: &str) -> Doc {
+/// The source with the occurrences of the marks backslash-escaped when a token holds a markdown
+/// delimiter (`@pkg/__init__.py`): the parser then keeps the token whole instead of reading
+/// `__init__` as emphasis. Occurrences inside code are left as written.
+fn protect_marks<'a>(src: &'a str, marks: &[Mark], opts: Options) -> Cow<'a, str> {
+    const DELIMS: &[char] = &[
+        '*', '_', '~', '`', '[', ']', '<', '>', '&', '\\', '!', '#', '|',
+    ];
+    if !marks.iter().any(|m| m.t.contains(DELIMS)) {
+        return Cow::Borrowed(src);
+    }
+    let mut code: Vec<std::ops::Range<usize>> = Vec::new();
+    for (ev, range) in Parser::new_ext(src, opts).into_offset_iter() {
+        if matches!(ev, Event::Code(_) | Event::Start(Tag::CodeBlock(_))) {
+            code.push(range);
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut at = 0;
+    while at < src.len() {
+        let rest = &src[at..];
+        let hit = marks
+            .iter()
+            .filter_map(|m| rest.find(m.t.as_str()).map(|i| (i, m)))
+            .min_by_key(|(i, m)| (*i, std::cmp::Reverse(m.t.len())));
+        let Some((i, m)) = hit else {
+            out.push_str(rest);
+            break;
+        };
+        let from = at + i;
+        out.push_str(&src[at..from]);
+        if code.iter().any(|r| r.contains(&from)) {
+            let step = rest[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&src[from..from + step]);
+            at = from + step;
+            continue;
+        }
+        for c in m.t.chars() {
+            if c.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        at = from + m.t.len();
+    }
+    Cow::Owned(out)
+}
+
+fn parse_doc(key: &str, src: &str, marks: &[Value]) -> Doc {
     let clean = text::clean(src);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut b = Builder::new(key);
+    let list = marks_of(marks);
+    let clean = protect_marks(&clean, &list, opts);
+    let mut b = Builder::new(key, list);
     for ev in TextMergeStream::new(Parser::new_ext(&clean, opts)) {
         b.event(ev);
     }
     Doc {
         blocks: b.finish(),
         src_len: src.len(),
+        marks_sig: marks_sig(marks),
     }
 }
 
@@ -284,6 +469,7 @@ struct TableAcc {
 
 struct Builder {
     key: String,
+    marks: Arc<[Mark]>,
     frames: Vec<Frame>,
     /// Containers beyond [`MAX_NEST`] (and everything nested in them) that were not pushed.
     skip: usize,
@@ -294,9 +480,10 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(key: &str) -> Builder {
+    fn new(key: &str, marks: Vec<Mark>) -> Builder {
         Builder {
             key: key.to_owned(),
+            marks: marks.into(),
             frames: vec![Frame::Root(Vec::new())],
             skip: 0,
             acc: None,
@@ -368,6 +555,7 @@ impl Builder {
         let Some(mut acc) = self.acc.take() else {
             return;
         };
+        acc.inline.apply_marks(&self.marks);
         acc.inline.trim_end();
         match acc.kind {
             AccKind::Para => {
@@ -542,7 +730,13 @@ impl Builder {
                     }
                     let id = format!("md:{}:{}", self.key, self.n_code);
                     self.n_code += 1;
-                    self.push_block(Block::Code { lang, text, id });
+                    let hash = hash_of(&text);
+                    self.push_block(Block::Code {
+                        lang,
+                        text,
+                        id,
+                        hash,
+                    });
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -718,20 +912,31 @@ fn url_ranges(s: &str) -> Vec<(usize, usize)> {
 pub fn show(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let text = n.str("text").unwrap_or("");
     let stream = n.flag("stream");
+    let marks = n.arr("marks");
     match n.tone() {
         Some(t) if t != "neutral" => {
             let mut tx = cx.tx();
             tx.color = cx.ink.tone(t);
-            cx.with_tx(tx, || show_text(cx, ui, &n.id, n.gen_, text, stream));
+            cx.with_tx(tx, || {
+                show_text(cx, ui, &n.id, n.gen_, text, marks, stream);
+            });
         }
-        _ => show_text(cx, ui, &n.id, n.gen_, text, stream),
+        _ => show_text(cx, ui, &n.id, n.gen_, text, marks, stream),
     }
 }
 
-/// Markdown `text` under the caller's cache `key` (valid for generation `gen_`). `stream` draws the
-/// blinking caret at the end and keeps the frame animating.
-pub fn show_text(cx: &Cx, ui: &mut Ui, key: &str, gen_: u64, text: &str, stream: bool) {
-    let doc = cx.loc(|l| l.md.doc(key, gen_, text));
+/// Markdown `text` under the caller's cache `key` (valid for generation `gen_`), its `marks`
+/// drawn as chips. `stream` draws the blinking caret at the end and keeps the frame animating.
+pub fn show_text(
+    cx: &Cx,
+    ui: &mut Ui,
+    key: &str,
+    gen_: u64,
+    text: &str,
+    marks: &[Value],
+    stream: bool,
+) {
+    let doc = cx.loc(|l| l.md.doc(key, gen_, text, marks));
     if doc.blocks.is_empty() && !stream {
         return;
     }
@@ -739,7 +944,7 @@ pub fn show_text(cx: &Cx, ui: &mut Ui, key: &str, gen_: u64, text: &str, stream:
     let caret = if stream { stream_caret(cx, ui) } else { None };
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let used = blocks(cx, ui, &look, 0, &doc.blocks, caret, false);
+        let used = blocks(cx, ui, &look, 0, &doc.blocks, caret, Flow::LOOSE);
         if let Some(c) = caret
             && !used
         {
@@ -794,7 +999,8 @@ impl Look {
 }
 
 /// Format of a run of `marks` on top of `base`.
-fn run_format(ink: &Ink, base: &Base, marks: u8, bold: bool) -> TextFormat {
+fn run_format(ink: &Ink, base: &Base, run: &Run, bold: bool) -> TextFormat {
+    let marks = run.marks;
     let mut f = base.format_plain();
     if (bold || marks & BOLD != 0) && marks & CODE == 0 {
         f.color = ink.strong();
@@ -818,7 +1024,24 @@ fn run_format(ink: &Ink, base: &Base, marks: u8, bold: bool) -> TextFormat {
     if marks & STRIKE != 0 {
         f.strikethrough = Stroke::new(1.0, f.color);
     }
+    if let Some(tokens) = &run.chip {
+        let c = chip_color(ink, tokens);
+        f.color = c;
+        f.background = theme::mix(ink.wash(c), c, 0.16);
+        f.expand_bg = 3.0;
+        f.coords = VariationCoords::new([("wght", 640.0_f32)]);
+    }
     f
+}
+
+/// Colour of a chip: the last colouring token of its style (`strong` only sets the weight).
+fn chip_color(ink: &Ink, tokens: &str) -> Color32 {
+    tokens
+        .split_whitespace()
+        .filter(|t| *t != "strong")
+        .filter_map(|t| text::span_style(ink, t).color)
+        .next_back()
+        .unwrap_or(ink.a)
 }
 
 /// The caret: one space wide block of `c` (the glyph itself is invisible).
@@ -834,7 +1057,7 @@ fn caret_line(cx: &Cx, ui: &mut Ui, look: &Look, c: Color32) {
     let base = look.base(cx.ink, 1.0, look.color, PROSE_LINE);
     let mut job = LayoutJob::default();
     job.append(" ", 0.0, caret_format(&base, c));
-    render::para(ui, job, look.color, &[]);
+    render::para(cx, ui, job, look.color, &[], RunOpts::INERT);
 }
 
 // ---- blocks ---------------------------------------------------------------------------------
@@ -859,6 +1082,21 @@ fn gap(look: &Look, prev: &Block, next: &Block, tight: bool) -> f32 {
     }
 }
 
+/// How a run of blocks follows each other: packed (a list item's) or spaced, and the list marker
+/// the first block carries in a copy.
+#[derive(Clone, Copy)]
+struct Flow {
+    tight: bool,
+    lead: Lead,
+}
+
+impl Flow {
+    const LOOSE: Flow = Flow {
+        tight: false,
+        lead: Lead::None,
+    };
+}
+
 /// Draws `bs` stacked; `caret` (the streaming caret) goes to the end of the last block. Returns
 /// whether the caret was drawn.
 fn blocks(
@@ -868,15 +1106,20 @@ fn blocks(
     ld: usize,
     bs: &[Block],
     caret: Option<Color32>,
-    tight: bool,
+    flow: Flow,
 ) -> bool {
     let mut used = false;
     for (i, b) in bs.iter().enumerate() {
         if i > 0 {
-            ui.add_space(gap(look, &bs[i - 1], b, tight));
+            ui.add_space(gap(look, &bs[i - 1], b, flow.tight));
         }
         let last = i + 1 == bs.len();
-        let u = block(cx, ui, look, ld, b, if last { caret } else { None });
+        let opts = RunOpts::sep(if flow.tight { Sep::Line } else { Sep::Block }).lead(if i == 0 {
+            flow.lead
+        } else {
+            Lead::None
+        });
+        let u = block(cx, ui, look, ld, b, if last { caret } else { None }, opts);
         if last {
             used = u;
         }
@@ -884,7 +1127,15 @@ fn blocks(
     used
 }
 
-fn block(cx: &Cx, ui: &mut Ui, look: &Look, ld: usize, b: &Block, caret: Option<Color32>) -> bool {
+fn block(
+    cx: &Cx,
+    ui: &mut Ui,
+    look: &Look,
+    ld: usize,
+    b: &Block,
+    caret: Option<Color32>,
+    opts: RunOpts,
+) -> bool {
     let ink = cx.ink;
     match b {
         Block::Para(inl) => {
@@ -893,7 +1144,7 @@ fn block(cx: &Cx, ui: &mut Ui, look: &Look, ld: usize, b: &Block, caret: Option<
             if job.is_empty() {
                 return false;
             }
-            let (_, url) = render::para(ui, job, look.color, &inl.links);
+            let (_, url) = render::para(cx, ui, job, look.color, &inl.links, opts);
             if let Some(u) = url {
                 cx.open(u);
             }
@@ -905,7 +1156,7 @@ fn block(cx: &Cx, ui: &mut Ui, look: &Look, ld: usize, b: &Block, caret: Option<
             let color = if dim { ink.dim() } else { ink.strong() };
             let base = look.base(ink, HEADING_K[l - 1], color, HEADING_LINE);
             let job = inl.job(ink, &base, true, caret);
-            let (_, url) = render::para(ui, job, color, &inl.links);
+            let (_, url) = render::para(cx, ui, job, color, &inl.links, opts);
             if let Some(u) = url {
                 cx.open(u);
             }
@@ -931,8 +1182,13 @@ fn block(cx: &Cx, ui: &mut Ui, look: &Look, ld: usize, b: &Block, caret: Option<
         }
         Block::List { start, items } => list(cx, ui, look, ld, *start, items, caret),
         Block::Quote(bs) => quote(cx, ui, look, ld, bs, caret),
-        Block::Code { lang, text, id } => {
-            code_block(cx, ui, lang, text, id, caret);
+        Block::Code {
+            lang,
+            text,
+            id,
+            hash,
+        } => {
+            code_block(cx, ui, (lang, *hash), text, id, caret);
             caret.is_some()
         }
         Block::Rule => {
@@ -998,6 +1254,11 @@ fn list(
         } else {
             look.clone()
         };
+        let lead = match (item.task, start) {
+            (Some(done), _) => Lead::Task(done),
+            (None, Some(s)) => Lead::Num(s.saturating_add(i as u64)),
+            (None, None) => Lead::Bullet,
+        };
         let r = ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let (m, _) = ui.allocate_exact_size(vec2(indent + mw, line_h), Sense::hover());
@@ -1034,7 +1295,7 @@ fn list(
                     ld + 1,
                     &item.blocks,
                     if last { caret } else { None },
-                    true,
+                    Flow { tight: true, lead },
                 )
             })
             .inner
@@ -1103,7 +1364,7 @@ fn quote(
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(4.0);
-            let used = blocks(cx, ui, &inner, ld, bs, caret, false);
+            let used = blocks(cx, ui, &inner, ld, bs, caret, Flow::LOOSE);
             ui.add_space(4.0);
             used
         })
@@ -1136,7 +1397,14 @@ fn quote(
 
 // ---- code blocks ----------------------------------------------------------------------------
 
-fn code_block(cx: &Cx, ui: &mut Ui, lang: &str, code: &str, id: &str, caret: Option<Color32>) {
+fn code_block(
+    cx: &Cx,
+    ui: &mut Ui,
+    (lang, hash): (&str, u64),
+    code: &str,
+    id: &str,
+    caret: Option<Color32>,
+) {
     let ink = cx.ink;
     let painter = ui.painter().clone();
     let bg = paint::reserve(&painter);
@@ -1196,7 +1464,7 @@ fn code_block(cx: &Cx, ui: &mut Ui, lang: &str, code: &str, id: &str, caret: Opt
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            code_text(cx, ui, id, code, caret);
+            code_text(cx, ui, (lang, hash), id, code, caret);
         });
 
     let total = Rect::from_min_max(top_left, pos2(top_left.x + w, body.response.rect.bottom()));
@@ -1213,15 +1481,33 @@ fn code_block(cx: &Cx, ui: &mut Ui, lang: &str, code: &str, id: &str, caret: Opt
     );
 }
 
-/// The code as unwrapped mono text; a horizontal scroll area only when a line is too long.
-fn code_text(cx: &Cx, ui: &mut Ui, id: &str, code: &str, caret: Option<Color32>) {
+/// The code as unwrapped mono text with syntax colours (once the worker has them); a horizontal
+/// scroll area only when a line is too long.
+fn code_text(
+    cx: &Cx,
+    ui: &mut Ui,
+    (lang, hash): (&str, u64),
+    id: &str,
+    code: &str,
+    caret: Option<Color32>,
+) {
     let ink = cx.ink;
     let font = ink.mono(1.0);
     let line = font.size * 1.5;
     let mut fmt = TextFormat::simple(font, ink.text());
     fmt.line_height = Some(line);
+    let hl = if lang.is_empty() {
+        None
+    } else {
+        cx.loc(|l| {
+            l.hl.get(ui.ctx(), id, hash, || {
+                highlight::source_of_text(lang, "", code)
+            })
+        })
+    };
+    let colors = highlight::colors(ui.ctx(), ink, ink.card());
     let mut job = LayoutJob::default();
-    job.append(code, 0.0, fmt.clone());
+    highlight::push_text(&mut job, code, hl.as_ref(), &colors, &fmt);
     if let Some(c) = caret {
         fmt.color = Color32::TRANSPARENT;
         fmt.background = c;
@@ -1231,30 +1517,20 @@ fn code_text(cx: &Cx, ui: &mut Ui, id: &str, code: &str, caret: Option<Color32>)
     let galley = ui.painter().layout_job(job);
     let color = ink.text();
     if galley.size().x <= ui.available_width() + 0.5 {
-        code_galley(ui, galley, color, line);
+        code_galley(cx, ui, galley, color, line);
     } else {
         ScrollArea::horizontal()
             .id_salt(Id::unique(id))
             .auto_shrink([false, true])
-            .show(ui, |ui| code_galley(ui, galley, color, line));
+            .show(ui, |ui| code_galley(cx, ui, galley, color, line));
     }
 }
 
-fn code_galley(ui: &mut Ui, galley: Arc<egui::Galley>, color: Color32, min_h: f32) {
-    let mut sense = Sense::click_and_drag();
-    sense -= Sense::FOCUSABLE;
+fn code_galley(cx: &Cx, ui: &mut Ui, galley: Arc<egui::Galley>, color: Color32, min_h: f32) {
     let size = galley.size().max(vec2(1.0, min_h));
-    let (rect, resp) = ui.allocate_exact_size(size, sense);
-    if ui.is_rect_visible(rect) {
-        egui::text_selection::LabelSelectionState::label_text_selection(
-            ui,
-            &resp,
-            rect.min,
-            galley,
-            color,
-            Stroke::NONE,
-        );
-    }
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let seq = cx.seqs(ui, 1);
+    cx.text_run(ui, seq, &galley, rect.min, color, RunOpts::BLOCK);
 }
 
 fn copy_button(cx: &Cx, ui: &mut Ui, id: &str, code: &str) {
@@ -1417,7 +1693,15 @@ fn table(cx: &Cx, ui: &mut Ui, look: &Look, t: &Table) {
     let total_w: f32 = widths.iter().sum();
     let total_h: f32 = heights.iter().sum();
     let (rect, _) = ui.allocate_exact_size(vec2(total_w, total_h), Sense::hover());
-    if !ui.is_rect_visible(rect) {
+    if !cx.visible(ui, rect) {
+        // The cells are runs even when nothing of them is on screen: number them all.
+        let cells = std::iter::once(&t.head)
+            .filter(|_| has_head)
+            .chain(t.rows.iter())
+            .flat_map(|r| r.iter().take(cols))
+            .filter(|inl| !inl.is_empty())
+            .count();
+        cx.seqs(ui, u32::try_from(cells).unwrap_or(u32::MAX));
         return;
     }
 
@@ -1498,7 +1782,9 @@ fn table(cx: &Cx, ui: &mut Ui, look: &Look, t: &Table) {
                         .max_rect(cell)
                         .layout(Layout::top_down(align)),
                 );
-                let (_, url) = render::para(&mut child, job, color, &inl.links);
+                let sep = if c == 0 { Sep::Line } else { Sep::Tab };
+                let (_, url) =
+                    render::para(cx, &mut child, job, color, &inl.links, RunOpts::sep(sep));
                 if let Some(u) = url {
                     cx.open(u);
                 }
@@ -1514,6 +1800,8 @@ fn table(cx: &Cx, ui: &mut Ui, look: &Look, t: &Table) {
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
+
+    use serde_json::json;
 
     use super::*;
     use crate::chat_view::ctx::Local;
@@ -1558,6 +1846,178 @@ fn main() {}
 
     fn ink() -> Ink {
         crate::chat_view::style::test_ink()
+    }
+
+    fn parse(key: &str, src: &str) -> Doc {
+        parse_doc(key, src, &[])
+    }
+
+    fn chips() -> Vec<Value> {
+        vec![
+            json!({"t": "/skill:plan", "s": "customMessageLabel strong"}),
+            json!({"t": "@src/lib.rs", "s": "statusLineModel strong"}),
+        ]
+    }
+
+    /// (text, is a chip) of the runs of the first paragraph.
+    fn runs(doc: &Doc) -> Vec<(String, bool)> {
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        p.runs
+            .iter()
+            .map(|r| (r.text.clone(), r.chip.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn marks_become_chip_runs() {
+        let doc = parse_doc("k", "run /skill:plan on @src/lib.rs now", &chips());
+        assert_eq!(
+            runs(&doc),
+            [
+                ("run ".to_owned(), false),
+                ("/skill:plan".to_owned(), true),
+                (" on ".to_owned(), false),
+                ("@src/lib.rs".to_owned(), true),
+                (" now".to_owned(), false),
+            ]
+        );
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        assert_eq!(p.len, "run /skill:plan on @src/lib.rs now".chars().count());
+        // Two marks in a row stay two chips.
+        let doc = parse_doc("k", "/skill:plan/skill:plan", &chips());
+        assert_eq!(runs(&doc).iter().filter(|r| r.1).count(), 2);
+    }
+
+    #[test]
+    fn a_mark_that_emphasis_splits_is_still_one_chip() {
+        let marks = [json!({"t": "@pkg/__init__.py", "s": "accent"})];
+        // `__init__` reads as strong emphasis: the token reaches the builder in three pieces.
+        let doc = parse_doc("k", "open @pkg/__init__.py now", &marks);
+        assert_eq!(
+            runs(&doc),
+            [
+                ("open ".to_owned(), false),
+                ("@pkg/__init__.py".to_owned(), true),
+                (" now".to_owned(), false),
+            ]
+        );
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        assert_eq!(p.len, "open @pkg/__init__.py now".chars().count());
+        // The look of the text around the chip survives.
+        let doc = parse_doc(
+            "k",
+            "**bold** @a_b.rs _it_",
+            &[json!({"t": "@a_b.rs", "s": "x"})],
+        );
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        assert!(
+            p.runs
+                .iter()
+                .any(|r| r.text == "bold" && r.marks & BOLD != 0)
+        );
+        assert!(
+            p.runs
+                .iter()
+                .any(|r| r.text == "it" && r.marks & ITALIC != 0)
+        );
+        assert!(
+            p.runs
+                .iter()
+                .any(|r| r.text == "@a_b.rs" && r.chip.is_some())
+        );
+    }
+
+    #[test]
+    fn protecting_a_token_leaves_code_as_written() {
+        let marks = [json!({"t": "@pkg/__init__.py", "s": "accent"})];
+        let doc = parse_doc("k", "see `@pkg/__init__.py`", &marks);
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        assert!(
+            p.runs
+                .iter()
+                .any(|r| r.text == "@pkg/__init__.py" && r.marks & CODE != 0 && r.chip.is_none())
+        );
+        let doc = parse_doc("k", "```\n@pkg/__init__.py\n```", &marks);
+        let Block::Code { text, .. } = &doc.blocks[0] else {
+            panic!("code");
+        };
+        assert_eq!(text.trim_end(), "@pkg/__init__.py");
+    }
+
+    #[test]
+    fn marks_do_not_touch_code_spans_or_links_and_the_longest_wins() {
+        let doc = parse_doc("k", "`/skill:plan` [/skill:plan](https://a.b) x", &chips());
+        assert!(runs(&doc).iter().all(|r| !r.1));
+        let marks = [
+            json!({"t": "@a", "s": "accent"}),
+            json!({"t": "@a.rs", "s": "accent"}),
+        ];
+        let doc = parse_doc("k", "see @a.rs", &marks);
+        assert_eq!(
+            runs(&doc),
+            [("see ".to_owned(), false), ("@a.rs".to_owned(), true)]
+        );
+        // Nothing without marks, and an entry without text is ignored.
+        let doc = parse_doc("k", "see @a.rs", &[json!({"s": "accent"})]);
+        assert_eq!(runs(&doc), [("see @a.rs".to_owned(), false)]);
+    }
+
+    #[test]
+    fn a_chip_is_drawn_in_its_tone_on_a_wash_and_strong() {
+        let ink = ink();
+        let doc = parse_doc("k", "go /skill:plan @src/lib.rs", &chips());
+        let Block::Para(p) = &doc.blocks[0] else {
+            panic!("para");
+        };
+        let base = Base::new(ink.prose(PROSE), ink.text(), &ink);
+        let fmt = |i: usize| run_format(&ink, &base, &p.runs[i], false);
+        let (skill, mention, plain) = (fmt(1), fmt(3), fmt(0));
+        assert_eq!(skill.color, ink.tone("user"));
+        assert_eq!(mention.color, ink.tone("accent"));
+        let user = ink.tone("user");
+        assert_eq!(skill.background, theme::mix(ink.wash(user), user, 0.16));
+        assert_ne!(skill.coords, plain.coords, "chips are strong");
+        assert_eq!(plain.background, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn the_cache_reparses_when_the_marks_change() {
+        let mut c = Cache::default();
+        let a = c.doc("k", 1, "run /skill:plan", &[]);
+        assert!(Arc::ptr_eq(&a, &c.doc("k", 1, "run /skill:plan", &[])));
+        let b = c.doc("k", 1, "run /skill:plan", &chips());
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&b, &c.doc("k", 1, "run /skill:plan", &chips())));
+        assert_eq!(runs(&b).iter().filter(|r| r.1).count(), 1);
+    }
+
+    #[test]
+    fn code_blocks_carry_a_fingerprint_of_their_text() {
+        let hash = |src: &str| {
+            let doc = parse("k", src);
+            let Block::Code { hash, .. } = &doc.blocks[0] else {
+                panic!("code");
+            };
+            *hash
+        };
+        assert_eq!(
+            hash("```rust\nfn a() {}\n```"),
+            hash("```rust\nfn a() {}\n```")
+        );
+        assert_ne!(
+            hash("```rust\nfn a() {}\n```"),
+            hash("```rust\nfn b() {}\n```")
+        );
     }
 
     fn slice(plain: &str, l: &Link) -> String {
@@ -1711,12 +2171,12 @@ fn main() {}
     #[test]
     fn the_cache_reparses_only_when_the_generation_moves() {
         let mut c = Cache::default();
-        let a = c.doc("k", 1, "one");
-        assert!(Arc::ptr_eq(&a, &c.doc("k", 1, "one")));
-        let b = c.doc("k", 2, "one two");
+        let a = c.doc("k", 1, "one", &[]);
+        assert!(Arc::ptr_eq(&a, &c.doc("k", 1, "one", &[])));
+        let b = c.doc("k", 2, "one two", &[]);
         assert!(!Arc::ptr_eq(&a, &b));
         for i in 0..=MAX_DOCS {
-            c.doc(&format!("n{i}"), 1, "x");
+            c.doc(&format!("n{i}"), 1, "x", &[]);
         }
         assert!(c.docs.len() <= MAX_DOCS);
     }
@@ -1751,7 +2211,7 @@ fn main() {}
                 ctx.run_ui(egui::RawInput::default(), |ui| {
                     let ink = Ink::new(ui, 13.0);
                     let cx = Cx::new(&snap, &ink, &mut loc, Instant::now(), false, false);
-                    show_text(&cx, ui, key, 1, DOC, stream);
+                    show_text(&cx, ui, key, 1, DOC, &[], stream);
                     animating = cx.into_out().1.is_some();
                 })
                 .textures_delta

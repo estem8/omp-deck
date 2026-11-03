@@ -4,13 +4,15 @@
 //! stay `Fn`. Borrows are always short: never hold one across a nested render call.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deck_tsp::wire::Event;
-use egui::{Color32, FontId, Rect, TextureHandle};
+use egui::{Color32, FontId, Pos2, Rect, TextureHandle};
 
 use super::events::{self, Click};
+use super::select::ComposerSel;
 use super::snap::{SNode, Snap};
 use super::style::Ink;
 
@@ -20,6 +22,10 @@ pub struct Out {
     pub events: Vec<Event>,
     pub open_url: Option<String>,
     pub copy: Option<String>,
+    /// Paste the clipboard into the composer (its context menu).
+    pub paste: bool,
+    /// The user acted on a menu: end the hold the open popup put on the terminal's input.
+    pub release: bool,
     /// Blob id of an image to enlarge.
     pub zoom: Option<String>,
 }
@@ -54,14 +60,42 @@ pub struct Cx<'a> {
     pub can_edit: bool,
 }
 
-/// A toast shown for its `ttl`.
-#[derive(Debug, Clone)]
+/// A toast from the document's ring, kept by `seq` so it shows for its whole `ttl` although omp
+/// already deleted its node (and is not shown twice when the ring is read again).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
-    pub id: String,
-    pub text: String,
-    pub sub: Option<String>,
-    pub tone: Option<String>,
-    pub until: Instant,
+    pub seq: u64,
+    /// Cleaned for display once, when the toast is taken from the ring.
+    pub text: Arc<str>,
+    pub sub: Option<Arc<str>>,
+    pub at: Instant,
+    pub ttl: Duration,
+}
+
+/// A toast's laid-out lines: its text never changes while it shows, so they are laid out again
+/// only when the display scale or the colours change.
+#[derive(Clone)]
+pub struct ToastGalleys {
+    pub ppp: f32,
+    pub colors: [Color32; 2],
+    pub text: Arc<egui::Galley>,
+    pub sub: Option<Arc<egui::Galley>>,
+}
+
+/// What a right click landed on, besides the text under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// A tool or agent card (its node id).
+    Card(String),
+    /// The composer's editor (its node id).
+    Composer(String),
+}
+
+/// An open context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtxMenu {
+    pub pos: Pos2,
+    pub target: Option<Claim>,
 }
 
 /// State that lives as long as the tab's chat view (the snapshot sits beside it in `ChatState`
@@ -74,6 +108,8 @@ pub struct Local {
     pub estimates: HashMap<String, (u64, i32, f32)>,
     pub md: super::md::Cache,
     pub ansi: super::ansi::Cache,
+    /// Syntax-highlight results of code blocks (self-bounded; owned by `highlight`).
+    pub hl: super::highlight::Cache,
     pub textures: HashMap<String, TextureHandle>,
     pub follow: bool,
     pub jump: bool,
@@ -88,20 +124,105 @@ pub struct Local {
     /// Directory shown of a path target at one width: `(generation, width bucket, dir)`.
     pub path_dirs: HashMap<String, (u64, i32, String)>,
     pub probe: Option<std::sync::Arc<egui::Galley>>,
+    /// "Copied" feedback by key: a card's action (`<node id>\0<what>`) or a code block.
     pub copied: HashMap<String, Instant>,
+    /// The actions of each tool/agent card, by (subtree generation).
+    pub acts: HashMap<String, (u64, std::sync::Arc<Vec<super::tools::CardAct>>)>,
     pub zoomed: Option<String>,
     pub blink_epoch: Option<Instant>,
     /// The input method's composition in progress (`Terminal::preedit`), shown at the caret.
     pub preedit: String,
+    /// While a tool body is being measured: the runs of equal-height rows its renderers drew
+    /// (see [`Cx::note_rows`]).
+    pub row_grids: Option<Vec<RowGrid>>,
     pub frame: u64,
     /// Screen rect of the composer's caret last frame (anchors the slash menu).
     pub caret: Option<Rect>,
-    /// Transient toasts omp already deleted (it removes a toast the frame after adding it).
+    /// The toasts on screen, by `seq` (see [`Toast`]).
     pub toasts: Vec<Toast>,
+    /// The laid-out lines of the toasts in `toasts`, by `seq`.
+    pub toast_galleys: HashMap<u64, ToastGalleys>,
+    /// The composer's selection (a drag in the editor).
+    pub sel: Option<ComposerSel>,
+    /// Keys whose press the selection took (their releases never reach omp).
+    pub swallowed: Vec<egui::Key>,
+    /// The transcript's text selection (see [`super::tsel`]).
+    pub tsel: super::tsel::Tsel,
+    /// A secondary click this frame; cards and the composer claim it by their rect.
+    pub ctx_click: Option<Pos2>,
+    pub ctx_claim: Option<Claim>,
+    /// The context menu being shown.
+    pub menu: Option<CtxMenu>,
+    /// A menu entry was clicked: the keyboard focus goes back to the chat (the entry took it).
+    pub refocus: bool,
+    /// Per-card unified/split override of diffs (key: diff node id; `true` = split).
+    pub diff_modes: HashMap<String, bool>,
+    /// Live thinking sections the reader expanded past the tail clamp.
+    pub thinking_full: HashSet<String>,
+
     /// Items of each picker, kept across `itemsAdd`/`itemsDel` patches.
     pub pickers: HashMap<String, super::layer::PickerItems>,
     /// Scratch of the transcript's prefix sums (reused between frames).
     pub offsets: Vec<f32>,
+}
+
+/// Where the rows of a run of text end.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowEnds {
+    /// `count` rows of equal height `pitch`.
+    Even { pitch: f32, count: usize },
+    /// Prefix sums of the row heights, `count + 1` entries from 0 (wrapped rows of any height).
+    Prefix(std::sync::Arc<[f32]>),
+}
+
+/// A run of text rows, the first starting at `top`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowGrid {
+    pub top: f32,
+    pub ends: RowEnds,
+}
+
+impl RowGrid {
+    pub fn count(&self) -> usize {
+        match &self.ends {
+            RowEnds::Even { count, .. } => *count,
+            RowEnds::Prefix(p) => p.len().saturating_sub(1),
+        }
+    }
+
+    /// Y where row `i` starts (`i == count()`: where the last one ends).
+    pub fn edge(&self, i: usize) -> f32 {
+        self.top
+            + match &self.ends {
+                RowEnds::Even { pitch, .. } => i as f32 * pitch,
+                RowEnds::Prefix(p) => p
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| p.last().copied().unwrap_or(0.0)),
+            }
+    }
+
+    pub fn moved(mut self, dy: f32) -> RowGrid {
+        self.top += dy;
+        self
+    }
+
+    /// The rows of several runs, top to bottom, as one run (the gaps between runs belong to the
+    /// row that follows them): a body made of a command and its output previews rows of both.
+    pub fn merged(mut runs: Vec<RowGrid>) -> Option<RowGrid> {
+        runs.sort_by(|a, b| a.top.total_cmp(&b.top));
+        let top = runs.first()?.top;
+        let rows: usize = runs.iter().map(RowGrid::count).sum();
+        let mut ends = Vec::with_capacity(rows + 1);
+        ends.push(0.0);
+        for g in &runs {
+            ends.extend((1..=g.count()).map(|i| g.edge(i) - top));
+        }
+        Some(RowGrid {
+            top,
+            ends: RowEnds::Prefix(ends.into()),
+        })
+    }
 }
 
 /// How long a "Copied" feedback is kept; entries older than this are dead weight.
@@ -115,8 +236,11 @@ impl Local {
         self.heights.retain(|id, _| live(id));
         self.estimates.retain(|id, _| live(id));
         self.heads.retain(|id, _| live(id));
+        self.acts.retain(|id, _| live(id));
         self.path_dirs.retain(|id, _| live(id));
         self.pickers.retain(|id, _| live(id));
+        self.thinking_full.retain(|id| live(id));
+        self.diff_modes.retain(|id, _| live(id));
         // Keys of folds are a node id, optionally followed by `\0` and a suffix.
         self.folds
             .retain(|k, _| live(k.split('\0').next().unwrap_or(k)));
@@ -162,6 +286,21 @@ impl<'a> Cx<'a> {
         f(&mut self.loc.borrow_mut())
     }
 
+    /// A renderer that drew `count` text rows of height `pitch` from `top` reports them, so a
+    /// clamped tool body can cut between rows instead of through one. Only taken while a tool
+    /// body is being measured; free otherwise.
+    pub fn note_rows(&self, top: f32, ends: RowEnds) {
+        let grid = RowGrid { top, ends };
+        if grid.count() == 0 || !grid.edge(grid.count()).is_finite() {
+            return;
+        }
+        self.loc(|l| {
+            if let Some(g) = &mut l.row_grids {
+                g.push(grid);
+            }
+        });
+    }
+
     /// Something on screen moves continuously: the frame repaints at once.
     pub fn animate(&self) {
         self.animate_in(Duration::from_millis(16));
@@ -196,6 +335,15 @@ impl<'a> Cx<'a> {
 
     pub fn copy(&self, text: String) {
         self.out.borrow_mut().copy = Some(text);
+    }
+
+    pub fn paste(&self) {
+        self.out.borrow_mut().paste = true;
+    }
+
+    /// A menu entry was clicked: its events must reach omp although the popup still holds input.
+    pub fn release(&self) {
+        self.out.borrow_mut().release = true;
     }
 
     pub fn zoom(&self, blob: String) {

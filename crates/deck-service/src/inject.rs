@@ -48,9 +48,10 @@
 //! observes the TSP document instead ([`TspComposer`]: the dock's sendable `editor` in focus, an
 //! `omp.editor.ask*` dialog or a lost focus reading as [`Composer::Missing`], attachments as chips,
 //! the autocomplete overlay as the popup). A slash command and a plain [`ComposeMode::Send`] go as
-//! one [`Write::Send`] (the `send` event, when the program's hello lists it): omp runs it through
-//! its ordinary submit path, displacing a confirmed draft into its recall history, so there is no
-//! Ctrl+C, paste, popup `Esc` or Enter. Inserts, steering, follow-ups, attachments, Stop and hotkeys
+//! one [`Write::Send`] (the `send` event, when the program's hello lists it) after the same
+//! confirm → Ctrl+C → composer-reads-empty steps as on the grid (so a displaced draft never lands
+//! in omp's recall history); there is no paste, popup `Esc` or Enter. Inserts, steering,
+//! follow-ups, attachments, Stop and hotkeys
 //! keep the PTY sequence above (omp edits its own editor), and a program without `send` falls back
 //! to it for every job. As on the grid, [`End::Completed`] means every byte was handed out.
 
@@ -264,8 +265,7 @@ pub enum Write {
     /// A key stroke, to be encoded like the user's own key (`deck_term::Terminal::send_key`).
     Key(Key, Mods),
     /// A TSP `send` event: submits `text` as its own prompt through the composer's ordinary
-    /// submission path (`deck_term::Terminal::inject_tsp`). A draft is displaced into omp's recall
-    /// history instead of being cleared with Ctrl+C.
+    /// submission path (`deck_term::Terminal::inject_tsp`), on a composer already cleared.
     Send {
         surface: String,
         editor: String,
@@ -798,11 +798,14 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
         ) => Step::Done,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::AwaitConfirm) => Step::Blocked,
         (Payload::Slash(_) | Payload::Text { .. }, Stage::ClearPending) => {
-            // A `send` displaces the draft by itself: no Ctrl+C.
-            let tsp = env.tsp.map(|f| f());
-            if atomic_text(&a.job.payload, tsp.as_ref()).is_some() {
-                a.stage = Stage::Cleared(now);
-                return Step::Continue;
+            // A draft is cleared with Ctrl+C like on the grid, never displaced into omp's recall
+            // history by the `send` itself. Not into an ask or dialog that took the composer
+            // while the confirmation was open: Ctrl+C there would answer it.
+            if env.tsp.is_some_and(|f| {
+                let t = f();
+                t.state == Composer::Missing && atomic_text(&a.job.payload, Some(&t)).is_some()
+            }) {
+                return Step::Dropped(End::DialogOpen);
             }
             let last = [*ctrl_c, env.last_ctrl_c].into_iter().flatten().max();
             match last {
@@ -834,6 +837,15 @@ fn step(a: &mut Active, env: &Env<'_>, ctrl_c: &mut Option<Instant>, out: &mut P
                         Step::Wait(SCREEN_POLL)
                     };
                 };
+                // The editor's text must be seen empty first: a `send` over a draft would
+                // displace it into recall.
+                if obs.composer != Composer::Empty {
+                    return if now >= until + SHOW_TIMEOUT {
+                        Step::Stalled
+                    } else {
+                        Step::Wait(SCREEN_POLL)
+                    };
+                }
                 write(
                     a,
                     out,
@@ -2078,6 +2090,10 @@ mod tests {
         sent: Vec<String>,
         submitted: Vec<String>,
         ctrl_c: bool,
+        /// omp's recall history: a `send` over a draft displaces it here; Ctrl+C never does.
+        recall: Vec<String>,
+        /// Ctrl+C does not clear the editor.
+        stuck: bool,
     }
 
     impl TspFixture {
@@ -2093,12 +2109,17 @@ mod tests {
                 sent: Vec::new(),
                 submitted: Vec::new(),
                 ctrl_c: false,
+                recall: Vec::new(),
+                stuck: false,
             }
         }
 
         fn composer(&self) -> TspComposer {
             let state = match &self.text {
                 None => Composer::Missing,
+                Some(t) if t.trim().is_empty() && self.chips > 0 => {
+                    Composer::Draft(format!("[{} attachment(s)]", self.chips))
+                }
                 Some(t) if t.trim().is_empty() => Composer::Empty,
                 Some(t) => Composer::Draft(t.clone()),
             };
@@ -2145,7 +2166,11 @@ mod tests {
                     }
                 }
                 Write::Send { text: t, .. } => {
-                    // Like omp: the displaced draft goes to recall, the text is its own prompt.
+                    // Like omp: a draft the send finds is displaced into recall, the text is its
+                    // own prompt.
+                    if !text.trim().is_empty() {
+                        self.recall.push(text.clone());
+                    }
                     self.sent.push(t.clone());
                     text.clear();
                     self.chips = 0;
@@ -2159,7 +2184,10 @@ mod tests {
                 Write::Key(Key::Escape, _) => self.popup = false,
                 Write::Key(Key::Char('c'), m) if m.ctrl => {
                     self.ctrl_c = true;
-                    text.clear();
+                    if !self.stuck {
+                        text.clear();
+                        self.chips = 0;
+                    }
                 }
                 Write::Key(..) => {}
             }
@@ -2212,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn tsp_draft_asks_first_and_a_clear_answer_sends_without_ctrl_c() {
+    fn tsp_draft_asks_first_and_a_clear_answer_clears_with_ctrl_c_then_sends() {
         let mut fx = TspFixture::new();
         fx.text = Some("half typed".to_owned());
         let mut inj = Injector::default();
@@ -2225,9 +2253,13 @@ mod tests {
         );
         inj.answer(true);
         let (writes, ended) = fx.drain(&mut inj);
-        assert_eq!(writes, vec![send_event("/compact")]);
+        assert_eq!(writes, vec![CTRL_C_KEY, send_event("/compact")]);
         assert_eq!(ended, vec![("Compact".to_owned(), End::Completed)]);
-        assert!(!fx.ctrl_c, "a send displaces the draft by itself");
+        assert!(
+            fx.recall.is_empty(),
+            "the draft was cleared, not displaced into recall: {:?}",
+            fx.recall
+        );
         // Declining drops the job and leaves the draft alone.
         let mut fx = TspFixture::new();
         fx.text = Some("half typed".to_owned());
@@ -2238,6 +2270,21 @@ mod tests {
         let (writes, _) = fx.drain(&mut inj);
         assert!(writes.is_empty());
         assert_eq!(fx.text.as_deref(), Some("half typed"));
+    }
+
+    #[test]
+    fn tsp_send_never_goes_over_a_draft_ctrl_c_did_not_clear() {
+        let mut fx = TspFixture::new();
+        fx.text = Some("half typed".to_owned());
+        fx.stuck = true;
+        let mut inj = Injector::default();
+        inj.push(Job::text("Prompt", "Reply with ok.", true));
+        fx.poll(&mut inj, 0);
+        inj.answer(true);
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![CTRL_C_KEY], "no send over the draft");
+        assert_eq!(ended, vec![("Prompt".to_owned(), End::Stalled)]);
+        assert!(fx.recall.is_empty() && fx.sent.is_empty());
     }
 
     #[test]
@@ -2369,6 +2416,28 @@ mod tests {
         assert_eq!(ended, vec![("Prompt".to_owned(), End::Completed)]);
         assert_eq!(fx.submitted, vec!["look at this".to_owned()]);
         assert!(fx.sent.is_empty(), "a send would drop the attachments");
+    }
+
+    #[test]
+    fn tsp_a_send_asks_before_it_goes_over_attachments_alone() {
+        let mut fx = TspFixture::new();
+        fx.chips = 2;
+        let mut inj = Injector::default();
+        inj.push(Job::slash("Compact", "/compact", Requires::Idle));
+        let first = fx.poll(&mut inj, 0);
+        assert!(
+            first.writes.is_empty(),
+            "nothing is written before the answer"
+        );
+        assert_eq!(
+            first.confirm.map(|c| c.draft),
+            Some("[2 attachment(s)]".to_owned())
+        );
+        inj.answer(true);
+        let (writes, ended) = fx.drain(&mut inj);
+        assert_eq!(writes, vec![CTRL_C_KEY, send_event("/compact")]);
+        assert_eq!(ended, vec![("Compact".to_owned(), End::Completed)]);
+        assert_eq!(fx.chips, 0);
     }
 
     #[test]

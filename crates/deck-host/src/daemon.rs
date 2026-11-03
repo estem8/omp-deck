@@ -30,6 +30,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,8 +45,9 @@ use deck_tsp::document::ReplayBlobs;
 use crate::error::{Error, Result};
 use crate::namespace::Namespace;
 use crate::protocol::{
-    self, AttachParams, ExitedPayload, Grid, Hello, HostInfo, Kind, ObserveParams, PROTOCOL,
-    Palette, PeekParams, ResizeParams, SNAPSHOT_CHUNK, SpawnRequest,
+    self, AttachParams, BLOB_CHUNK, BLOB_ID_LEN, BlobHead, BlobRequest, ExitedPayload, Grid, Hello,
+    HostInfo, Kind, ObserveParams, PROTOCOL, Palette, PeekParams, ResizeParams, SNAPSHOT_CHUNK,
+    SpawnRequest,
 };
 use crate::pty::{self, PtyChild, PtySize};
 use crate::snapshot::{self, SideScanner};
@@ -377,6 +379,89 @@ enum Out {
     /// Live PTY output, shared with the observers.
     Output(Arc<[u8]>),
     Snapshot(Vec<u8>),
+    /// The answer to a `BlobGet`, written as one unit so its frames stay in order.
+    Blob(BlobAnswer),
+}
+
+/// Blob bytes one connection may have queued for writing at once; a request past it is answered
+/// "absent" (a controller asks for a few blobs at a time, so it never gets there).
+const MAX_PENDING_BLOB_BYTES: usize = 64 << 20;
+
+/// Keeps `bytes` counted in `pending` until the answer was written or dropped.
+struct PendingBlob {
+    pending: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for PendingBlob {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// What a `BlobGet` found: the id asked for and the blob (mime, bytes) when the document held it.
+struct BlobAnswer {
+    id: String,
+    blob: Option<(Option<String>, Arc<[u8]>)>,
+    _pending: Option<PendingBlob>,
+}
+
+impl BlobAnswer {
+    fn absent(id: String) -> BlobAnswer {
+        BlobAnswer {
+            id,
+            blob: None,
+            _pending: None,
+        }
+    }
+
+    /// Shares the blob's bytes (no copy under the core lock). Past `pending`'s budget the
+    /// answer is "absent".
+    fn of(core: &Core, id: String, pending: &Arc<AtomicUsize>) -> BlobAnswer {
+        let blob = core
+            .tsp
+            .as_ref()
+            .and_then(|tsp| tsp.document().blob(&id))
+            .map(|b| (b.mime.clone(), b.bytes.clone()));
+        let Some((mime, bytes)) = blob else {
+            return BlobAnswer::absent(id);
+        };
+        let len = bytes.len();
+        if pending.fetch_add(len, Ordering::AcqRel) + len > MAX_PENDING_BLOB_BYTES {
+            pending.fetch_sub(len, Ordering::AcqRel);
+            return BlobAnswer::absent(id);
+        }
+        let hold = PendingBlob {
+            pending: pending.clone(),
+            bytes: len,
+        };
+        BlobAnswer {
+            id,
+            blob: Some((mime, bytes)),
+            _pending: Some(hold),
+        }
+    }
+
+    /// `BlobHead`, then the `BlobData` chunks.
+    fn write(&self, stream: &mut Stream, buf: &mut Vec<u8>) -> Result<()> {
+        let head = BlobHead {
+            id: self.id.clone(),
+            mime: self.blob.as_ref().and_then(|(m, _)| m.clone()),
+            len: self.blob.as_ref().map(|(_, b)| b.len() as u64),
+        };
+        protocol::write_json(stream, buf, Kind::BlobHead, &head)?;
+        let Some((_, bytes)) = &self.blob else {
+            return Ok(());
+        };
+        let mut data = Vec::with_capacity(BLOB_ID_LEN + BLOB_CHUNK.min(bytes.len()));
+        for chunk in bytes.chunks(BLOB_CHUNK) {
+            data.clear();
+            data.extend_from_slice(self.id.as_bytes());
+            data.extend_from_slice(chunk);
+            protocol::write_frame(stream, buf, Kind::BlobData, &data)?;
+        }
+        Ok(())
+    }
 }
 
 struct ClientHandle {
@@ -639,6 +724,7 @@ impl Shared {
                         .and_then(|tsp| crate::run_state::TspFacts::of(tsp.document()))
                 })
                 .flatten(),
+            blob_fetch: true,
         }
     }
 }
@@ -930,6 +1016,8 @@ fn accept_loop(shared: &Arc<Shared>, listener: &Listener) -> ! {
 
 /// Per-connection state.
 struct Conn<'a> {
+    /// Blob bytes of this connection's answers not yet written.
+    blob_pending: Arc<AtomicUsize>,
     shared: &'a Arc<Shared>,
     stream: Stream,
     payload: Vec<u8>,
@@ -971,6 +1059,24 @@ impl Conn<'_> {
     fn is_current(&self, core: &Core) -> bool {
         self.attached.is_some() && core.client.as_ref().map(|c| c.id) == self.attached
     }
+
+    /// Sends a blob answer: through the client queue when attached (one unit, in order with
+    /// the output), else straight to the stream.
+    fn reply_blob(&mut self, answer: BlobAnswer) -> Result<()> {
+        if let Some(id) = self.attached {
+            let core = self.shared.core();
+            if let Some(client) = core.client.as_ref().filter(|c| c.id == id) {
+                return match client.queue.try_send(Out::Blob(answer)) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => Ok(()),
+                    // A client too slow to take it is cut off (it re-attaches and gets a
+                    // snapshot), never left waiting for an answer that was dropped.
+                    Err(TrySendError::Full(_)) => Err(Error::Protocol("client queue full".into())),
+                };
+            }
+            return Ok(());
+        }
+        answer.write(&mut self.stream, &mut self.out)
+    }
 }
 
 fn serve_conn(shared: &Arc<Shared>, stream: Stream) -> Result<()> {
@@ -984,6 +1090,7 @@ fn serve_conn(shared: &Arc<Shared>, stream: Stream) -> Result<()> {
         read_only: false,
         observing: None,
         peer_protocol: 0,
+        blob_pending: Arc::new(AtomicUsize::new(0)),
     };
     match protocol::read_frame(&mut conn.stream, &mut conn.payload)? {
         Some(Kind::Hello) => {}
@@ -1057,6 +1164,11 @@ fn conn_loop(conn: &mut Conn<'_>) -> Result<()> {
                     conn.reply(Kind::Snapshot, chunk)?;
                 }
                 conn.reply(Kind::SnapshotEnd, &[])?;
+            }
+            Kind::BlobGet => {
+                let request: BlobRequest = protocol::parse(&conn.payload)?;
+                let answer = BlobAnswer::of(&shared.core(), request.id, &conn.blob_pending);
+                conn.reply_blob(answer)?;
             }
             Kind::TspPeek => {
                 let core = shared.core();
@@ -1217,6 +1329,7 @@ fn client_writer(mut stream: Stream, rx: &Receiver<Out>) {
                 protocol::write_frame(&mut stream, &mut buf, Kind::Output, &payload)
             }
             Out::Snapshot(bytes) => write_snapshot(&mut stream, &mut buf, &bytes),
+            Out::Blob(answer) => answer.write(&mut stream, &mut buf),
         };
         if result.is_err() {
             break;

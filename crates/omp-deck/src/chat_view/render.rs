@@ -17,6 +17,7 @@ use super::paint;
 use super::snap::SNode;
 use super::style::LABEL;
 use super::text::{self, Base};
+use super::tsel::{RunOpts, Sep};
 use super::{ansi, code, dock, layer, md, tools, transcript};
 
 /// Spacing step of `gap`/`size` props (px).
@@ -53,10 +54,12 @@ pub fn node(cx: &Cx, ui: &mut Ui, n: &SNode) {
     if blank(cx, n) {
         return;
     }
-    if transcript::role_node(cx, ui, n) || dock::role_node(cx, ui, n) {
-        return;
-    }
-    with_click(cx, ui, n, |ui| kind(cx, ui, n));
+    cx.in_node(n.ord, || {
+        if transcript::role_node(cx, ui, n) || dock::role_node(cx, ui, n) {
+            return;
+        }
+        with_click(cx, ui, n, |ui| kind(cx, ui, n));
+    });
 }
 
 /// Wraps `add` so a node with `actions.click` is a button: hover pop, hand cursor, tooltip, event.
@@ -137,7 +140,8 @@ fn kind(cx: &Cx, ui: &mut Ui, n: &SNode) {
         "seg" => seg(cx, ui, n),
         "editor" | "input" => dock::editor_readonly(cx, ui, n),
         "overlay" | "picker" => layer::inline(cx, ui, n),
-        // Toasts are recorded when the surface syncs and drawn over the chat (`layer::overlays`).
+        // A toast's node is gone a frame after it arrives; the document's toast ring is what is
+        // drawn over the chat (`layer::overlays`), so the node itself shows nothing.
         "toast" => {}
         "rows" => ansi::show_rows(cx, ui, n),
         _ => unknown(cx, ui, n),
@@ -217,7 +221,9 @@ fn row(cx: &Cx, ui: &mut Ui, n: &SNode) {
         });
         return;
     }
-    let justify_end = n.str("justify") == Some("end") && grow.is_none();
+    // Idle, the activity row holds the todo pill alone: it sits at the right, where the pill of a
+    // run sits next to the working line.
+    let justify_end = (n.str("justify") == Some("end") || hud) && grow.is_none();
     let (left, mid, right): (&[&SNode], Option<&SNode>, &[&SNode]) = match grow {
         Some(i) if kids[i].kind == "spacer" => (&kids[..i], None, &kids[i + 1..]),
         Some(i) => (&kids[..i], Some(kids[i]), &kids[i + 1..]),
@@ -473,13 +479,14 @@ fn section(cx: &Cx, ui: &mut Ui, n: &SNode) {
         let dim = thinking;
         let tx = if dim {
             Tx {
-                font: ink.prose(14.0),
+                font: ink.prose(THINK_PX),
                 color: ink.dim(),
-                line: Some(14.0 * 1.55),
+                line: Some(THINK_LINE),
             }
         } else {
             cx.tx()
         };
+        let live = n.role() == "omp.thinking.live";
         cx.with_tx(tx, || {
             ui.horizontal(|ui| {
                 // A quiet rail along the body.
@@ -487,8 +494,16 @@ fn section(cx: &Cx, ui: &mut Ui, n: &SNode) {
                 ui.add_space(14.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for c in &body {
-                        node(cx, ui, c);
+                    let draw = |ui: &mut Ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for c in &body {
+                            node(cx, ui, c);
+                        }
+                    };
+                    if live {
+                        live_body(cx, ui, n, &draw);
+                    } else {
+                        draw(ui);
                     }
                 });
                 let r = ui.min_rect();
@@ -501,6 +516,107 @@ fn section(cx: &Cx, ui: &mut Ui, n: &SNode) {
     }
 }
 
+/// Font size and line height of a thinking body.
+const THINK_PX: f32 = 14.0;
+const THINK_LINE: f32 = THINK_PX * 1.55;
+/// Lines of a streaming thinking body that stay visible (its tail).
+const THINK_ROWS: f32 = 6.0;
+/// Height of the soft fade at the top of a clamped thinking body.
+const THINK_FADE: f32 = 22.0;
+
+/// How far a body of `content` px is shifted up so that its last `max` px show, `None` when it
+/// fits (a clamp that hides less than half a line is not worth a control).
+pub fn tail_clamp(content: f32, max: f32) -> Option<f32> {
+    (content > max + THINK_LINE * 0.5).then_some(content - max)
+}
+
+/// A live thinking body: only its tail (the last few lines, fading in from above) while it
+/// streams; the reader can open all of it, and close it again.
+fn live_body(cx: &Cx, ui: &mut Ui, n: &SNode, draw: &dyn Fn(&mut Ui)) {
+    let ink = cx.ink;
+    let w = ui.available_width();
+    let max_h = THINK_ROWS * THINK_LINE;
+    let full = transcript::measure_size(ui, w, draw).y;
+    let Some(shift) = tail_clamp(full, max_h) else {
+        draw(ui);
+        return;
+    };
+    let lines = (full / THINK_LINE).round() as usize;
+    let open = cx.loc(|l| l.thinking_full.contains(&n.id));
+    let id = ui.scope_id().with(("thinking-more", &n.id));
+    if open {
+        draw(ui);
+        if pill(cx, ui, id, "Show less").clicked() {
+            cx.loc(|l| l.thinking_full.remove(&n.id));
+        }
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(vec2(w, max_h), Sense::hover());
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt(("thinking-tail", &n.id))
+            .max_rect(Rect::from_min_size(
+                rect.min - vec2(0.0, shift),
+                vec2(w, full + 8.0),
+            ))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    child.set_width(w);
+    draw(&mut child);
+    let fade = Rect::from_min_size(rect.min, vec2(w, THINK_FADE.min(rect.height())));
+    crate::deco::fill_vertical(
+        ui.painter(),
+        &[
+            fade.left_top(),
+            fade.right_top(),
+            fade.right_bottom(),
+            fade.left_bottom(),
+        ],
+        ink.p.bg,
+        ink.p.bg.gamma_multiply(0.0),
+    );
+    if pill(cx, ui, id, &format!("Show all · {lines} lines")).clicked() {
+        cx.loc(|l| l.thinking_full.insert(n.id.clone()));
+    }
+}
+
+/// A small outlined control `label` on its own row, right-aligned.
+fn pill(cx: &Cx, ui: &mut Ui, id: egui::Id, label: &str) -> Response {
+    let g = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), cx.ink.label(LABEL), cx.ink.dim());
+    let size = g.size() + vec2(18.0, 6.0);
+    let row = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(row, size.y), Sense::hover());
+    let at = Rect::from_min_size(pos2(rect.right() - size.x, rect.top()), size);
+    pill_at(cx, ui, id, at, g)
+}
+
+fn pill_at(cx: &Cx, ui: &mut Ui, id: egui::Id, at: Rect, g: Arc<egui::Galley>) -> Response {
+    let ink = cx.ink;
+    let resp = ui
+        .interact(at, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let hot = ui
+        .ctx()
+        .animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
+    let p = ui.painter();
+    paint::boxed(
+        p,
+        at,
+        8,
+        ink.chip().gamma_multiply(0.85 + 0.15 * hot),
+        Stroke::new(1.0, crate::theme::mix(ink.p.stroke, ink.b, 0.55 * hot)),
+    );
+    p.galley(
+        at.center() - g.size() / 2.0,
+        g,
+        crate::theme::mix(ink.dim(), ink.strong(), hot),
+    );
+    resp
+}
+
 // ---- text -----------------------------------------------------------------------------------
 
 /// A link inside a paragraph: char range of the job's text and its target.
@@ -511,54 +627,56 @@ pub struct Link {
     pub url: String,
 }
 
-/// Lays out `job` at the available width as selectable text; returns the response and the link
-/// clicked this frame.
+/// Lays out `job` at the available width as selectable text (a run of the current node, see
+/// [`tsel`]); returns the response and the link clicked this frame.
 pub fn para(
+    cx: &Cx,
     ui: &mut Ui,
     mut job: LayoutJob,
     fallback: Color32,
     links: &[Link],
+    opts: RunOpts,
 ) -> (Response, Option<String>) {
     let w = ui.available_width();
     if w.is_finite() && job.wrap.max_width > w {
         job.wrap.max_width = w;
     }
     let galley = ui.painter().layout_job(job);
-    para_galley(ui, galley, fallback, links)
+    para_galley(cx, ui, galley, fallback, links, opts)
 }
 
 /// [`para`] for a galley already laid out (cached by the caller).
 pub fn para_galley(
+    cx: &Cx,
     ui: &mut Ui,
     galley: Arc<egui::Galley>,
     fallback: Color32,
     links: &[Link],
+    opts: RunOpts,
 ) -> (Response, Option<String>) {
-    let mut sense = Sense::click_and_drag();
-    sense -= Sense::FOCUSABLE;
+    // Text takes no pointer input of its own (the chat view's selection reads the raw pointer);
+    // only a paragraph with links is a click target.
+    let sense = if links.is_empty() {
+        Sense::hover()
+    } else {
+        Sense::click()
+    };
     let (rect, resp) = ui.allocate_exact_size(galley.size(), sense);
+    let seq = cx.seqs(ui, 1);
     let mut clicked = None;
-    if ui.is_rect_visible(rect) {
-        if !links.is_empty()
-            && let Some(pos) = resp.hover_pos()
-        {
-            let idx = galley.cursor_from_pos(pos - rect.min).index.0;
-            if let Some(l) = links.iter().find(|l| (l.from..l.to).contains(&idx)) {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                if resp.clicked() {
-                    clicked = Some(l.url.clone());
-                }
+    if ui.is_rect_visible(rect)
+        && !links.is_empty()
+        && let Some(pos) = resp.hover_pos()
+    {
+        let idx = galley.cursor_from_pos(pos - rect.min).index.0;
+        if let Some(l) = links.iter().find(|l| (l.from..l.to).contains(&idx)) {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            if resp.clicked() {
+                clicked = Some(l.url.clone());
             }
         }
-        egui::text_selection::LabelSelectionState::label_text_selection(
-            ui,
-            &resp,
-            rect.min,
-            Arc::clone(&galley),
-            fallback,
-            Stroke::NONE,
-        );
     }
+    cx.text_run(ui, seq, &galley, rect.min, fallback, opts);
     (resp, clicked)
 }
 
@@ -572,19 +690,20 @@ fn text_node(cx: &Cx, ui: &mut Ui, n: &SNode) {
         return;
     }
     let truncate = n.str("wrap") == Some("none") || n.str("truncate").is_some();
-    let resp = if truncate {
-        ui.add(
-            egui::Label::new(job)
-                .wrap_mode(TextWrapMode::Truncate)
-                .selectable(true),
-        )
-    } else {
-        let (resp, url) = para(ui, job, tone, &[]);
-        if let Some(u) = url {
-            cx.open(u);
+    let (resp, url) = if truncate {
+        let mut job = job;
+        let w = ui.available_width();
+        if w.is_finite() {
+            job.wrap = egui::text::TextWrapping::truncate_at_width(w);
         }
-        resp
+        let galley = ui.painter().layout_job(job);
+        para_galley(cx, ui, galley, tone, &[], RunOpts::LINE)
+    } else {
+        para(cx, ui, job, tone, &[], RunOpts::LINE)
     };
+    if let Some(u) = url {
+        cx.open(u);
+    }
     if let Some(t) = n.str("title")
         && n.click().is_none()
     {
@@ -665,7 +784,7 @@ fn kbd(cx: &Cx, ui: &mut Ui, n: &SNode) {
 
 fn icon(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let name = n.str("name").unwrap_or_default();
-    let color = n.tone().map_or(cx.ink.dim(), |t| cx.ink.tone(t));
+    let color = n.tone().map_or(cx.ink.dim(), |t| cx.ink.glyph_tone(t));
     let size = ui
         .text_style_height(&egui::TextStyle::Body)
         .clamp(13.0, 16.0);
@@ -760,7 +879,7 @@ fn rate(cx: &Cx, ui: &mut Ui, n: &SNode) {
 }
 
 fn spinner(cx: &Cx, ui: &mut Ui, n: &SNode) {
-    let color = n.tone().map_or(cx.ink.tone("accent"), |t| cx.ink.tone(t));
+    let color = cx.ink.glyph_tone(n.tone().unwrap_or("accent"));
     ui.horizontal(|ui| {
         spin(cx, ui, 13.0, color);
         if let Some(l) = text::prop(n, "label") {
@@ -1202,28 +1321,34 @@ fn kv(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let key_base = Base::new(ink.label(12.0), ink.dim(), ink);
     let val_base = Base::new(tx.font.clone(), ink.strong(), ink);
     let items = n.arr("items");
-    egui::Grid::new(ui.scope_id().with(("kv", &n.id)))
-        .num_columns(2)
-        .spacing(vec2(14.0, 4.0))
-        .show(ui, |ui| {
-            for it in items {
-                let k = it
-                    .get("k")
-                    .map(|v| cell_job(cx, v, &key_base))
-                    .unwrap_or_default();
-                let v = it
-                    .get("v")
-                    .map(|v| cell_job(cx, v, &val_base))
-                    .unwrap_or_default();
-                ui.add(egui::Label::new(k).selectable(false));
-                ui.add(
-                    egui::Label::new(v)
-                        .wrap_mode(TextWrapMode::Wrap)
-                        .selectable(true),
-                );
-                ui.end_row();
-            }
-        });
+    let grid = |ui: &mut Ui| {
+        egui::Grid::new(ui.scope_id().with(("kv", &n.id)))
+            .num_columns(2)
+            .spacing(vec2(14.0, 4.0))
+            .show(ui, |ui| {
+                for it in items {
+                    let k = it
+                        .get("k")
+                        .map(|v| cell_job(cx, v, &key_base))
+                        .unwrap_or_default();
+                    let v = it
+                        .get("v")
+                        .map(|v| cell_job(cx, v, &val_base))
+                        .unwrap_or_default();
+                    ui.add(egui::Label::new(k).selectable(false));
+                    para(cx, ui, v, ink.strong(), &[], RunOpts::LINE);
+                    ui.end_row();
+                }
+            });
+    };
+    sized_grid(cx, ui, grid);
+}
+
+/// Draws a grid. One that egui has not laid out before first takes a sizing pass (nothing painted,
+/// no runs), so a copy being collected draws it once more, the first draw's runs dropped.
+fn sized_grid(cx: &Cx, ui: &mut Ui, grid: impl Fn(&mut Ui)) {
+    cx.discarding(|| grid(ui));
+    grid(ui);
 }
 
 fn table(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -1241,34 +1366,42 @@ fn table(cx: &Cx, ui: &mut Ui, n: &SNode) {
             ))
         })
         .collect();
-    egui::Grid::new(ui.scope_id().with(("table", &n.id)))
-        .num_columns(cols.len().max(1))
-        .spacing(vec2(20.0, 5.0))
-        .striped(false)
-        .show(ui, |ui| {
-            for (_, head, _) in &cols {
-                let mut job = LayoutJob::default();
-                job.append(&head.to_uppercase(), 0.0, head_base.format_plain());
-                ui.add(egui::Label::new(job).selectable(false));
-            }
-            ui.end_row();
-            for row in n.arr("rows") {
-                let cells = row.get("cells");
-                for (id, _, end) in &cols {
-                    let job = cells
-                        .and_then(|c| c.get(*id))
-                        .map(|v| cell_job(cx, v, &cell_base))
-                        .unwrap_or_default();
-                    ui.with_layout(
-                        Layout::top_down(if *end { Align::Max } else { Align::Min }),
-                        |ui| {
-                            ui.add(egui::Label::new(job).selectable(true));
-                        },
-                    );
+    let grid = |ui: &mut Ui| {
+        egui::Grid::new(ui.scope_id().with(("table", &n.id)))
+            .num_columns(cols.len().max(1))
+            .spacing(vec2(20.0, 5.0))
+            .striped(false)
+            .show(ui, |ui| {
+                for (_, head, _) in &cols {
+                    let mut job = LayoutJob::default();
+                    job.append(&head.to_uppercase(), 0.0, head_base.format_plain());
+                    ui.add(egui::Label::new(job).selectable(false));
                 }
                 ui.end_row();
-            }
-        });
+                for row in n.arr("rows") {
+                    let cells = row.get("cells");
+                    for (c, (id, _, end)) in cols.iter().enumerate() {
+                        let job = cells
+                            .and_then(|c| c.get(*id))
+                            .map(|v| cell_job(cx, v, &cell_base))
+                            .unwrap_or_default();
+                        let sep = if c == 0 { Sep::Line } else { Sep::Tab };
+                        ui.with_layout(
+                            Layout::top_down(if *end { Align::Max } else { Align::Min }),
+                            |ui| {
+                                if job.is_empty() {
+                                    ui.add(egui::Label::new(job).selectable(false));
+                                } else {
+                                    para(cx, ui, job, ink.text(), &[], RunOpts::sep(sep));
+                                }
+                            },
+                        );
+                    }
+                    ui.end_row();
+                }
+            });
+    };
+    sized_grid(cx, ui, grid);
 }
 
 fn image(cx: &Cx, ui: &mut Ui, n: &SNode) {
@@ -1306,4 +1439,25 @@ fn seg(cx: &Cx, ui: &mut Ui, n: &SNode) {
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_streaming_thought_keeps_its_last_six_lines_and_a_short_one_stays_whole() {
+        let max = THINK_ROWS * THINK_LINE;
+        assert_eq!(tail_clamp(max, max), None, "exactly six lines");
+        assert_eq!(
+            tail_clamp(max + THINK_LINE * 0.4, max),
+            None,
+            "hiding less than half a line is not worth a control"
+        );
+        let shift = tail_clamp(20.0 * THINK_LINE, max).expect("twenty lines are clamped");
+        assert!(
+            (shift - 14.0 * THINK_LINE).abs() < 1e-3,
+            "the first fourteen lines move out above: {shift}"
+        );
+    }
 }

@@ -18,8 +18,9 @@
 //! - `settle` is remembered per node ([`NodeRef::is_settled`]) and cleared on any later op on
 //!   the node or a descendant, as the spec says; it never changes the tree.
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -49,6 +50,14 @@ pub const BLOB_BUDGET: usize = 64 << 20;
 pub const MAX_STYLE_BYTES: usize = 256 << 10;
 /// Closed surfaces kept for `adopt` and replay.
 pub const MAX_CLOSED: usize = 4;
+/// Toasts kept per document (see [`Document::toasts`]).
+pub const MAX_TOASTS: usize = 8;
+/// A toast's lifetime when the program names none.
+pub const DEFAULT_TOAST_TTL: Duration = Duration::from_millis(2400);
+/// The longest toast lifetime honored (a program cannot pin one forever).
+pub const MAX_TOAST_TTL: Duration = Duration::from_secs(60);
+/// Blob ids a document remembers it lacks (see [`Document::missing_blobs`]).
+pub const MAX_WANTED_BLOBS: usize = 256;
 
 /// Why one op was rejected; its `Display` is the `msg` of the `error` event.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -744,7 +753,8 @@ impl Serialize for Surface {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blob {
     pub mime: Option<String>,
-    pub bytes: Vec<u8>,
+    /// Shared: the session host hands one out without copying it under its lock.
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Default)]
@@ -805,6 +815,103 @@ impl Program {
     }
 }
 
+/// One `toast` node an inline program created (omp appends it and deletes it with the next
+/// frame, so a renderer reading the tree would miss it).
+#[derive(Debug, Clone)]
+pub struct ToastRecord {
+    /// 1, 2, 3, …: the record's identity, never reused within a document.
+    pub seq: u64,
+    pub text: String,
+    pub sub: Option<String>,
+    /// How long it shows, counted from `at`.
+    pub ttl: Duration,
+    /// When the creating frame was applied.
+    pub at: Instant,
+    sf: String,
+    parent: String,
+    node: Node,
+}
+
+/// Remembers into `wanted` the blob ids `props` refer to that `blobs` does not hold.
+fn want_blobs(wanted: &mut HashSet<String>, blobs: &BlobStore, props: &Map<String, Value>) {
+    let mut ids = HashSet::new();
+    replay::note_blob_ids(props, &mut ids);
+    for id in ids {
+        if wanted.len() < MAX_WANTED_BLOBS && !blobs.map.contains_key(&id) {
+            wanted.insert(id);
+        }
+    }
+}
+
+fn want_tree_blobs(wanted: &mut HashSet<String>, blobs: &BlobStore, node: &Node) {
+    want_blobs(wanted, blobs, &node.p);
+    for child in &node.c {
+        want_tree_blobs(wanted, blobs, child);
+    }
+}
+
+/// Pushes `record` onto the ring: expired entries go first, then the oldest past the bound.
+fn record_toast(ring: &mut VecDeque<ToastRecord>, record: ToastRecord, now: Instant) {
+    ring.retain(|t| !t.expired(now));
+    ring.push_back(record);
+    while ring.len() > MAX_TOASTS {
+        ring.pop_front();
+    }
+}
+
+impl ToastRecord {
+    fn new(seq: u64, sf: &str, parent: String, node: Node, now: Instant) -> ToastRecord {
+        let ttl = node
+            .p
+            .get("ttl")
+            .and_then(Value::as_f64)
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map_or(DEFAULT_TOAST_TTL, |ms| {
+                Duration::from_secs_f64(ms / 1000.0).min(MAX_TOAST_TTL)
+            });
+        // A replayed toast carries its age (see `replay::advance_timers`).
+        let age = node
+            .p
+            .get("age")
+            .and_then(Value::as_f64)
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map_or(Duration::ZERO, |ms| {
+                Duration::from_secs_f64(ms / 1000.0).min(MAX_TOAST_TTL)
+            });
+        let (ttl, at) = if age >= ttl {
+            (Duration::ZERO, now)
+        } else {
+            (ttl, now.checked_sub(age).unwrap_or(now))
+        };
+        let text = |key: &str| node.p.get(key).and_then(Value::as_str).map(str::to_owned);
+        ToastRecord {
+            seq,
+            text: text("text").unwrap_or_default(),
+            sub: text("sub"),
+            ttl,
+            at,
+            sf: sf.to_owned(),
+            parent,
+            node,
+        }
+    }
+
+    /// Whether the toast has run out at `now`.
+    pub fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) >= self.ttl
+    }
+}
+
+/// Appends to `out` every `toast` node of the subtree `node` (attached under `parent`).
+fn collect_toasts(node: &Node, parent: &str, out: &mut Vec<(String, Node)>) {
+    if node.k == "toast" {
+        out.push((parent.to_owned(), node.clone()));
+    }
+    for child in &node.c {
+        collect_toasts(child, &node.id, out);
+    }
+}
+
 /// The terminal's copy of every surface of one pane, plus its blobs.
 #[derive(Debug, Default)]
 pub struct Document {
@@ -812,6 +919,9 @@ pub struct Document {
     blobs: BlobStore,
     program: Option<Program>,
     revision: u64,
+    toasts: VecDeque<ToastRecord>,
+    toast_seq: u64,
+    wanted: HashSet<String>,
 }
 
 impl Document {
@@ -851,6 +961,67 @@ impl Document {
         self.surfaces
             .iter()
             .find(|s| s.open && s.mode == Mode::Inline)
+    }
+
+    /// The toasts that have not expired at `now`, oldest first (at most [`MAX_TOASTS`] are
+    /// kept). A toast outlives the node omp deletes right after creating it.
+    pub fn toasts(&self, now: Instant) -> impl Iterator<Item = &ToastRecord> {
+        self.toasts.iter().filter(move |t| !t.expired(now))
+    }
+
+    /// Blob ids (lowercase hex SHA-256) a node refers to that this document holds no blob
+    /// for: a peer that sent the blob before this document existed is the only way to get
+    /// one. At most [`MAX_WANTED_BLOBS`] are remembered; an id leaves the list when its blob
+    /// arrives.
+    pub fn missing_blobs(&self) -> Vec<String> {
+        self.wanted.iter().cloned().collect()
+    }
+
+    /// Whether [`Document::missing_blobs`] is not empty.
+    pub fn wants_blobs(&self) -> bool {
+        !self.wanted.is_empty()
+    }
+    /// Gives up on `id`: the host does not hold it either (a later node that refers to it asks
+    /// again).
+    pub fn forget_blob(&mut self, id: &str) {
+        self.wanted.remove(id);
+    }
+
+    /// Keeps only the wanted ids some live node still refers to (a deleted node's blob is no
+    /// longer missing).
+    fn prune_wanted(&mut self) {
+        if self.wanted.is_empty() {
+            return;
+        }
+        let mut live = HashSet::new();
+        for s in self.surfaces.iter().filter(|s| s.open) {
+            for entry in s.nodes.values() {
+                replay::note_blob_ids(&entry.p, &mut live);
+            }
+        }
+        self.wanted.retain(|id| live.contains(id));
+    }
+
+    /// Stores a blob a peer supplied for `id` after checking that `bytes` hash to it; the
+    /// revision moves so a renderer repaints. `false` (nothing stored) when the bytes do not
+    /// match or are over [`MAX_BLOB`].
+    pub fn put_blob(&mut self, id: &str, mime: Option<String>, bytes: Vec<u8>) -> bool {
+        if bytes.len() > MAX_BLOB || blob_id(&bytes) != id {
+            return false;
+        }
+        self.put_verified_blob(id, mime, bytes.into())
+    }
+
+    /// [`Document::put_blob`] for bytes the caller already hashed to `id` (outside any lock that
+    /// guards this document).
+    pub fn put_verified_blob(&mut self, id: &str, mime: Option<String>, bytes: Arc<[u8]>) -> bool {
+        if bytes.len() > MAX_BLOB {
+            return false;
+        }
+        self.wanted.remove(id);
+        self.blobs.insert(id.to_owned(), Blob { mime, bytes });
+        self.revision += 1;
+        true
     }
 
     /// Whether any surface is open.
@@ -1037,21 +1208,68 @@ impl Document {
         let surface = &mut self.surfaces[idx];
         let listen = surface.listen;
         let mut applied = Applied::default();
+        let mut removes = false;
         for (i, op) in ops.into_iter().enumerate() {
-            if let Err(e) = surface.apply_op(op, now)
-                && listen
-            {
-                applied.errors.push(Event::Error {
-                    sf: Some(sf.clone()),
-                    s: Some(s),
-                    op: u32::try_from(i).ok(),
-                    msg: e.to_string(),
-                });
+            let mut created = Vec::new();
+            let mut retoast: Option<String> = None;
+            removes |= matches!(op, Op::Del { .. });
+            match &op {
+                Op::Add { parent, node, .. } => {
+                    collect_toasts(node, parent, &mut created);
+                    want_tree_blobs(&mut self.wanted, &self.blobs, node);
+                }
+                Op::Set { id, props } => {
+                    want_blobs(&mut self.wanted, &self.blobs, props);
+                    retoast = Some(id.clone());
+                }
+                Op::Text { id, .. } | Op::Splice { id, .. } => retoast = Some(id.clone()),
+                _ => {}
+            }
+            match surface.apply_op(op, now) {
+                Ok(()) => {
+                    // omp keeps one `toast` node and only changes its text for the next
+                    // toast: every change is a new toast to show.
+                    if let Some(id) = retoast.take()
+                        && let Some(e) = surface.nodes.get(&id)
+                        && e.k == "toast"
+                    {
+                        let mut p = e.p.clone();
+                        // The age of a replayed node belongs to its old text.
+                        p.remove("age");
+                        let node = Node {
+                            id: id.clone(),
+                            k: e.k.clone(),
+                            p,
+                            c: Vec::new(),
+                        };
+                        created.push((e.parent.clone().unwrap_or_default(), node));
+                    }
+                    for (parent, node) in created {
+                        self.toast_seq += 1;
+                        record_toast(
+                            &mut self.toasts,
+                            ToastRecord::new(self.toast_seq, &sf, parent, node, now),
+                            now,
+                        );
+                    }
+                }
+                Err(e) if listen => {
+                    applied.errors.push(Event::Error {
+                        sf: Some(sf.clone()),
+                        s: Some(s),
+                        op: u32::try_from(i).ok(),
+                        msg: e.to_string(),
+                    });
+                }
+                Err(_) => {}
             }
         }
         surface.last_s = Some(s);
         if listen {
             applied.acks.push((sf, s));
+        }
+        if removes {
+            self.prune_wanted();
         }
         self.revision += 1;
         applied
@@ -1126,16 +1344,36 @@ impl Document {
         }
         // The blob's id is the hash of its bytes; an `id` parameter is ignored (spec).
         let id = hex(&Sha256::digest(&bytes));
+        self.wanted.remove(&id);
         self.blobs.insert(
             id,
             Blob {
                 mime: msg.param("mime").map(str::to_owned),
-                bytes,
+                bytes: bytes.into(),
             },
         );
         self.revision += 1;
         Applied::default()
     }
+}
+
+/// The `b` message(s) that store `bytes` in a [`Document`] fed with them (one APC string, or a
+/// `c=<chunk_id>` chunk sequence for a big blob), for a consumer that learns of a blob out of
+/// band. `chunk_id` must not collide with another chunk sequence in flight.
+pub fn encode_blob(mime: Option<&str>, bytes: &[u8], chunk_id: &str) -> Vec<u8> {
+    let params: Vec<(&str, &str)> = mime.map(|m| ("mime", m)).into_iter().collect();
+    crate::stream::encode_chunked(
+        Verb::Blob,
+        &params,
+        STANDARD.encode(bytes).as_bytes(),
+        crate::wire::DEFAULT_APC_LIMIT,
+        chunk_id,
+    )
+}
+
+/// The id of a blob: the lowercase hex SHA-256 of its bytes.
+pub fn blob_id(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
 }
 
 /// Lowercase hex of `bytes`.
@@ -2037,7 +2275,7 @@ mod tests {
         let mut store = BlobStore::default();
         let big = |n: u8| Blob {
             mime: None,
-            bytes: vec![n; 24 << 20],
+            bytes: vec![n; 24 << 20].into(),
         };
         store.insert("a".into(), big(1));
         store.insert("b".into(), big(2));
@@ -2070,6 +2308,202 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn toast_frame(doc: &mut Document, s: u64, id: &str, props: Value, now: Instant) {
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": s, "ops": [
+                ["add", id, "main", null, {"id": id, "k": "toast", "p": props}],
+            ]}),
+        );
+        doc.apply(&f, now);
+    }
+
+    fn del_frame(doc: &mut Document, s: u64, id: &str, now: Instant) {
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": s, "ops": [["del", id]]}),
+        );
+        doc.apply(&f, now);
+    }
+
+    #[test]
+    fn a_toast_outlives_the_node_omp_deletes_and_expires_after_its_ttl() {
+        let t0 = Instant::now();
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        toast_frame(
+            &mut doc,
+            2,
+            "t1",
+            json!({"text": "Copied", "sub": "to clipboard", "ttl": 3000}),
+            t0,
+        );
+        del_frame(&mut doc, 3, "t1", t0);
+        assert!(doc.surface("s1").unwrap().node("t1").is_none());
+
+        let got: Vec<_> = doc.toasts(t0 + Duration::from_millis(2999)).collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].seq, got[0].text.as_str(), got[0].sub.as_deref()),
+            (1, "Copied", Some("to clipboard"))
+        );
+        assert_eq!((got[0].ttl, got[0].at), (Duration::from_secs(3), t0));
+        assert_eq!(doc.toasts(t0 + Duration::from_millis(3000)).count(), 0);
+
+        // No ttl: omp's 2400 ms; nothing but a toast node is recorded.
+        toast_frame(&mut doc, 4, "t2", json!({"text": "Saved"}), t0);
+        let t2: Vec<_> = doc.toasts(t0 + Duration::from_millis(100)).collect();
+        assert_eq!((t2.len(), t2[1].seq, t2[1].sub.as_deref()), (2, 2, None));
+        assert_eq!(t2[1].ttl, DEFAULT_TOAST_TTL);
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": 5, "ops": [
+                ["add", "m", "main", null, {"id": "m", "k": "md", "p": {"text": "hi"}}],
+            ]}),
+        );
+        doc.apply(&f, t0);
+        assert_eq!(doc.toasts(t0).count(), 2);
+        // A program cannot pin a toast.
+        toast_frame(&mut doc, 6, "t3", json!({"text": "x", "ttl": 1e9}), t0);
+        assert_eq!(doc.toasts(t0).last().unwrap().ttl, MAX_TOAST_TTL);
+    }
+
+    #[test]
+    fn a_toast_node_whose_text_changes_is_a_new_toast_each_time() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        toast_frame(
+            &mut doc,
+            2,
+            "q",
+            json!({"text": "fake-1", "ttl": 1000}),
+            ms(0),
+        );
+        let op = |s: u64, ops: Value| msg(Verb::Frame, &json!({"sf": "s1", "s": s, "ops": ops}));
+        doc.apply(&op(3, json!([["text", "q", "replace", "fake-2"]])), ms(500));
+        // fake-1 expires at 1000; the text change at 500 is a second, fresh record.
+        let texts: Vec<_> = doc.toasts(ms(600)).map(|t| t.text.clone()).collect();
+        assert_eq!(texts, ["fake-1", "fake-2"]);
+        doc.apply(&op(4, json!([["set", "q", {"sub": "again"}]])), ms(2000));
+        let last = doc.toasts(ms(2100)).last().unwrap();
+        assert_eq!((last.at, last.sub.as_deref()), (ms(2000), Some("again")));
+        assert_eq!(doc.toasts(ms(2999)).count(), 1);
+        assert_eq!(doc.toasts(ms(3000)).count(), 0);
+    }
+
+    #[test]
+    fn the_toast_ring_keeps_the_newest_eight_and_drops_the_expired_on_the_next_one() {
+        let t0 = Instant::now();
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        for i in 0..11u64 {
+            let text = format!("n{i}");
+            toast_frame(
+                &mut doc,
+                2 + i,
+                &format!("t{i}"),
+                json!({ "text": text }),
+                t0,
+            );
+        }
+        let seqs: Vec<u64> = doc.toasts(t0).map(|t| t.seq).collect();
+        assert_eq!(seqs, (4..=11).collect::<Vec<_>>());
+        // The expired ones are gone for good once a later toast arrives.
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(doc.toasts(later).count(), 0);
+        toast_frame(&mut doc, 20, "late", json!({"text": "late"}), later);
+        assert_eq!(doc.toasts(t0).count(), 1);
+        assert_eq!(doc.toasts(later).next().unwrap().seq, 12);
+    }
+
+    #[test]
+    fn a_toast_rejected_by_its_frame_is_not_recorded() {
+        let t0 = Instant::now();
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        toast_frame(&mut doc, 2, "t1", json!({"text": "ok"}), t0);
+        toast_frame(&mut doc, 3, "t1", json!({"text": "duplicate id"}), t0);
+        assert_eq!(doc.toasts(t0).count(), 1);
+    }
+
+    #[test]
+    fn a_wanted_blob_is_dropped_when_its_node_is_deleted_or_the_host_has_none() {
+        let t0 = Instant::now();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": 2, "ops": [
+                ["add", "ia", "main", null, {"id": "ia", "k": "image", "p": {"blob": a}}],
+                ["add", "ib", "main", null, {"id": "ib", "k": "image", "p": {"blob": b}}],
+            ]}),
+        );
+        doc.apply(&f, t0);
+        assert_eq!(doc.missing_blobs().len(), 2);
+
+        let del = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": 3, "ops": [["del", "ia"]]}),
+        );
+        doc.apply(&del, t0);
+        assert_eq!(doc.missing_blobs(), std::slice::from_ref(&b));
+
+        doc.forget_blob(&b);
+        assert!(doc.missing_blobs().is_empty() && !doc.wants_blobs());
+    }
+
+    #[test]
+    fn blobs_a_node_refers_to_but_this_document_never_got_are_missing_until_put() {
+        let t0 = Instant::now();
+        let bytes = b"late blob".to_vec();
+        let id = hex(&Sha256::digest(&bytes));
+        let mut doc = Document::new();
+        open_inline(&mut doc, "s1");
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": 2, "ops": [
+                ["add", "img", "main", null, {"id": "img", "k": "image", "p": {"blob": id}}],
+                ["add", "txt", "main", null, {"id": "txt", "k": "text", "p": {"text": "no blob"}}],
+            ]}),
+        );
+        doc.apply(&f, t0);
+        assert_eq!(doc.missing_blobs(), std::slice::from_ref(&id));
+
+        let revision = doc.revision();
+        assert!(
+            !doc.put_blob(&id, None, b"other bytes".to_vec()),
+            "hash mismatch"
+        );
+        assert_eq!(doc.revision(), revision);
+        assert!(doc.put_blob(&id, Some("image/png".into()), bytes.clone()));
+        assert!(doc.revision() > revision);
+        assert_eq!(&doc.blob(&id).unwrap().bytes[..], &bytes[..]);
+        assert!(doc.missing_blobs().is_empty());
+
+        // A blob that arrives before the node that refers to it was never wanted.
+        let early = b"early".to_vec();
+        let early_id = hex(&Sha256::digest(&early));
+        doc.apply(
+            &Message {
+                verb: Verb::Blob,
+                params: Vec::new(),
+                body: STANDARD.encode(&early).into_bytes(),
+            },
+            t0,
+        );
+        let f = msg(
+            Verb::Frame,
+            &json!({"sf": "s1", "s": 3, "ops": [
+                ["set", "img", {"blob": early_id}],
+            ]}),
+        );
+        doc.apply(&f, t0);
+        assert!(doc.missing_blobs().is_empty());
     }
 
     #[test]

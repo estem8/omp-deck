@@ -343,3 +343,86 @@ pub fn after_last_user(request: &Value) -> &[Value] {
 pub fn last_user_text(request: &Value) -> String {
     last_user(request).map(text).unwrap_or_default()
 }
+
+// ---- subagents ----------------------------------------------------------------------------------
+
+/// The user text that makes the parent run one subagent through omp's `task` tool
+/// (see [`task_script`]); the subagent ends by answering with text.
+pub const TASK_MARK: &str = "TASK-MARK";
+
+/// Like [`TASK_MARK`], but the task declares an output schema: the subagent must end through its
+/// `yield` finish tool.
+pub const TASK_YIELD_MARK: &str = "TASK-YIELD-MARK";
+
+/// What the parent says once the subagent's result came back.
+pub const TASK_PARENT_REPLY: &str = "The subagent has finished.";
+
+/// What the subagent answers or submits.
+pub const TASK_RESULT: &str = "Subagent result: all done.";
+
+/// Names of the tools the request offers.
+pub fn tool_names(request: &Value) -> Vec<&str> {
+    request["tools"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|t| {
+            t["function"]["name"]
+                .as_str()
+                .or_else(|| t["name"].as_str())
+        })
+        .collect()
+}
+
+/// The request is a subagent's: omp opens its conversation with the `Complete assignment
+/// thoroughly:` brief (which the parent's never carries), and gives a subagent with an output
+/// schema the `yield` finish tool.
+pub fn is_subagent(request: &Value) -> bool {
+    tool_names(request).contains(&"yield") || last_user_text(request).contains(SUBAGENT_BRIEF)
+}
+
+/// The line omp puts above a task's assignment in the subagent's first user message.
+const SUBAGENT_BRIEF: &str = "Complete assignment thoroughly";
+
+/// Scripts the parent and its subagent for the keywords [`TASK_MARK`] and [`TASK_YIELD_MARK`];
+/// `None` for any other request, so a test's own script handles the rest. Call it before the
+/// script's other branches.
+///
+/// - Parent, keyword in the newest user message, no tool result yet: one `task` call (agent
+///   `task`, name `Helper`; with an output schema for the yield keyword).
+/// - The subagent: answers [`TASK_RESULT`] as text, or submits it through `yield` when that tool
+///   is offered; either way over about `hold`, so the agent can be seen running.
+/// - Parent, after the `task` result: [`TASK_PARENT_REPLY`].
+pub fn task_script(request: &Value, hold: Duration) -> Option<Reply> {
+    if is_subagent(request) {
+        return Some(if tool_names(request).contains(&"yield") {
+            Reply::slow_tool_call("yield", &json!({ "data": { "answer": TASK_RESULT } }), hold)
+        } else {
+            Reply::slow_text(TASK_RESULT, hold)
+        });
+    }
+    let user = last_user_text(request);
+    let structured = user.contains(TASK_YIELD_MARK);
+    if !has_tools(request) || !(structured || user.contains(TASK_MARK)) {
+        return None;
+    }
+    let fresh = !after_last_user(request).iter().any(|m| role(m) == "tool");
+    Some(if fresh {
+        let mut args = json!({
+            "name": "Helper",
+            "agent": "task",
+            "task": "Report that the job is done.",
+            "solutionSpace": "one fix: reply, nothing to research",
+        });
+        if structured {
+            args["outputSchema"] = json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } },
+                "required": ["answer"],
+            });
+        }
+        Reply::tool_call("task", &args)
+    } else {
+        Reply::text(TASK_PARENT_REPLY)
+    })
+}

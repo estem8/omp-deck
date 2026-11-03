@@ -13,13 +13,14 @@ use egui::text::LayoutJob;
 use egui::{Color32, Galley, Id, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::Value;
 
-use super::ctx::{Cx, FoldOverride};
+use super::ctx::{Cx, FoldOverride, RowEnds};
 use super::glyphs;
 use super::paint;
 use super::render::{self, Link};
 use super::snap::SNode;
 use super::style::{Ink, LABEL};
 use super::text::{self, Base};
+use super::tsel::RunOpts;
 use crate::theme::mix;
 
 /// Most output kept per node (the tail wins): a runaway log must not stall every frame.
@@ -418,42 +419,48 @@ fn near(a: Color32, b: Color32) -> bool {
     d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b()) < 60
 }
 
+/// The theme's 16 terminal colours (the chat's own ANSI palette; syntax highlighting maps its
+/// scopes onto the same ones).
+pub(super) fn palette16(ink: &Ink) -> [Color32; 16] {
+    let p = ink.p;
+    let strong = p.text_strong;
+    let blue = p.accent;
+    // Cyan is the gradient end; where a flat style makes it the accent too, lean it to green.
+    let cyan = if near(ink.b, blue) {
+        mix(ink.b, p.ok, 0.4)
+    } else {
+        ink.b
+    };
+    let magenta = if near(ink.a, blue) {
+        mix(ink.a, p.danger, 0.45)
+    } else {
+        mix(ink.a, p.danger, 0.2)
+    };
+    let base = [
+        mix(p.bg, p.text, 0.22),
+        p.danger,
+        p.ok,
+        p.warn,
+        blue,
+        magenta,
+        cyan,
+        p.text,
+    ];
+    let mut c = [Color32::TRANSPARENT; 16];
+    for (i, b) in base.iter().enumerate() {
+        c[i] = *b;
+        c[i + 8] = mix(*b, strong, 0.28);
+    }
+    c[8] = p.weak;
+    c[15] = strong;
+    c
+}
+
 impl Pal {
     fn new(ink: &Ink, default: Color32) -> Pal {
-        let p = ink.p;
-        let strong = p.text_strong;
-        let blue = p.accent;
-        // Cyan is the gradient end; where a flat style makes it the accent too, lean it to green.
-        let cyan = if near(ink.b, blue) {
-            mix(ink.b, p.ok, 0.4)
-        } else {
-            ink.b
-        };
-        let magenta = if near(ink.a, blue) {
-            mix(ink.a, p.danger, 0.45)
-        } else {
-            mix(ink.a, p.danger, 0.2)
-        };
-        let base = [
-            mix(p.bg, p.text, 0.22),
-            p.danger,
-            p.ok,
-            p.warn,
-            blue,
-            magenta,
-            cyan,
-            p.text,
-        ];
-        let mut c = [Color32::TRANSPARENT; 16];
-        for (i, b) in base.iter().enumerate() {
-            c[i] = *b;
-            c[i + 8] = mix(*b, strong, 0.28);
-        }
-        c[8] = p.weak;
-        c[15] = strong;
         Pal {
-            c,
-            strong,
+            c: palette16(ink),
+            strong: ink.p.text_strong,
             default,
             card: ink.card(),
             link: ink.tone("accent"),
@@ -960,6 +967,14 @@ fn source(n: &SNode) -> String {
     s
 }
 
+/// The text of an ANSI node without its escapes (what "Copy output" copies).
+pub fn plain(cx: &Cx, n: &SNode) -> String {
+    let ink = cx.ink;
+    let base = Base::new(ink.mono(0.95), ink.text(), ink);
+    let doc = parse(&source(n));
+    build(ink, &base, &doc, 0, doc.len()).0.text
+}
+
 /// Kind `ansi`: tool output in the terminal font, selectable, clamped by its preview.
 pub fn show(cx: &Cx, ui: &mut Ui, n: &SNode) {
     let pv = preview(cx, n);
@@ -1028,7 +1043,16 @@ fn draw(cx: &Cx, ui: &mut Ui, n: &SNode, pv: Option<Preview>) {
                 .galley(&n.id, width, ppp, |job| ui.painter().layout_job(job))
         });
         if let Some((galley, links)) = laid {
-            let (_, url) = render::para_galley(ui, galley, color, &links);
+            if !galley.rows.is_empty() {
+                cx.note_rows(
+                    ui.cursor().top(),
+                    RowEnds::Even {
+                        pitch: galley.size().y / galley.rows.len() as f32,
+                        count: galley.rows.len(),
+                    },
+                );
+            }
+            let (_, url) = render::para_galley(cx, ui, galley, color, &links, RunOpts::LINE);
             if let Some(u) = url {
                 cx.open(u);
             }
