@@ -83,6 +83,7 @@ pub fn show_row(ui: &mut Ui, row: &mut Row, first: bool) -> Option<RowEvent> {
                 &row.setting.key,
                 &row.setting.description,
                 modified,
+                row.overridden_by.as_deref(),
             )
         },
         |ui| {
@@ -166,6 +167,7 @@ fn left_half(
     key: &str,
     description: &str,
     modified: bool,
+    overridden_by: Option<&str>,
 ) -> Option<RowEvent> {
     let pal = Palette::of_ui(ui);
     let mut ev = None;
@@ -178,6 +180,13 @@ fn left_half(
                 let (r, resp) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
                 theme::glow_dot(ui.painter(), r.center(), 3.2, pal.accent_a, 0.4);
                 resp.on_hover_text("Modified from the default");
+            }
+            if let Some(by) = overridden_by {
+                badge::show(ui, None, &format!("overridden by {by}"), Hue::Amber, 11.0)
+                    .on_hover_text(format!(
+                        "The {by}'s own settings file supplies this value in the active tab's \
+                         folder; the value saved here applies everywhere else."
+                    ));
             }
         });
         let key_resp = ui.add(

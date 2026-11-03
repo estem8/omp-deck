@@ -79,6 +79,8 @@ mod mobile;
 mod notifications;
 mod palette;
 mod project_sync;
+mod redirect;
+mod settings_ext;
 mod spawn;
 mod split;
 use split::PaneClaim;
@@ -190,6 +192,13 @@ enum PendingConfirm {
     KillRunning(Vec<String>),
     /// Restore a downloaded config backup over the local omp config.
     RestoreBackup(backup::PendingRestore),
+    /// Resuming into a tab whose omp is mid-turn: stop the turn first.
+    ResumeForce,
+    /// Spend one saved rate-limit reset of a stored account (Usage → Saved resets).
+    SpendReset {
+        provider: String,
+        credential: String,
+    },
     /// Forget the saved backup server.
     RemoveServer,
     /// Remove a clean, merged worktree (with its branch) or park a clean, pushed one (the
@@ -457,6 +466,8 @@ pub struct App {
     /// Revision of the usage topic last adopted.
     usage_rev: u64,
     usage_open: bool,
+    /// The Usage view was opened for omp's `/usage reset` (the saved-reset panel is wanted).
+    usage_reset: bool,
     usage_ui: usage_view::ViewState,
     sessions: session_manager::SessionHub,
     /// Live subagent control of the active session tab.
@@ -653,6 +664,7 @@ impl App {
             usage: Usage::new(false),
             usage_rev: 0,
             usage_open: false,
+            usage_reset: false,
             usage_ui: usage_view::ViewState::default(),
             sessions: session_manager::SessionHub::default(),
             live: ctl::LiveFollow::default(),
@@ -2081,6 +2093,7 @@ impl App {
         if !self.settings_open {
             return;
         }
+        self.sync_project_layer();
         let gateway = self.gw.gateway();
         let mobile = self.gw.mobile();
         let backends = gateway
@@ -2128,6 +2141,14 @@ impl App {
                 favorites: &self.cfg.favorite_models,
                 provider: self.cfg.model_provider_filter.as_deref(),
             },
+            project: match self.tabs.get(self.active) {
+                Some(t) if t.role == TabRole::Session => Some(t.cwd.as_path()),
+                _ => None,
+            },
+            live_tab: self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.role == TabRole::Session && !t.terminal().is_exited()),
         };
         // Dialogs of the app (and the other windows) in front of it own the keys and clicks.
         let blocked = self.confirm.is_some()
@@ -2183,6 +2204,8 @@ impl App {
                 SettingsAction::AppUpdate(a) => self.apply_app_update_setting(a),
                 SettingsAction::GatewayMode(mode) => self.set_gateway_mode(mode),
                 SettingsAction::Agents(a) => self.apply_agents_action(a),
+                SettingsAction::Plugins(a) => self.apply_plugins_action(a),
+                SettingsAction::Advisor(a) => self.apply_advisor_action(a),
                 SettingsAction::Mobile(a) => self.apply_mobile_action(a),
             }
         }
@@ -2193,6 +2216,7 @@ impl App {
         let mut chat_url = None;
         let mut copy_link = None;
         let mut refused = None;
+        let mut redirect = None;
         let pal = Palette::of_ui(ui);
         let font_size = self.terminal_font_size();
         // A single chat pane under the bar: the bar already shows what the composer would repeat.
@@ -2221,6 +2245,7 @@ impl App {
                     .hide_duplicates(bar_shows_session)
                     .show(ui);
                 refused = out.refused;
+                redirect = out.redirect;
                 (out.response, out.open_url)
             } else {
                 let out = TerminalView::new(tab.terminal_mut())
@@ -2260,6 +2285,9 @@ impl App {
         }
         if let Some(url) = chat_url {
             self.open_chat_link(url);
+        }
+        if let Some(redirect) = redirect {
+            self.apply_redirect(redirect);
         }
         if let Some(url) = open_url {
             self.open_external(url);
@@ -2314,6 +2342,10 @@ impl App {
             self.answer_restore(prepared, answer);
             return;
         }
+        if matches!(pending, PendingConfirm::ResumeForce) {
+            self.answer_resume_force(answer);
+            return;
+        }
         if !answer {
             return;
         }
@@ -2348,7 +2380,13 @@ impl App {
             PendingConfirm::SwitchMain { entry, open } => self.execute_switch_main(entry, open),
             PendingConfirm::DropSyncRow { path } => self.drop_sync_row(&path),
             PendingConfirm::Changes(w) => self.execute_changes_write(w),
-            PendingConfirm::ClearDraft { .. } | PendingConfirm::RestoreBackup(_) => {}
+            PendingConfirm::SpendReset {
+                provider,
+                credential,
+            } => self.execute_spend_reset(provider, credential),
+            PendingConfirm::ClearDraft { .. }
+            | PendingConfirm::RestoreBackup(_)
+            | PendingConfirm::ResumeForce => {}
         }
     }
 
@@ -2846,6 +2884,7 @@ impl App {
     fn on_setting_done(&mut self, key: &str, outcome: Result<Option<Value>, String>) {
         let reset = matches!(outcome, Ok(None));
         let err = outcome.as_ref().err().cloned();
+        let failed = err.is_some();
         let label = self.settings.write_done(key, outcome);
         match err {
             None if reset => self
@@ -2856,6 +2895,9 @@ impl App {
                 &self.ctx,
                 format!("{label}: {}", crate::summary::strip_context(&e)),
             ),
+        }
+        if key == crate::omp_settings::THINKING_KEY && !failed {
+            self.follow_default_thinking();
         }
     }
 

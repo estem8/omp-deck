@@ -3617,3 +3617,151 @@ Removes the step-2 known limits. Shared interfaces:
   painted outside the sheet; role default 40 % master / 60 % detail, explicit props win. Layer `sheet()` bounds and
   clips its body and header band. Gate: `recorded_jobs_overlay_keeps_both_panes_inside_sheet` (real 18.15.0 ops,
   `chat_view/jobs-overlay.json`, widths 1100/700/450).
+
+## Wave 21: omp screens redirected to OmpDeck's own, with parity (user, 2026-11-03)
+
+User: redirect omp's `/settings`, Alt+P / `/switch` / status-line model click, `/usage`, `/resume`, `/tree` in the **chat
+view** to OmpDeck's counterparts, "but add the missing omp functionalities to the ompdeck variant … so that we don't lose
+anything"; for the tree: add the missing features, then redirect. Facts: `agent://RedirectFacts`, `agent://OmpRoutes`,
+`agent://DeckHooks` (summarised here). omp 18.16.0 is installed; routes were read at v18.16.0 and must be re-verified live
+(sandbox `PI_CODING_AGENT_DIR`) by whoever implements them. omp's own screens stay reachable in the **terminal view**
+(redirects are chat-view only). Kept as omp's (not redirected): `/model` hub (Alt+M), `/git`, agent hub, `/jobs`, `/copy`,
+rewind, `/login`, `/marketplace`.
+
+### Redirect mechanism (omp-deck `chat_view/` + app glue)
+- `ChatResponse.redirect: Option<Redirect>`; `pub enum Redirect { OmpSettings, ModelPicker, Usage { reset: bool },
+  Resume { foreign: Option<ForeignSource> }, Tree }` (`ForeignSource` from deck-core). Consumed in `app.rs` (session tab)
+  and `app/split.rs` (pane: focus that pane first; the redirect acts on that pane's tab).
+- **Typed / slash-menu** (before omp sees Enter): on a plain Enter press with a sendable composer, resolve the command
+  from the open `omp.autocomplete` list's `selected` item, else the composer text's first token (+ same-frame typed
+  text). `/settings`, `/switch` (no argument), `/usage` (no argument → `Usage{reset:false}`; `reset` with no target →
+  `Usage{reset:true}`), `/resume` (no argument → `Resume{foreign:None}`; `@claude`/`@codex` → that source), `/tree`.
+  Arguments that make omp act directly (`/switch <sel>`, `/resume <id|path>`, `/usage reset <provider>/<id>`) pass
+  through. The Enter press and its release are swallowed and the composer cleared with one TSP `edit` to `""` (never
+  Ctrl+C: it would land in omp's draft recall).
+- **Catch-all** (any other entry: remapped chords, double-Esc tree, omp actions): when the pre-draw snapshot shows omp's
+  settings page, the Alt+P temporary model picker, the usage overlay (`omp.overlay.usage`), the session picker or the
+  tree picker, emit the redirect and close omp's surface the same frame (Esc / `action close`), before drawing it. The
+  exact identification (titles/roles/props of each) comes from recorded ops, never guesses; the model **hub** (Alt+M) and
+  every other picker are never caught.
+- **Status-line clicks** in split panes (`hide_duplicates` off): `status.model` → `ModelPicker`, `status.cost` →
+  `Usage{reset:false}`, intercepted in `Cx::click` before `resolve_click`.
+- App targets: OmpDeck omp-settings page (`open_settings` + pending omp page applied once the catalog loads); the
+  status-bar model picker (`picker.request_open`); Usage modal (reset panel open when `reset`); session manager in
+  **resume mode** (below); `open_tree_active`.
+
+### Parity: settings (omp's `/settings` + `/advisor configure`)
+- **Plugins** page in the omp settings section (omp's "Installed" page): npm + marketplace plugins from `omp plugin list
+  --json`; enable/disable (`omp plugin enable|disable <name> --scope user|project --json`); features (`omp plugin features
+  <pkg> --set a,b --json`); per-plugin settings from the manifest schema (`omp plugin config list <pkg> --json`, `config
+  set|delete`, string/number/boolean/enum, secrets never displayed). After a change: `/reload-plugins` injected into the
+  active omp tab when idle (else queued until idle), like omp reloading its own session.
+- **Advisor** page (WATCHDOG.yml, scope Project = `<vcs root or cwd>/WATCHDOG.yml` default / User = `<agentDir>/WATCHDOG.yml`):
+  shared `instructions`, `maxNotesPerUpdate`, advisors list (`name, model, tools, reviewMode, reviewInterval, syncBacklog,
+  instructions, enabled, maxNotesPerUpdate, scope, includeReasoning`). Read/save through omp's own `advisor/config` module
+  (live tab: ctl `AdvisorConfig`, which also `applyAdvisorConfigs` live; no live tab: headless helper). Empty document
+  deletes the file (omp semantics).
+- `defaultThinkingLevel` change also switches the active omp tab's live session (`/effort <lvl>` when it differs), like
+  omp's `/settings`.
+- Rows overridden by project/overlay/env show an "overridden by …" badge (`config set --json` `overriddenBy`); the three
+  editors omp hides when the project supplies them (`contextFilesExtra`, `restrictedFolders`, `perCallModelAllow`) are
+  hidden likewise. Theme/status-line previews: not applicable in the chat view (OmpDeck paints its own palette; omp's
+  status facts are hidden as duplicates); config writes apply live through omp's watcher.
+
+### Parity: model picker (Alt+P / `/switch`)
+- Quick roles: a "Roles" group (`@default`, `@smol`, `@slow`, custom roles from `modelRoles`) → `/switch @role`.
+- Task-agent model (omp's task mode, session-only `task.agentModelOverrides`): ctl `TaskModelOverride`; shown as a picker
+  mode for the active tab; needs live control.
+
+### Parity: usage (`/usage`, `/usage reset`)
+- Refresh exists. Add the saved-reset flow: `omp usage reset [--provider p] --json` lists accounts (`availableCount`,
+  `redeemableCount`, `soonestExpiry`, `unavailableReason`, credits); spending = `omp usage reset <provider>/<credentialId>`
+  (fenced, 15 s timeout) after a Drafted confirm; omp's empty/unreachable messages verbatim; refresh after success.
+- Active-account marker on the active tab's provider/account (ctl snapshot / pinned account).
+
+### Parity: resume (`/resume`)
+- Session manager **resume mode** (opened by the redirect; also from its toolbar): current project first, pinned first.
+  Primary action **Resume here** = inject `/resume <file stem>` into the origin tab (omp's `/resume` takes an id or
+  file-name prefix, never a path — verified live; aborts a running turn in omp → `Rejected::Busy`, confirm, retry with
+  `force` = stop, wait ≤ 10 s for idle, then send); secondary **Open in new tab** (today's behavior).
+- **Pin/Unpin** (omp's `session-pins.json`, read by OmpDeck; written only through omp: helper `setSessionPinned`), pinned
+  sessions sort first in the session manager (and in resume mode).
+- **Rename** (live: `/rename <title>` into its tab; closed: helper `renameSessionTitle`, lease-checked).
+- **Foreign sources** Claude Code / Codex: list via helper (`createForeignSessionStore(src).list()`), pick → import
+  (`persistForeignSession`, fresh omp id) → Resume here / Open in new tab.
+- Delete exists (lease-checked `ompdeck-del.ts`).
+
+### Parity: tree (`/tree`)
+- Filters add **No tools** and **User only** (omp's predicates); search becomes omp's `FuzzyQuery` (all tokens must match);
+  Alt+Up/Down = previous/next user-or-assistant message; branch jumps (omp `#moveBranch`); PgUp/PgDn by visible lines;
+  picking the current leaf says "Already at this point".
+- **Navigate with summary**: when `branchSummary.enabled`, Go here asks No summary / Summarize / Summarize with custom
+  prompt; Shift+Enter pre-answers Summarize. ctl `Navigate { summary: BranchSummary }` → `mainSession().navigateTree(id,
+  {summarize, customInstructions, requireIdle:true})` + UI refresh + editor text.
+- **Labels**: `L` edits the selected node's label (empty removes): live ctl `SetLabel` (`sessionManager.appendLabelChange`),
+  closed session: helper (lease + `appendLabelChange`).
+- **Re-answer ask**: on an `ask` result node, live tab only: ctl `ReanswerAsk` (navigateTree `allowAskReopen` → omp's
+  AskTool through the extension UI, answered in the tab like any ask → `reanswerAskResult` → `resumeAfterAskReanswer`).
+
+### deck-core interfaces
+- `ctl::CtlCommand`: `Navigate { root, entry_id, #[serde(default)] summary: BranchSummary }` with
+  `pub enum BranchSummary { #[default] None, Summarize, Custom(String) }`; new `SetLabel { root, entry_id, label:
+  Option<String> }`, `ReanswerAsk { root, entry_id }`, `AdvisorConfig { root: Option<PathBuf>, scope: AdvisorScope, doc:
+  Option<serde_json::Value> }` (`None` reads), `TaskModelOverride { root: Option<PathBuf>, model: Option<String> }`.
+  `CtlReply` gains `#[serde(default)] value: Option<serde_json::Value>` and `#[serde(default)] message: Option<String>`
+  (omp's status text, e.g. "Already at this point").
+- `omp::Omp` (CLI): `plugins()`, `plugin_set_enabled(name, enabled, scope)`, `plugin_features(pkg, &[String])`,
+  `plugin_config(pkg)`, `plugin_config_set(pkg, key, value)`, `plugin_config_delete(pkg, key)`, `usage_resets(provider)`,
+  `usage_reset_spend(provider, credential)`; headless helper (one embedded extension `ompdeck-sess.ts`, rpc mode, like
+  `ompdeck-del.ts`): `set_pinned(id, bool)`, `rename_session(file, title)`, `set_label(file, entry, label)`,
+  `foreign_sessions(ForeignSource)`, `import_foreign(source, id, cwd) -> PathBuf`, `advisor_config(cwd, scope)`,
+  `save_advisor_config(cwd, scope, doc)`. `pins::read(agent_dir) -> HashSet<String>` (read-only).
+- Typed results (serde): `PluginList`, `PluginConfig`, `ResetAccounts`, `ForeignSession`, `AdvisorDoc`; `AdvisorScope
+  { Project, User }`, `ForeignSource { Claude, Codex }`, `PluginScope { User, Project }`.
+
+### deck-service (gateway) interfaces
+- Queries: `PluginList`, `PluginConfig { pkg }`, `UsageResets { provider }`, `ForeignSessions { source }`,
+  `AdvisorConfig { cwd, scope }`, `SessionPins`.
+- Mutations (jobs): `PluginEnable { name, enabled, scope }`, `PluginFeatures { pkg, features }`, `PluginConfigSet { pkg,
+  key, value: Option<Value> }` (each followed by the reload policy above for `reload: Option<SessionTarget>`),
+  `UsageResetSpend { provider, credential }`, `SessionPin { id, pinned }`, `SessionRename { file, title }` (live →
+  `/rename` injection via the controller, else helper), `SessionLabel { file, entry_id, label }` (live → ctl `SetLabel`,
+  else helper), `ForeignImport { source, id, cwd }` → new file, `AdvisorSave { cwd, scope, doc, apply: Option<SessionTarget>
+  }`, `ResumeHere { target: SessionTarget, file, force }`. As built (W21Gateway): `Done::Message`/`Done::PluginFeatures`;
+  `Command::{Resume, ReloadPlugins}`; one queued `/reload-plugins` per session, retried ≤ 5, dropped when the session or
+  requester goes; `UsageResetSpend` refreshes without `usage invalidate` (no flicker); `@role` selectors in `plan_switch`.
+  Tree/advisor/task ctl calls use the existing `Mutation::Ctl`.
+
+### As built (Wave 21)
+(Tree search keeps the selection on matching rows: query change moves it to the nearest match, moves skip excluded rows,
+Go here is inert on an excluded row. Advisor banner shows its own save/validation errors.)
+- **Redirect** (`chat_view/redirect.rs`, fixtures `redirect-fixtures.json` recorded from omp 18.16.0; `app/redirect.rs`):
+  `Redirect::OmpSettings { page: Option<String> }` (omp's active tab id: `plugins`/`installed` → Plugins, `advisor` →
+  Advisor). Typed `/advisor configure` → Advisor page; omp's advisor editor (`prefs` titled `Advisors…`) caught too.
+  Typed text counts only as a plain append at omp's caret (cursor/anchor at the end, no selection); otherwise Enter goes to
+  omp and the catch-all covers the screen. An open argument menu passes through unless its selection equals the typed
+  arguments (`/advisor configure`, `/usage reset`). Catch-all Esc is resent after ~1.5 s if omp keeps the surface.
+  `picker.request_open` expires after 3 s.
+- **deck-core**: omp's `advisor/*` is not importable from the compiled binary, so `assets/ompdeck-advisor.ts` ports it
+  (installed beside the ctl and sess extensions); unknown WATCHDOG.yml keys round-trip via `AdvisorDoc/AdvisorEntry.extra`.
+  Closed-session label/rename claim the session with `FileSessionStorage.claimSession` (holding a lease made omp fork the
+  edit into a continuation). `TreeNode` gains `search_text` (omp's `#getSearchableText` minus the label, pieces capped at
+  200 chars), `attribution`, `user_request` (`isUserRequestEntry`), `tool_name` (tool results; ask = `ToolResult` +
+  `"ask"`). Plugin manifest `features`/`settings`/schema serialize as ordered maps.
+- **Gateway**: forced `ResumeHere` keeps the admitted `SessionTarget` (stale generation → `Rejected::Stale`), stops a turn
+  started by a still-delivering injection, submits under a fresh `~deferred` controller key mapped back to the journaled
+  mutation; queued reloads also retry `Delivery::Refused(NoBracketedPaste)`. GUI reads typed refusals via
+  `Gw::mutate_typed` / `MutateError`.
+- **GUI**: Plugins/Advisor pages (`plugins_page.rs`, `advisor_page.rs`, `app/settings_ext.rs`); an advisor draft saves only
+  to the scope/project it was read for (banner "Save to <owner>" / "Discard and load <now>"), and a save reply clears only
+  an unchanged draft. "Overridden by project" is derived from `<cwd>/.omp/settings.json` (omp's `/settings` shows no
+  badges; `Omp::set_setting` drops `overriddenBy`). Resume mode (`resume_model.rs`, `sessions_view/resume.rs`,
+  `app/session_manager/resume.rs`): destination captured at start + epoch guard, stale completions resume nothing.
+  Saved resets page (`usage_resets.rs`). Model picker Roles group + Task agents mode (`model_picker.rs`). Tree: six
+  filters (Ctrl+O cycles, Alt+C/D/T/U/L/A), omp `FuzzyQuery` (`tree_layout/fuzzy.rs`, match only; non-matches dimmed),
+  Alt+↑/↓ turn jumps, `[`/`]` branch jumps, summary dialog (Shift+Enter = Summarize), `L` labels, Re-answer on ask
+  results.
+- **Tests hygiene**: deck-service sandboxes sweep their `omp-deck-test-*` host namespace on drop (owner first, then
+  `Namespace::list` + `kill`, then the root) — host sessions used to survive with their sockets deleted.
+- Not covered: mobile `Op`s for the new mutations (desktop only); spending a saved reset was not exercised live (no
+  accounts in the sandbox).

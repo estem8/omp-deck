@@ -12,6 +12,7 @@ use deck_tsp::wire::Event;
 use egui::{Color32, FontId, Pos2, Rect, TextureHandle};
 
 use super::events::{self, Click};
+use super::redirect::Redirect;
 use super::select::ComposerSel;
 use super::snap::{SNode, Snap};
 use super::style::Ink;
@@ -30,6 +31,8 @@ pub struct Out {
     pub zoom: Option<String>,
     /// The user asked to leave the page omp shows: omp gets an Esc, as if it were typed.
     pub dismiss: bool,
+    /// The user clicked a fact that is an omp screen's entry point: OmpDeck opens its own.
+    pub redirect: Option<Redirect>,
 }
 
 /// A fold flipped locally, until omp's echo (`set collapsed`) arrives (the node's generation moves).
@@ -62,6 +65,8 @@ pub struct Cx<'a> {
     pub can_edit: bool,
     /// The app already shows these composer facts for this pane (never for fullscreen pages).
     pub hide_duplicates: bool,
+    /// A node of the layer that omp opened and is closing: not drawn (see `redirect`).
+    pub hidden: Option<&'a str>,
 }
 
 /// A toast from the document's ring, kept by `seq` so it shows for its whole `ttl` although omp
@@ -278,6 +283,7 @@ impl<'a> Cx<'a> {
             focused,
             can_edit,
             hide_duplicates: false,
+            hidden: None,
         }
     }
 
@@ -390,6 +396,16 @@ impl<'a> Cx<'a> {
 
     /// Applies the click action `name` of `n` (what its `actions` declare).
     pub fn click(&self, n: &SNode, name: &str) {
+        // The facts that open omp's model picker and usage dashboard open OmpDeck's own.
+        let redirect = match name {
+            "status.model" => Some(Redirect::ModelPicker),
+            "status.cost" => Some(Redirect::Usage { reset: false }),
+            _ => None,
+        };
+        if redirect.is_some() {
+            self.out.borrow_mut().redirect = redirect;
+            return;
+        }
         match events::resolve_click(self.snap, n, name, self.collapsed(n)) {
             Click::Toggle(_) => self.toggle(n),
             Click::Copy => self.copy(super::text::node_plain(n)),

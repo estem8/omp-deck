@@ -340,7 +340,11 @@ pub fn inline(cx: &Cx, ui: &mut Ui, n: &SNode) {
 /// Shows every overlay of the `layer` region, the toasts and the zoomed image over `rect`.
 pub fn overlays(cx: &Cx, ctx: &Context, rect: Rect, salt: Id) {
     if let Some(layer) = cx.snap.region("layer") {
-        for n in cx.snap.kids(layer).filter(|n| !n.hidden()) {
+        for n in cx
+            .snap
+            .kids(layer)
+            .filter(|n| !n.hidden() && cx.hidden != Some(n.id.as_str()))
+        {
             match n.kind.as_str() {
                 "overlay" => overlay(cx, ctx, rect, salt, n),
                 "picker" => modal_picker(cx, ctx, rect, salt, n),

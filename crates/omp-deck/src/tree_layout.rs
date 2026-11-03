@@ -3,11 +3,16 @@
 //! model the view paints. No egui here; the view caches one [`Layout`] per (tree revision,
 //! leaf, filter).
 
+mod fuzzy;
+
 use std::ops::Range;
 
 use deck_core::tree::{NodeKind, SessionTree, TreeNode};
 
-/// Which nodes are listed. Mirrors omp's `/tree` filters, plus the GUI's conversation view.
+pub use fuzzy::{FuzzySearch, FuzzyText};
+
+/// Which nodes are listed. Mirrors omp's `/tree` filters (default, no-tools, user-only, labeled,
+/// all), plus the GUI's conversation view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Filter {
     /// User prompts, assistant replies with text, compactions and branch summaries.
@@ -15,25 +20,35 @@ pub enum Filter {
     Conversation,
     /// omp's `/tree` default: everything except settings-like entries and empty assistant steps.
     Default,
-    All,
+    /// The default view minus tool results.
+    NoTools,
+    /// Only user requests: prompts and user-invoked skill / collab prompts.
+    UserOnly,
     /// Only nodes that carry a label.
     Labeled,
+    /// Everything except empty assistant steps (omp's base rule applies in every mode).
+    All,
 }
 
 impl Filter {
-    pub const ALL: [Filter; 4] = [
+    /// In the order Ctrl+O cycles through them (omp's order, with the GUI's view first).
+    pub const ALL: [Filter; 6] = [
         Filter::Conversation,
         Filter::Default,
-        Filter::All,
+        Filter::NoTools,
+        Filter::UserOnly,
         Filter::Labeled,
+        Filter::All,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Filter::Conversation => "Conversation",
             Filter::Default => "Default",
-            Filter::All => "All",
+            Filter::NoTools => "No tools",
+            Filter::UserOnly => "User only",
             Filter::Labeled => "Labeled",
+            Filter::All => "All",
         }
     }
 
@@ -41,9 +56,30 @@ impl Filter {
         match self {
             Filter::Conversation => "Your prompts and the assistant's replies, tool calls hidden",
             Filter::Default => "What omp's /tree shows by default",
-            Filter::All => "Every entry in the session file",
+            Filter::NoTools => "The default view without tool results",
+            Filter::UserOnly => "Only your prompts",
             Filter::Labeled => "Only entries with a label",
+            Filter::All => "Every entry, settings included; empty assistant steps stay hidden",
         }
+    }
+
+    /// The letter of the Alt+letter shortcut that picks this filter.
+    pub fn shortcut(self) -> char {
+        match self {
+            Filter::Conversation => 'C',
+            Filter::Default => 'D',
+            Filter::NoTools => 'T',
+            Filter::UserOnly => 'U',
+            Filter::Labeled => 'L',
+            Filter::All => 'A',
+        }
+    }
+
+    /// The filter `delta` steps away in [`Filter::ALL`], wrapping (Ctrl+O / Ctrl+Shift+O).
+    pub fn cycled(self, delta: isize) -> Filter {
+        let n = Filter::ALL.len() as isize;
+        let at = Filter::ALL.iter().position(|&f| f == self).unwrap_or(0) as isize;
+        Filter::ALL[(at + delta).rem_euclid(n) as usize]
     }
 }
 
@@ -126,6 +162,20 @@ impl Layout {
             .filter(|&r| r != u32::MAX)
             .map(|r| r as usize)
     }
+
+    /// `node` when it is listed, else its nearest listed ancestor: where a selection goes when a
+    /// filter hides it (omp keeps the selection on the nearest visible row).
+    pub fn nearest_listed(&self, tree: &SessionTree, node: usize) -> Option<usize> {
+        let mut cur = Some(node);
+        for _ in 0..=tree.nodes.len() {
+            let i = cur?;
+            if self.row_of_node(i).is_some() {
+                return Some(i);
+            }
+            cur = tree.parent_index(i);
+        }
+        None // parent cycle
+    }
 }
 
 /// Whether node `i` is listed for `filter`. A leaf that the filter hides is not forced in: "you
@@ -133,37 +183,69 @@ impl Layout {
 /// assistant step is shown while it is the leaf).
 pub fn is_visible(tree: &SessionTree, i: usize, filter: Filter, leaf: Option<usize>) -> bool {
     let n = &tree.nodes[i];
-    match filter {
-        Filter::All => true,
-        Filter::Labeled => tree.labels.contains_key(&n.id),
-        Filter::Default => {
-            default_visible(n) || (Some(i) == leaf && matches!(n.kind, NodeKind::Assistant))
-        }
-        Filter::Conversation => match n.kind {
+    if filter == Filter::Conversation {
+        return match n.kind {
             NodeKind::User | NodeKind::Compaction | NodeKind::BranchSummary => true,
             NodeKind::Assistant => n.has_text,
             _ => false,
-        },
+        };
+    }
+    // omp's other modes all start from the same rule (tree-selector.ts `#buildFilter`).
+    if !assistant_listed(n, Some(i) == leaf) {
+        return false;
+    }
+    match filter {
+        Filter::All => true,
+        Filter::Default => !is_settings(n),
+        Filter::NoTools => !is_settings(n) && n.kind != NodeKind::ToolResult,
+        Filter::UserOnly => is_user_request(n),
+        Filter::Labeled => tree.labels.contains_key(&n.id),
+        Filter::Conversation => false, // handled above
     }
 }
 
-/// omp's `/tree` default view (docs/notes/session-tree.md §1 "Visibility").
-fn default_visible(n: &TreeNode) -> bool {
+/// omp's base rule: an assistant message without text is hidden unless it is the current leaf or
+/// stopped for a reason other than `stop` / `toolUse` (error, aborted, length, …).
+fn assistant_listed(n: &TreeNode, is_leaf: bool) -> bool {
+    if n.kind != NodeKind::Assistant || is_leaf || n.has_text {
+        return true;
+    }
+    n.stop_reason
+        .as_deref()
+        .is_some_and(|r| !r.is_empty() && r != "stop" && r != "toolUse")
+}
+
+/// omp's `isSettingsEntry`: bookkeeping entries that only the "all" mode lists.
+fn is_settings(n: &TreeNode) -> bool {
     match &n.kind {
         NodeKind::Label
         | NodeKind::Custom(_)
         | NodeKind::ModelChange
         | NodeKind::ModelUsage
-        | NodeKind::ThinkingChange
-        | NodeKind::Setting(_) => false,
-        NodeKind::Assistant => {
-            n.has_text
-                || n.stop_reason
-                    .as_deref()
-                    .is_some_and(|r| r != "stop" && r != "toolUse")
-        }
-        _ => true,
+        | NodeKind::ThinkingChange => true,
+        // Unknown entry types are `Setting` too, but omp lists those like any other entry.
+        NodeKind::Setting(ty) => matches!(
+            ty.as_str(),
+            "service_tier_change"
+                | "title_change"
+                | "mode_change"
+                | "credential_pin"
+                | "ttsr_injection"
+                | "session_init"
+                | "reset_boundary"
+        ),
+        _ => false,
     }
+}
+
+/// omp's `isUserRequestEntry`, computed by deck-core while reading the file.
+fn is_user_request(n: &TreeNode) -> bool {
+    n.user_request
+}
+
+/// A result of omp's `ask` tool, the entries "Re-answer…" applies to.
+pub fn is_ask_result(n: &TreeNode) -> bool {
+    matches!(n.kind, NodeKind::ToolResult) && n.tool_name.as_deref() == Some("ask")
 }
 
 /// Lay the tree out for `filter`. Hidden nodes drop out and their visible descendants attach to
@@ -314,6 +396,125 @@ pub fn build(tree: &SessionTree, leaf: Option<usize>, filter: Filter) -> Layout 
     }
 }
 
+// ------------------------------------------------------------------ keyboard jumps
+
+/// Alt+Up / Alt+Down: the nearest row after (`forward`) or before row `from` that holds a user or
+/// assistant message (omp `moveSelectionWhere`; no wrapping, no move when there is none).
+pub fn turn_jump(tree: &SessionTree, layout: &Layout, from: usize, forward: bool) -> Option<usize> {
+    let is_turn = |r: &Row| {
+        matches!(
+            tree.nodes[r.node].kind,
+            NodeKind::User | NodeKind::Assistant
+        )
+    };
+    if forward {
+        let after = layout.rows.get(from + 1..)?;
+        after.iter().position(is_turn).map(|p| from + 1 + p)
+    } else {
+        layout.rows.get(..from)?.iter().rposition(is_turn)
+    }
+}
+
+/// Children of a node in omp's order: the branch holding the leaf first, the rest as stored.
+fn ordered<'a>(kids: &'a [usize], on_path: &'a [bool]) -> impl Iterator<Item = usize> + 'a {
+    let lead = kids.iter().copied().filter(|&c| on_path[c]);
+    lead.chain(kids.iter().copied().filter(|&c| !on_path[c]))
+}
+
+/// `[` / `]`: the row of the previous / next visible branch (omp `#moveBranch`).
+///
+/// A branch is one child of a fork (a node, or the roots, with at least two children, counted over
+/// the unfiltered tree). Its head is promoted to the first listed node at or below it, so a
+/// filtered-out head still has a target. Targets are visited in row order and the walk wraps; from
+/// a row outside every branch, forward starts at the first target and backward at the last.
+pub fn branch_jump(
+    tree: &SessionTree,
+    layout: &Layout,
+    from: usize,
+    forward: bool,
+) -> Option<usize> {
+    let selected = layout.rows.get(from)?.node;
+    let n = tree.nodes.len();
+    let on_path = tree.active_path(layout.leaf_node);
+
+    // Pre-order over the whole tree, the leaf's branch first at every fork.
+    let roots: Vec<usize> = ordered(&tree.roots, &on_path).collect();
+    let mut preorder: Vec<usize> = Vec::with_capacity(n);
+    let mut stack: Vec<usize> = roots.iter().rev().copied().collect();
+    while let Some(i) = stack.pop() {
+        preorder.push(i);
+        let kids: Vec<usize> = ordered(&tree.children[i], &on_path).collect();
+        stack.extend(kids.iter().rev());
+    }
+
+    // First listed node of each subtree, children before parents.
+    let mut first_listed = vec![usize::MAX; n];
+    for &i in preorder.iter().rev() {
+        first_listed[i] = if layout.row_of_node(i).is_some() {
+            i
+        } else {
+            ordered(&tree.children[i], &on_path)
+                .map(|c| first_listed[c])
+                .find(|&t| t != usize::MAX)
+                .unwrap_or(usize::MAX)
+        };
+    }
+
+    // (branch head, its target) for every branch of every fork.
+    let mut heads: Vec<(usize, usize)> = Vec::new();
+    let mut add_fork = |branches: &mut dyn Iterator<Item = usize>, count: usize| {
+        if count < 2 {
+            return;
+        }
+        heads.extend(
+            branches
+                .map(|b| (b, first_listed[b]))
+                .filter(|&(_, t)| t != usize::MAX),
+        );
+    };
+    add_fork(&mut roots.iter().copied(), roots.len());
+    for &i in &preorder {
+        add_fork(
+            &mut ordered(&tree.children[i], &on_path),
+            tree.children[i].len(),
+        );
+    }
+    let row_of = |node: usize| layout.row_of_node(node).unwrap_or(usize::MAX);
+    let mut targets: Vec<usize> = heads.iter().map(|&(_, t)| t).collect();
+    targets.sort_by_key(|&t| row_of(t));
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+
+    // The branch that holds the selection, at its nearest ancestor fork.
+    let mut branch = selected;
+    let mut current = None;
+    for _ in 0..=n {
+        let parent = tree.parent_index(branch);
+        let siblings = parent.map_or(tree.roots.len(), |p| tree.children[p].len());
+        if siblings > 1 {
+            current = Some(branch);
+            break;
+        }
+        match parent {
+            Some(p) => branch = p,
+            None => break,
+        }
+    }
+    let current = current
+        .and_then(|b| heads.iter().find(|&&(head, _)| head == b))
+        .and_then(|&(_, t)| targets.iter().position(|&x| x == t));
+    let count = targets.len();
+    let next = match current {
+        None if forward => 0,
+        None => count - 1,
+        Some(c) if forward => (c + 1) % count,
+        Some(c) => (c + count - 1) % count,
+    };
+    layout.row_of_node(targets[next])
+}
+
 // ------------------------------------------------------------------ text, search, time
 
 /// Lowercased whitespace-separated search words.
@@ -324,29 +525,51 @@ pub fn search_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// What the search matches a node against: kind name, label and row text.
-fn haystack(tree: &SessionTree, node: usize) -> String {
+/// The text omp's tree search matches a node against (`#getSearchableText`): the label, then
+/// deck-core's `search_text` (role / type keyword, content, tool output, bash command, …).
+fn search_text(tree: &SessionTree, node: usize) -> String {
     let n = &tree.nodes[node];
-    let mut s = String::with_capacity(n.text.len() + 24);
-    s.push_str(kind_name(&n.kind));
-    s.push(' ');
-    if let Some(l) = tree.labels.get(&n.id) {
+    let label = tree.labels.get(&n.id).filter(|l| !l.is_empty());
+    let mut s = String::with_capacity(n.search_text.len() + label.map_or(0, |l| l.len() + 1));
+    if let Some(l) = label {
         s.push_str(l);
         s.push(' ');
     }
-    s.push_str(&n.text);
-    s.make_ascii_lowercase();
+    s.push_str(&n.search_text);
     s
 }
 
-/// Per row: every search word occurs in the node's kind, label or text (ASCII case-insensitive).
-pub fn search_matches(tree: &SessionTree, layout: &Layout, tokens: &[String]) -> Vec<bool> {
+/// Prepared (normalized) search texts, one per node, built on first use. Valid for one tree
+/// revision: the owner clears it when the tree or its labels change.
+#[derive(Default)]
+pub struct SearchIndex {
+    texts: Vec<Option<FuzzyText>>,
+}
+
+impl SearchIndex {
+    pub fn clear(&mut self) {
+        self.texts.clear();
+    }
+}
+
+/// Per row: every search word fuzzy-matches the node's search text (omp's `FuzzyQuery`).
+pub fn search_matches(
+    tree: &SessionTree,
+    layout: &Layout,
+    search: &FuzzySearch,
+    index: &mut SearchIndex,
+) -> Vec<bool> {
+    if index.texts.len() != tree.nodes.len() {
+        index.texts.clear();
+        index.texts.resize_with(tree.nodes.len(), || None);
+    }
     layout
         .rows
         .iter()
         .map(|r| {
-            let h = haystack(tree, r.node);
-            tokens.iter().all(|t| h.contains(t.as_str()))
+            let text = index.texts[r.node]
+                .get_or_insert_with(|| FuzzyText::new(&search_text(tree, r.node)));
+            search.matches(text)
         })
         .collect()
 }
@@ -502,6 +725,10 @@ mod tests {
                     stop_reason: None,
                     active_leaf: None,
                     cost_before: Default::default(),
+                    search_text: format!("{} {id} text", kind_name(kind)),
+                    attribution: None,
+                    user_request: matches!(kind, NodeKind::User),
+                    tool_name: None,
                 })
             })
             .collect();
@@ -692,7 +919,8 @@ mod tests {
         let def = build(&t, leaf, Filter::Default);
         assert_eq!(ids(&t, &def), ["u", "t", "a", "k", "s", "z"]);
         let all = build(&t, leaf, Filter::All);
-        assert_eq!(all.rows.len(), 9);
+        // `All` still applies omp's base rule: the empty assistant step "e" stays hidden.
+        assert_eq!(all.rows.len(), 8);
         // Labeled lists only the labeled node; the hidden leaf's marker moves up to it.
         let lab = build(&t, leaf, Filter::Labeled);
         assert_eq!(ids(&t, &lab), ["a"]);
@@ -737,28 +965,340 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_words_anywhere_and_highlights_spans() {
+    fn search_is_omp_fuzzy_over_label_role_and_text_and_highlights_literal_spans() {
         let mut t = tree(&[user("a", None), asst("b", Some("a"))]);
-        Arc::make_mut(&mut t.nodes[0]).text = "Fix the Login bug".to_owned();
-        Arc::make_mut(&mut t.nodes[1]).text = "Done".to_owned();
+        Arc::make_mut(&mut t.nodes[0]).search_text = "user Fix the Login bug".to_owned();
+        Arc::make_mut(&mut t.nodes[1]).search_text = "assistant Done".to_owned();
         t.labels.insert("b".to_owned(), "milestone".to_owned());
         let l = build(&t, Some(1), Filter::Conversation);
+        let mut index = SearchIndex::default();
+        let mut hits = |q: &str| search_matches(&t, &l, &FuzzySearch::new(q), &mut index);
+        // Every piece must match, in any order and case.
+        assert_eq!(hits("  login FIX "), [true, false]);
+        assert_eq!(hits("login crash"), [false, false]);
+        // Prefix of a label word; the role is searchable; an in-order abbreviation of a word.
+        assert_eq!(hits("mile"), [false, true]);
+        assert_eq!(hits("assistant"), [false, true]);
+        assert_eq!(hits("lgn"), [true, false]);
+        // Acronym over words: Fix The Login → "ftl".
+        assert_eq!(hits("ftl"), [true, false]);
+        // Blank queries match everything.
+        assert_eq!(hits(""), [true, true]);
+        assert_eq!(hits("?!"), [true, true]);
         let tok = search_tokens("  login FIX ");
-        assert_eq!(search_matches(&t, &l, &tok), [true, false]);
-        assert_eq!(
-            search_matches(&t, &l, &search_tokens("mile")),
-            [false, true]
-        );
-        assert_eq!(
-            search_matches(&t, &l, &search_tokens("assistant")),
-            [false, true]
-        );
-        assert_eq!(search_matches(&t, &l, &[]), [true, true]);
         assert_eq!(
             highlight_spans("Fix the Login bug fix", &tok),
             vec![0..3, 8..13, 18..21]
         );
         assert_eq!(highlight_spans("aaaa", &search_tokens("aa a")), vec![0..4]);
+    }
+
+    /// A node's search text is prepared once and reused until the owner clears the index.
+    #[test]
+    fn search_index_is_reused_until_cleared() {
+        let mut t = tree(&[user("a", None)]);
+        let l = build(&t, Some(0), Filter::Conversation);
+        let mut index = SearchIndex::default();
+        let q = FuzzySearch::new("login");
+        assert_eq!(search_matches(&t, &l, &q, &mut index), [false]);
+        t.labels.insert("a".to_owned(), "login".to_owned());
+        assert_eq!(search_matches(&t, &l, &q, &mut index), [false], "cached");
+        index.clear();
+        assert_eq!(search_matches(&t, &l, &q, &mut index), [true]);
+    }
+
+    /// omp searches a tool result's output, which the row text (the call summary) does not show.
+    #[test]
+    fn search_reaches_tool_output_and_the_bash_command_not_only_the_row_text() {
+        use NodeKind::*;
+        let mut t = chain(&[
+            ("u", User, true),
+            ("t", ToolResult, false),
+            ("sh", BashExecution, false),
+        ]);
+        let set = |t: &mut SessionTree, i: usize, text: &str, search: &str| {
+            let n = Arc::make_mut(&mut t.nodes[i]);
+            n.text = text.to_owned();
+            n.search_text = search.to_owned();
+        };
+        set(
+            &mut t,
+            1,
+            "[read: src/a.rs:1-5]",
+            "toolResult src/a.rs panicked at overflow",
+        );
+        set(
+            &mut t,
+            2,
+            "[bash]: cargo test",
+            "bashExecution 3 passed cargo test",
+        );
+        let l = build(&t, Some(2), Filter::All);
+        let mut index = SearchIndex::default();
+        let mut hits = |q: &str| search_matches(&t, &l, &FuzzySearch::new(q), &mut index);
+        assert_eq!(hits("overflow"), [false, true, false]);
+        assert_eq!(hits("passed"), [false, false, true]);
+        // A label is prepended to the entry's own text.
+        t.labels.insert("u".to_owned(), "kickoff".to_owned());
+        index.clear();
+        let mut hits = |q: &str| search_matches(&t, &l, &FuzzySearch::new(q), &mut index);
+        assert_eq!(hits("kickoff"), [true, false, false]);
+    }
+
+    /// A linear chain of (id, kind, has_text) entries.
+    fn chain(entries: &[(&str, NodeKind, bool)]) -> SessionTree {
+        let spec: Vec<Spec<'_>> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (id, kind, text))| {
+                (
+                    *id,
+                    i.checked_sub(1).map(|p| entries[p].0),
+                    kind.clone(),
+                    *text,
+                )
+            })
+            .collect();
+        tree(&spec)
+    }
+
+    fn listed<'a>(t: &'a SessionTree, filter: Filter, leaf: &str) -> Vec<&'a str> {
+        let leaf = t.index.get(leaf).copied();
+        (0..t.nodes.len())
+            .filter(|&i| is_visible(t, i, filter, leaf))
+            .map(|i| t.nodes[i].id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn filters_follow_omp_predicates() {
+        use NodeKind::*;
+        let mut t = chain(&[
+            ("u", User, true),
+            ("skill", CustomMessage("skill-prompt".into()), false),
+            ("collab", CustomMessage("collab-prompt".into()), false),
+            ("note", CustomMessage("advisor".into()), false),
+            ("t", ToolResult, false),
+            ("sh", BashExecution, false),
+            ("a", Assistant, true),
+            ("noop", Assistant, false), // text-less, stop reason unset
+            ("tooluse", Assistant, false),
+            ("stop", Assistant, false),
+            ("empty", Assistant, false),
+            ("cut", Assistant, false), // text-less, stopped for another reason
+            ("m", ModelChange, false),
+            ("title", Setting("title_change".into()), false),
+            ("reset", Setting("reset_boundary".into()), false),
+            ("future", Setting("some_future_entry".into()), false),
+            ("here", Assistant, false), // the leaf, text-less
+        ]);
+        for (id, reason) in [
+            ("tooluse", "toolUse"),
+            ("stop", "stop"),
+            ("empty", ""),
+            ("cut", "length"),
+        ] {
+            let i = t.index[id];
+            Arc::make_mut(&mut t.nodes[i]).stop_reason = Some(reason.to_owned());
+        }
+        for id in ["t", "noop", "m"] {
+            t.labels.insert(id.to_owned(), "tag".to_owned());
+        }
+        for id in ["skill", "collab"] {
+            let i = t.index[id];
+            Arc::make_mut(&mut t.nodes[i]).user_request = true;
+        }
+        let by = |f| listed(&t, f, "here");
+        assert_eq!(by(Filter::Conversation), ["u", "a"]);
+        // Default: no settings entries; empty assistant steps only when abnormal or the leaf; an
+        // unknown entry type is listed.
+        assert_eq!(
+            by(Filter::Default),
+            [
+                "u", "skill", "collab", "note", "t", "sh", "a", "cut", "future", "here"
+            ]
+        );
+        assert_eq!(
+            by(Filter::NoTools),
+            [
+                "u", "skill", "collab", "note", "sh", "a", "cut", "future", "here"
+            ]
+        );
+        // User requests: prompts and the two user-attributed custom prompts, not other customs.
+        assert_eq!(by(Filter::UserOnly), ["u", "skill", "collab"]);
+        // Labeled: the base rule still hides the labeled but empty "noop".
+        assert_eq!(by(Filter::Labeled), ["t", "m"]);
+        assert_eq!(
+            by(Filter::All),
+            [
+                "u", "skill", "collab", "note", "t", "sh", "a", "cut", "m", "title", "reset",
+                "future", "here"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_user_attributed_skill_prompt_counts_as_a_user_request() {
+        use NodeKind::*;
+        use deck_core::tree::Attribution;
+        let mut t = chain(&[
+            ("u", User, true),
+            ("mine", CustomMessage("skill-prompt".into()), false),
+            ("agents", CustomMessage("skill-prompt".into()), false),
+            ("a", Assistant, true),
+        ]);
+        for (id, who, request) in [
+            ("mine", Attribution::User, true),
+            ("agents", Attribution::Agent, false),
+        ] {
+            let n = Arc::make_mut(&mut t.nodes[t.index[id]]);
+            n.attribution = Some(who);
+            n.user_request = request;
+        }
+        assert_eq!(listed(&t, Filter::UserOnly, "a"), ["u", "mine"]);
+        assert!(listed(&t, Filter::Default, "a").contains(&"agents"));
+    }
+
+    #[test]
+    fn conversation_filter_keeps_prompts_and_replies_only() {
+        use NodeKind::*;
+        let t = chain(&[
+            ("u", User, true),
+            ("t", ToolResult, false),
+            ("a", Assistant, true),
+            ("k", Compaction, false),
+            ("empty", Assistant, false),
+        ]);
+        // Even the text-less leaf is not forced into this view.
+        assert_eq!(listed(&t, Filter::Conversation, "empty"), ["u", "a", "k"]);
+    }
+
+    #[test]
+    fn filters_cycle_in_order_and_wrap() {
+        assert_eq!(Filter::Conversation.cycled(1), Filter::Default);
+        assert_eq!(Filter::Default.cycled(1), Filter::NoTools);
+        assert_eq!(Filter::NoTools.cycled(1), Filter::UserOnly);
+        assert_eq!(Filter::UserOnly.cycled(1), Filter::Labeled);
+        assert_eq!(Filter::Labeled.cycled(1), Filter::All);
+        assert_eq!(Filter::All.cycled(1), Filter::Conversation);
+        assert_eq!(Filter::Conversation.cycled(-1), Filter::All);
+        assert_eq!(Filter::NoTools.cycled(-1), Filter::Default);
+        let letters: Vec<char> = Filter::ALL.iter().map(|f| f.shortcut()).collect();
+        assert_eq!(letters, ['C', 'D', 'T', 'U', 'L', 'A']);
+    }
+
+    #[test]
+    fn turn_jump_skips_everything_but_user_and_assistant_messages_and_does_not_wrap() {
+        use NodeKind::*;
+        let t = chain(&[
+            ("t0", ToolResult, false),
+            ("u1", User, true),
+            ("t1", ToolResult, false),
+            ("k", Compaction, false),
+            ("a1", Assistant, true),
+            ("sh", BashExecution, false),
+            ("t2", ToolResult, false),
+        ]);
+        let l = build(&t, Some(6), Filter::Default);
+        let row = |id: &str| l.row_of_node(t.index[id]).unwrap();
+        assert_eq!(turn_jump(&t, &l, row("t2"), false), Some(row("a1")));
+        assert_eq!(turn_jump(&t, &l, row("a1"), false), Some(row("u1")));
+        assert_eq!(turn_jump(&t, &l, row("u1"), true), Some(row("a1")));
+        assert_eq!(turn_jump(&t, &l, row("u1"), false), None);
+        assert_eq!(turn_jump(&t, &l, row("a1"), true), None);
+        assert_eq!(turn_jump(&t, &l, row("t0"), true), Some(row("u1")));
+    }
+
+    #[test]
+    fn a_hidden_selection_falls_back_to_its_nearest_listed_ancestor() {
+        use NodeKind::*;
+        let t = chain(&[
+            ("u", User, true),
+            ("a", Assistant, true),
+            ("t", ToolResult, false),
+            ("sh", BashExecution, false),
+            ("a2", Assistant, true),
+        ]);
+        let l = build(&t, Some(4), Filter::NoTools);
+        let node = |id: &str| t.index[id];
+        assert_eq!(l.nearest_listed(&t, node("a2")), Some(node("a2")));
+        assert_eq!(l.nearest_listed(&t, node("sh")), Some(node("sh")));
+        assert_eq!(l.nearest_listed(&t, node("t")), Some(node("a")));
+        let users = build(&t, Some(4), Filter::UserOnly);
+        assert_eq!(users.nearest_listed(&t, node("a2")), Some(node("u")));
+    }
+
+    /// a → b → {c → {e, f}, d → g}; the leaf g lays d's branch first: a b d g c e f.
+    fn forked() -> SessionTree {
+        tree(&[
+            user("a", None),
+            asst("b", Some("a")),
+            user("c", Some("b")),
+            user("d", Some("b")),
+            asst("e", Some("c")),
+            asst("f", Some("c")),
+            asst("g", Some("d")),
+        ])
+    }
+
+    /// Walk branch jumps from `start` and return the ids visited.
+    fn branch_walk(
+        t: &SessionTree,
+        l: &Layout,
+        start: &str,
+        forward: bool,
+        steps: usize,
+    ) -> Vec<String> {
+        let mut at = l.row_of_node(t.index[start]).unwrap();
+        (0..steps)
+            .map(|_| {
+                at = branch_jump(t, l, at, forward).unwrap();
+                t.nodes[l.rows[at].node].id.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn branch_jumps_visit_forks_in_row_order_and_wrap() {
+        let t = forked();
+        let l = build(&t, Some(t.index["g"]), Filter::Conversation);
+        assert_eq!(ids(&t, &l), ["a", "b", "d", "g", "c", "e", "f"]);
+        // Targets in row order: d, c (fork at b) then e, f (fork at c).
+        assert_eq!(branch_walk(&t, &l, "g", true, 5), ["c", "e", "f", "d", "c"]);
+        assert_eq!(
+            branch_walk(&t, &l, "g", false, 5),
+            ["f", "e", "c", "d", "f"]
+        );
+        // From inside a branch the nearest fork decides: f is its own branch at c.
+        assert_eq!(branch_walk(&t, &l, "f", true, 1), ["d"]);
+        assert_eq!(branch_walk(&t, &l, "f", false, 1), ["e"]);
+        // c heads its own branch at b, and its jump lands on the next target, e.
+        assert_eq!(branch_walk(&t, &l, "c", true, 1), ["e"]);
+    }
+
+    #[test]
+    fn branch_jump_from_outside_every_branch_starts_at_the_edge() {
+        let t = forked();
+        let l = build(&t, Some(t.index["g"]), Filter::Conversation);
+        // a and b have a single child each: not in any branch.
+        assert_eq!(branch_walk(&t, &l, "a", true, 1), ["d"]);
+        assert_eq!(branch_walk(&t, &l, "a", false, 1), ["f"]);
+        // A linear tree has no branches to jump to.
+        let lin = tree(&[user("x", None), asst("y", Some("x"))]);
+        let ll = build(&lin, Some(1), Filter::Conversation);
+        assert_eq!(branch_jump(&lin, &ll, 0, true), None);
+    }
+
+    #[test]
+    fn a_filtered_out_branch_head_is_promoted_to_its_first_listed_descendant() {
+        let mut t = forked();
+        // Only g and e carry labels: the heads d and c are hidden, f has nothing listed below.
+        t.labels.insert("g".to_owned(), "x".to_owned());
+        t.labels.insert("e".to_owned(), "x".to_owned());
+        let l = build(&t, Some(t.index["g"]), Filter::Labeled);
+        assert_eq!(ids(&t, &l), ["g", "e"]);
+        assert_eq!(branch_walk(&t, &l, "g", true, 3), ["e", "g", "e"]);
+        assert_eq!(branch_walk(&t, &l, "g", false, 1), ["e"]);
     }
 
     #[test]
@@ -782,5 +1322,43 @@ mod tests {
     fn fork_hint_names_the_cut() {
         assert_eq!(fork_hint(&NodeKind::User), "Fork before this prompt");
         assert_eq!(fork_hint(&NodeKind::Assistant), "Fork after this reply");
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    fn node(kind: NodeKind, tool: Option<&str>) -> TreeNode {
+        TreeNode {
+            id: "n".into(),
+            parent: None,
+            kind,
+            timestamp: None,
+            text: "[ask: x]".into(),
+            has_text: false,
+            stop_reason: None,
+            active_leaf: None,
+            cost_before: Default::default(),
+            search_text: String::new(),
+            attribution: None,
+            user_request: false,
+            tool_name: tool.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn only_a_tool_result_named_ask_can_be_re_answered() {
+        assert!(is_ask_result(&node(NodeKind::ToolResult, Some("ask"))));
+        // Another tool (whatever its row text says), or a result without a name.
+        assert!(!is_ask_result(&node(
+            NodeKind::ToolResult,
+            Some("ask_user")
+        )));
+        assert!(!is_ask_result(&node(NodeKind::ToolResult, Some("read"))));
+        assert!(!is_ask_result(&node(NodeKind::ToolResult, None)));
+        // The name belongs to tool results only.
+        assert!(!is_ask_result(&node(NodeKind::User, Some("ask"))));
+        assert!(!is_ask_result(&node(NodeKind::Assistant, Some("ask"))));
     }
 }

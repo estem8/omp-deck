@@ -6,10 +6,11 @@ use std::time::{Instant, SystemTime};
 
 use deck_core::ctl::CtlCommand;
 use deck_core::usage::{ACTIVITY_DAYS, AccountPolicy};
-use deck_service::gateway::protocol::{Answer, Mutation, Query, Topic};
+use deck_service::gateway::protocol::{Answer, Done, Mutation, Query, Topic};
 use egui::{Key, Modifiers};
 
-use super::App;
+use super::{App, PendingConfirm};
+use crate::confirm::Confirm;
 use crate::usage_state::UsageEvent;
 use crate::usage_view::{self, UsageAction, ViewInput};
 
@@ -51,9 +52,58 @@ impl App {
 
     pub(super) fn open_usage(&mut self) {
         self.usage_open = true;
+        // omp's `/usage reset` lands on the Saved resets page; every opening reads them afresh.
+        if std::mem::take(&mut self.usage_reset) {
+            self.usage_ui.page = usage_view::Page::Resets;
+        }
+        self.usage_ui.resets.invalidate();
         if self.usage.activity_due(Instant::now()) {
             self.start_activity_read();
         }
+    }
+
+    /// Asks omp for the saved resets of every stored account (the providers are queried, which
+    /// can take seconds; the page keeps the last list meanwhile).
+    fn load_resets(&mut self) {
+        if self.usage_ui.resets.loading {
+            return;
+        }
+        self.usage_ui.resets.begin_load();
+        self.gw
+            .query(Query::UsageResets { provider: None }, |app, r| {
+                let r = match r {
+                    Ok(Answer::UsageResets(list)) => Ok(list),
+                    Ok(_) => Err("unexpected answer".to_owned()),
+                    Err(e) => Err(e),
+                };
+                app.usage_ui.resets.loaded(r);
+            });
+    }
+
+    /// The spend was confirmed: omp spends one saved reset. The gateway re-reads usage itself
+    /// afterwards; the saved-reset list is read again here.
+    pub(super) fn execute_spend_reset(&mut self, provider: String, credential: String) {
+        if self.usage_ui.resets.spending.is_some() {
+            return;
+        }
+        self.usage_ui.resets.spending = Some((provider.clone(), credential.clone()));
+        self.gw.mutate(
+            Mutation::UsageResetSpend {
+                provider,
+                credential,
+            },
+            |app, r| {
+                app.usage_ui.resets.spending = None;
+                match r {
+                    Ok(Done::Message(m)) if !m.is_empty() => app.toasts.success(&app.ctx, m),
+                    Ok(_) => app.toasts.success(&app.ctx, "Saved reset spent"),
+                    Err(e) => app
+                        .toasts
+                        .error(&app.ctx, format!("Could not spend the reset: {e}")),
+                }
+                app.load_resets();
+            },
+        );
     }
 
     pub(super) fn close_usage(&mut self) {
@@ -141,6 +191,28 @@ impl App {
                     credential,
                     label,
                 } => self.pin_account(provider, credential, label),
+                UsageAction::LoadResets => self.load_resets(),
+                UsageAction::SpendReset {
+                    provider,
+                    credential,
+                    question,
+                } => {
+                    self.confirm = Some((
+                        Confirm {
+                            title: "Spend a saved reset?".to_owned(),
+                            body: format!(
+                                "{question} The limit it covers clears right away; this cannot \
+                                 be undone."
+                            ),
+                            confirm_label: "Spend reset".to_owned(),
+                            danger: false,
+                        },
+                        PendingConfirm::SpendReset {
+                            provider,
+                            credential,
+                        },
+                    ));
+                }
             }
         }
     }

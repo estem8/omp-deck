@@ -702,3 +702,46 @@ impl Gw {
         }));
     }
 }
+
+/// Why a mutation sent through [`Gw::mutate_typed`] did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutateError {
+    /// The gateway turned it away with a typed reason (e.g. `Rejected::Busy`).
+    Rejected(deck_service::controller::Rejected),
+    /// Any other failure, as text.
+    Failed(String),
+}
+
+impl Gw {
+    /// [`Gw::mutate`] for callers that act on the gateway's typed refusal.
+    pub fn mutate_typed(
+        &mut self,
+        op: Mutation,
+        done: impl FnOnce(&mut App, Result<Done, MutateError>) + 'static,
+    ) -> RequestKey {
+        let m = self.client.mutate(op);
+        let refusal = Rc::new(std::cell::Cell::new(None));
+        let seen = Rc::clone(&refusal);
+        // The acceptance callback runs before the completion for the same request.
+        let on_accepted = move |_: &mut App, _: RequestKey, r: Result<Submitted, GatewayError>| {
+            if let Err(GatewayError::Rejected(why)) = r {
+                seen.set(Some(why));
+            }
+        };
+        self.track(
+            m.key,
+            m.accepted,
+            Box::new(move |app, r| {
+                done(
+                    app,
+                    r.map_err(|text| match refusal.take() {
+                        Some(why) => MutateError::Rejected(why),
+                        None => MutateError::Failed(text),
+                    }),
+                );
+            }),
+            None,
+            Some(Box::new(on_accepted)),
+        )
+    }
+}

@@ -40,8 +40,19 @@ pub const EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-ctl.ts");
 /// `OMPDECK_DEL_TARGETS` and `OMPDECK_DEL_OUT` are set.
 pub const DELETE_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-del.ts");
 
+/// The session-store helper (see [`crate::omp::Omp::set_pinned`] and friends): inert unless
+/// `OMPDECK_SESS_REQ` and `OMPDECK_SESS_OUT` are set.
+pub const SESS_EXTENSION_SOURCE: &str = include_str!("../assets/ompdeck-sess.ts");
+
+/// `WATCHDOG.yml` load/save/discovery (omp's `advisor/config` is not importable from an
+/// extension, so it is ported), imported by both the control and the session helper extensions
+/// from the directory they are installed in.
+pub const ADVISOR_MODULE_SOURCE: &str = include_str!("../assets/ompdeck-advisor.ts");
+
 const EXTENSION_FILE: &str = "ompdeck-ctl.ts";
 const DELETE_EXTENSION_FILE: &str = "ompdeck-del.ts";
+const SESS_EXTENSION_FILE: &str = "ompdeck-sess.ts";
+const ADVISOR_MODULE_FILE: &str = "ompdeck-advisor.ts";
 /// Longest accepted protocol line; longer ones are dropped.
 const MAX_LINE: usize = 8 * 1024 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
@@ -50,16 +61,24 @@ const BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// Read/poll granularity: bounds how long the thread takes to notice shutdown or queued commands.
 const POLL: Duration = Duration::from_millis(50);
 
-/// Writes the extension to `<dir>/ompdeck-ctl.ts` if missing, different, or not a private (0600,
-/// euid-owned) regular non-symlink file; returns the path. Anything else at the path (a symlink, a
-/// foreign-owned or wrongly-moded file) is atomically replaced; a directory is an error.
+/// Writes the extension to `<dir>/ompdeck-ctl.ts` (and its `ompdeck-advisor.ts` module beside it)
+/// if missing, different, or not a private (0600, euid-owned) regular non-symlink file; returns
+/// the extension's path. Anything else at the path (a symlink, a foreign-owned or wrongly-moded
+/// file) is atomically replaced; a directory is an error.
 pub fn install_extension(dir: &Path) -> io::Result<PathBuf> {
+    install_asset(dir, ADVISOR_MODULE_FILE, ADVISOR_MODULE_SOURCE)?;
     install_asset(dir, EXTENSION_FILE, EXTENSION_SOURCE)
 }
 
 /// [`install_extension`] for the session-delete extension (`<dir>/ompdeck-del.ts`), same hardening.
 pub fn install_delete_extension(dir: &Path) -> io::Result<PathBuf> {
     install_asset(dir, DELETE_EXTENSION_FILE, DELETE_EXTENSION_SOURCE)
+}
+
+/// [`install_extension`] for the session helper (`<dir>/ompdeck-sess.ts` + its advisor module).
+pub fn install_sess_extension(dir: &Path) -> io::Result<PathBuf> {
+    install_asset(dir, ADVISOR_MODULE_FILE, ADVISOR_MODULE_SOURCE)?;
+    install_asset(dir, SESS_EXTENSION_FILE, SESS_EXTENSION_SOURCE)
 }
 
 fn install_asset(dir: &Path, file: &str, source: &str) -> io::Result<PathBuf> {
@@ -416,10 +435,46 @@ pub enum CtlCommand {
         root: PathBuf,
         entry_id: String,
     },
-    /// Move the live tab's leaf to `entry_id` (idle only). Reply: `leaf`.
+    /// Move the live tab's leaf to `entry_id` (idle only), optionally summarising the branch
+    /// being left (omp's `navigateTree` with `summarize`). Reply: `leaf`; `message` carries omp's
+    /// own status ("Already at this point" when `entry_id` is the current leaf).
     Navigate {
         root: PathBuf,
         entry_id: String,
+        /// Absent in payloads of older senders: no summary.
+        #[serde(default)]
+        summary: BranchSummary,
+    },
+    /// Set (or, with `None`/blank, remove) the label of `entry_id` in the live tab's session
+    /// (`sessionManager.appendLabelChange`; any state, an append). Unknown entry → `ok: false`.
+    SetLabel {
+        root: PathBuf,
+        entry_id: String,
+        label: Option<String>,
+    },
+    /// omp's "re-answer ask" on the `ask` result node `entry_id` (idle only): omp shows its own
+    /// ask dialog in the tab, the user answers it there, omp appends the new result and resumes
+    /// the turn. The reply arrives once that finished (or was cancelled: `ok: false`,
+    /// `error: "cancelled"`), which can take as long as the user needs.
+    ReanswerAsk {
+        root: PathBuf,
+        entry_id: String,
+    },
+    /// Read (`doc: None`; reply `value` = omp's document `{path, doc}`) or save (`doc: Some`: the
+    /// `WATCHDOG.yml` document of `scope`, an empty one deletes the file) the advisor configuration
+    /// for the live tab's project, then apply the merged roster to the running session
+    /// (`applyAdvisorConfigs`; reply `message` says how many advisors are active). `root`, when
+    /// given, must still be the tab's session.
+    AdvisorConfig {
+        root: Option<PathBuf>,
+        scope: crate::omp::AdvisorScope,
+        doc: Option<serde_json::Value>,
+    },
+    /// Set (`Some("provider/id")`) or clear (`None`) the session-only task-agent model override
+    /// (omp's task mode, `task.agentModelOverrides`). Reply `value` = the model now in effect.
+    TaskModelOverride {
+        root: Option<PathBuf>,
+        model: Option<String>,
     },
     /// Answer the pending UI request `id` ([`PendingUi::id`]) with `value`, the dialog
     /// function's own result: a label (`select`), `true`/`false` (`confirm`), text
@@ -441,7 +496,20 @@ pub enum CtlCommand {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// How much of the branch left behind by [`CtlCommand::Navigate`] omp summarises into the new
+/// position (omp's "Summarize branch?" choice).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BranchSummary {
+    /// "No summary".
+    #[default]
+    None,
+    /// "Summarize", with omp's default prompt.
+    Summarize,
+    /// "Summarize with custom prompt": these instructions steer the summary.
+    Custom(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CtlReply {
     pub ok: bool,
     pub error: Option<String>,
@@ -449,6 +517,12 @@ pub struct CtlReply {
     pub new_file: Option<PathBuf>,
     /// `Navigate`: the leaf after the move.
     pub leaf: Option<String>,
+    /// Result payload of commands that return data (`AdvisorConfig`, `TaskModelOverride`).
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    /// omp's own status text for the user ("Already at this point", "Saved … — 2 advisors active.").
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 // ---- wire format -------------------------------------------------------------------------------
@@ -474,6 +548,10 @@ enum WireMsg {
         new_file: Option<PathBuf>,
         #[serde(default)]
         leaf: Option<String>,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        #[serde(default)]
+        message: Option<String>,
     },
 }
 
@@ -770,8 +848,34 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::AnswerUi { id, value, root } => {
             serde_json::json!({"rid": rid, "t": "answer_ui", "id": id, "value": value, "root": root})
         }
-        CtlCommand::Navigate { root, entry_id } => {
-            serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root})
+        CtlCommand::Navigate {
+            root,
+            entry_id,
+            summary,
+        } => {
+            let (summarize, instructions) = match summary {
+                BranchSummary::None => (false, None),
+                BranchSummary::Summarize => (true, None),
+                BranchSummary::Custom(text) => (true, Some(text)),
+            };
+            serde_json::json!({"rid": rid, "t": "navigate", "entryId": entry_id, "root": root,
+                "summarize": summarize, "customInstructions": instructions})
+        }
+        CtlCommand::SetLabel {
+            root,
+            entry_id,
+            label,
+        } => {
+            serde_json::json!({"rid": rid, "t": "set_label", "entryId": entry_id, "root": root, "label": label})
+        }
+        CtlCommand::ReanswerAsk { root, entry_id } => {
+            serde_json::json!({"rid": rid, "t": "reanswer_ask", "entryId": entry_id, "root": root})
+        }
+        CtlCommand::AdvisorConfig { root, scope, doc } => {
+            serde_json::json!({"rid": rid, "t": "advisor_config", "root": root, "scope": scope.as_str(), "doc": doc})
+        }
+        CtlCommand::TaskModelOverride { root, model } => {
+            serde_json::json!({"rid": rid, "t": "task_model_override", "root": root, "model": model})
         }
         CtlCommand::PinAccount {
             root,
@@ -892,8 +996,7 @@ fn failure(msg: &str) -> CtlReply {
     CtlReply {
         ok: false,
         error: Some(msg.to_string()),
-        new_file: None,
-        leaf: None,
+        ..CtlReply::default()
     }
 }
 
@@ -1102,6 +1205,8 @@ impl Worker {
                 error,
                 new_file,
                 leaf,
+                value,
+                message,
             } => {
                 if self.pending.remove(&rid) {
                     let reply = CtlReply {
@@ -1109,6 +1214,8 @@ impl Worker {
                         error,
                         new_file,
                         leaf,
+                        value,
+                        message,
                     };
                     lock(&self.shared.replies).push((rid, reply));
                     (self.on_update)();
@@ -1122,6 +1229,27 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigate_payloads_without_a_summary_still_decode() {
+        let old: CtlCommand =
+            serde_json::from_str(r#"{"Navigate":{"root":"/s/a.jsonl","entry_id":"e1"}}"#).unwrap();
+        assert_eq!(
+            old,
+            CtlCommand::Navigate {
+                root: "/s/a.jsonl".into(),
+                entry_id: "e1".into(),
+                summary: BranchSummary::None,
+            }
+        );
+        let new: CtlCommand = serde_json::from_str(
+            r#"{"Navigate":{"root":"/s/a.jsonl","entry_id":"e1","summary":{"Custom":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(new, CtlCommand::Navigate { summary: BranchSummary::Custom(t), .. } if t == "x")
+        );
+    }
 
     #[test]
     fn with_ctl_loads_the_extension_without_an_env_wrapper() {

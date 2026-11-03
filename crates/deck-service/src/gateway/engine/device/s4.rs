@@ -1849,6 +1849,7 @@ impl Engine {
                     command: deck_core::ctl::CtlCommand::Navigate {
                         root,
                         entry_id: entry,
+                        summary: deck_core::ctl::BranchSummary::None,
                     },
                 }
             }

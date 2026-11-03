@@ -6,6 +6,8 @@
 //! module sends the requests (the gateway runs omp and the backends) and owns the cleanup shared
 //! with the sidebar's single-session actions.
 
+mod resume;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf, absolute};
 use std::time::{Duration, Instant, SystemTime};
@@ -22,6 +24,7 @@ use egui::{Key, Modifiers};
 use super::{App, PendingConfirm};
 use crate::app::human_size;
 use crate::confirm::Confirm;
+use crate::resume_model::Epoch;
 use crate::running_model::{HubMode, RunModel, RunPoll};
 use crate::sessions_model::{Live, Model, plural};
 use crate::sessions_view::{self, OpProgress, SessionsAction, ViewInput, ViewState};
@@ -161,6 +164,26 @@ pub(super) struct SessionHub {
     mode: HubMode,
     run: RunModel,
     run_poll: RunPolling,
+    /// The tab omp's `/resume` was redirected from while the hub is open for it.
+    pub(super) resume_origin: Option<ResumeOrigin>,
+    /// The imported session whose file the hub waits to see in the inventory, to open it in a
+    /// tab (and since when).
+    open_when_listed: Option<(PathBuf, Instant)>,
+    /// The rename dialog, while open.
+    rename: Option<resume::RenameDialog>,
+    /// Where the resume in flight goes (fixed when it was asked for).
+    resume_dest: Option<resume::ResumeDest>,
+    /// Which opening of the hub requests in flight belong to; see [`Epoch`].
+    resume_epoch: Epoch,
+}
+
+/// Where a redirected `/resume` came from: the hub resumes into that tab, and lists the foreign
+/// source's sessions when one was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResumeOrigin {
+    /// `uid` of the tab.
+    pub(super) tab: u64,
+    pub(super) foreign: Option<deck_core::omp::ForeignSource>,
 }
 
 /// What one session of a bulk operation ended with.
@@ -190,6 +213,8 @@ impl App {
     /// Open the hub (scoped to `scope` when given) and follow the gateway's inventory.
     pub(super) fn open_sessions(&mut self, scope: Option<PathBuf>) {
         let hub = &mut self.sessions;
+        hub.drop_waits();
+        hub.resume_origin = None;
         hub.open = true;
         hub.view.release_focus = true;
         hub.model.filter = Default::default();
@@ -210,6 +235,7 @@ impl App {
 
     pub(super) fn close_sessions(&mut self) {
         let hub = &mut self.sessions;
+        hub.drop_waits();
         hub.open = false;
         hub.generation += 1;
         self.gw.unsubscribe(&Topic::Inventory);
@@ -284,6 +310,7 @@ impl App {
     /// worktree projects are called.
     fn sync_hub_inputs(&mut self) {
         self.take_inventory();
+        self.poll_listed();
         let generation = self.gw.sessions_generation();
         if self.sessions.labels_gen != Some(generation) {
             self.sessions.labels_gen = Some(generation);
@@ -345,9 +372,11 @@ impl App {
             || self.folder_dialog.is_some()
             || self.dialog.is_some()
             || self.wt.dialog.is_some()
-            || self.palette.is_some();
+            || self.palette.is_some()
+            || self.sessions.rename.is_some();
         let (omp, can_stop) = (self.omp_found(), self.backends_available());
         let hub = &mut self.sessions;
+        let here = resume::resume_here(hub.resume_origin.as_ref(), &self.tabs, &self.labels);
         let input = ViewInput {
             scanning: !hub.loaded,
             loaded: hub.loaded,
@@ -357,6 +386,7 @@ impl App {
             now: SystemTime::now(),
             omp,
             can_stop,
+            here,
         };
         let actions = sessions_view::show(ctx, &mut hub.model, &mut hub.run, &mut hub.view, &input);
         // Ages tick over without any other event.
@@ -364,6 +394,7 @@ impl App {
         for a in actions {
             self.apply_sessions_action(a);
         }
+        self.show_rename(ctx);
     }
 
     // ------------------------------------------------------------ running
@@ -391,6 +422,7 @@ impl App {
                 .iter()
                 .any(|r| r.live.running)
                 .then_some(RAM_POLL),
+            HubMode::Resume => None,
         };
         let last = hub.run_poll.last;
         let wait = match (last, every) {
@@ -547,6 +579,9 @@ impl App {
                     self.sessions.mode = mode;
                     // Fresh numbers at once on entering the Running view.
                     self.sessions.run_poll.last = None;
+                    if mode == HubMode::Resume {
+                        self.enter_resume_mode();
+                    }
                 }
             }
             SessionsAction::KillRunning(names) => self.request_kill_running(names),
@@ -582,6 +617,17 @@ impl App {
                     self.open_folder(dir.to_path_buf());
                 }
             }
+            SessionsAction::Pin { id, pinned } => self.pin_session(id, pinned),
+            SessionsAction::Rename(path) => self.ask_rename(&path),
+            SessionsAction::ResumeHere(file) => self.start_resume(file),
+            SessionsAction::SetSource(source) => self.set_resume_source(source),
+            SessionsAction::ReloadForeign(src) => self.load_foreign(src),
+            SessionsAction::ImportForeign {
+                source,
+                id,
+                cwd,
+                then,
+            } => self.start_import(source, id, &cwd, then),
         }
     }
 

@@ -5,6 +5,8 @@
 //! mutating the model for view-local state (scope, filter, sort, selection, detail) and returning
 //! [`SessionsAction`]s for everything that touches the outside world.
 
+mod resume;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -21,8 +23,10 @@ use crate::icons::{
     ICON_ACTIVITY, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHECK, ICON_CIRCLE_STOP, ICON_COINS,
     ICON_COPY, ICON_CPU, ICON_EXTERNAL_LINK, ICON_FOLDER, ICON_FOLDER_INPUT, ICON_FOLDER_OPEN,
     ICON_FOLDER_OUTPUT, ICON_FOLDER_X, ICON_HARD_DRIVE, ICON_INFO, ICON_MESSAGES_SQUARE,
-    ICON_MINUS, ICON_REFRESH_CW, ICON_SEARCH, ICON_SPARKLES, ICON_TRASH_2, ICON_X, Icon,
+    ICON_MINUS, ICON_PENCIL, ICON_REFRESH_CW, ICON_SEARCH, ICON_SPARKLES, ICON_STAR, ICON_TRASH_2,
+    ICON_X, Icon,
 };
+use crate::resume_model::{ResumeState, Source, Then};
 use crate::running_model::{HubMode, RunModel};
 use crate::sessions_model::{
     Badge, Check, Column, Filter, Model, Project, Row, StatsSlot, compact, plural,
@@ -35,6 +39,7 @@ use crate::usage_fmt::money;
 use crate::usage_view::tab_chip;
 use crate::widgets::{DraftButton, DraftKind};
 use crate::widgets::{Spin, empty_state, icon_text, paint_icon};
+use deck_core::omp::ForeignSource;
 
 pub(crate) const ROW_H: f32 = 34.0;
 pub(crate) const HEAD_H: f32 = 30.0;
@@ -52,6 +57,8 @@ pub struct ViewState {
     focus_filter: bool,
     /// Drop keyboard focus held outside the hub (the terminal) on the next frame.
     pub release_focus: bool,
+    /// Resume mode's own state.
+    pub resume: ResumeState,
 }
 
 /// What the app tells the view each frame.
@@ -71,6 +78,8 @@ pub struct ViewInput<'a> {
     pub omp: bool,
     /// Stopping a running session is possible (a session backend exists).
     pub can_stop: bool,
+    /// Resume mode: the title of the tab "Resume here" acts on, or why there is none.
+    pub here: Result<&'a str, &'static str>,
 }
 
 pub struct OpProgress {
@@ -105,6 +114,26 @@ pub enum SessionsAction {
     OpenFolder(PathBuf),
     /// Reveal the session file in the file manager (opens its folder).
     Reveal(PathBuf),
+    /// Pin or unpin the session `id` in omp.
+    Pin {
+        id: String,
+        pinned: bool,
+    },
+    /// Ask for a new title of the session in this file.
+    Rename(PathBuf),
+    /// Resume the omp session in this file into the tab the manager was opened from.
+    ResumeHere(PathBuf),
+    /// Resume mode lists another source now.
+    SetSource(Source),
+    /// Read the Claude Code / Codex list again.
+    ReloadForeign(ForeignSource),
+    /// Import the foreign session `id` (it ran in `cwd`), then resume it here or open it.
+    ImportForeign {
+        source: ForeignSource,
+        id: String,
+        cwd: String,
+        then: Then,
+    },
 }
 
 // ------------------------------------------------------------------ window
@@ -142,7 +171,9 @@ pub fn show(
     }
     // Only the hub's own text field counts as typing; the terminal's focus must not.
     let typing = ctx.memory(|m| m.has_focus(Id::unique(FILTER_ID)));
-    if !input.blocked && !egui::Popup::is_any_open(ctx) && !typing {
+    if input.mode == HubMode::Resume {
+        resume::keys(ctx, model, st, input, &mut out);
+    } else if !input.blocked && !egui::Popup::is_any_open(ctx) && !typing {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             out.push(SessionsAction::Close);
         }
@@ -160,6 +191,7 @@ pub fn show(
             {
                 out.push(SessionsAction::Delete(selected_paths(model)));
             }
+            session_keys(ctx, model, input, &mut out);
         }
     }
 
@@ -192,6 +224,66 @@ pub fn show(
     out
 }
 
+/// omp's resume-picker keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKey {
+    Rename,
+    Pin,
+    Unpin,
+    Delete,
+}
+
+/// Ctrl+R renames, Alt+K pins, Alt+Shift+K unpins, Ctrl+D deletes (omp's defaults). The shifted
+/// chord is taken first so Alt+Shift+K is never read as Alt+K.
+fn row_key(ctx: &egui::Context) -> Option<RowKey> {
+    ctx.input_mut(|i| {
+        if i.consume_key(Modifiers::ALT | Modifiers::SHIFT, Key::K) {
+            Some(RowKey::Unpin)
+        } else if i.consume_key(Modifiers::ALT, Key::K) {
+            Some(RowKey::Pin)
+        } else if i.consume_key(Modifiers::COMMAND, Key::R) {
+            Some(RowKey::Rename)
+        } else if i.consume_key(Modifiers::COMMAND, Key::D) {
+            Some(RowKey::Delete)
+        } else {
+            None
+        }
+    })
+}
+
+/// What `key` does to the session `row`.
+fn row_key_action(key: RowKey, row: &Row, input: &ViewInput<'_>) -> Option<SessionsAction> {
+    if !input.omp {
+        return None;
+    }
+    let idle = input.op.is_none();
+    match key {
+        RowKey::Pin | RowKey::Unpin => Some(SessionsAction::Pin {
+            id: row.entry.id.clone(),
+            pinned: key == RowKey::Pin,
+        }),
+        RowKey::Rename => idle.then(|| SessionsAction::Rename(row.path().to_path_buf())),
+        RowKey::Delete => idle.then(|| SessionsAction::Delete(vec![row.path().to_path_buf()])),
+    }
+}
+
+/// The picker keys on the session whose details are open.
+fn session_keys(
+    ctx: &egui::Context,
+    model: &Model,
+    input: &ViewInput<'_>,
+    out: &mut Vec<SessionsAction>,
+) {
+    let Some(row) = model.detail.as_deref().and_then(|p| model.row_by_path(p)) else {
+        return;
+    };
+    if let Some(key) = row_key(ctx)
+        && let Some(a) = row_key_action(key, row, input)
+    {
+        out.push(a);
+    }
+}
+
 fn selected_paths(model: &Model) -> Vec<PathBuf> {
     model
         .selected_rows()
@@ -210,6 +302,10 @@ fn body(
 ) {
     header(ui, model, run, input, out);
     ui.add_space(8.0);
+    if input.mode == HubMode::Resume {
+        resume::body(ui, model, st, input, out);
+        return;
+    }
     let sessions = input.mode == HubMode::Sessions;
     if sessions {
         filter_row(ui, model, st);
@@ -313,6 +409,14 @@ fn header(
             {
                 set_mode = Some(HubMode::Running);
             }
+            if tab_chip(ui, "Resume…", input.mode == HubMode::Resume)
+                .on_hover_text(
+                    "Pick a session to resume — omp's /resume, with Claude Code and Codex",
+                )
+                .clicked()
+            {
+                set_mode = Some(HubMode::Resume);
+            }
             ui.add_space(4.0);
             match input.mode {
                 HubMode::Sessions => {
@@ -332,6 +436,7 @@ fn header(
                     }
                 }
                 HubMode::Running => {}
+                HubMode::Resume => {}
             }
         },
         |ui| {
@@ -1240,7 +1345,7 @@ pub(crate) fn galley_cell(p: &Painter, rect: Rect, g: &Arc<Galley>, right: bool)
 fn badge_color(b: &Badge, pal: &Palette) -> Color32 {
     match b {
         Badge::Running => pal.ok,
-        Badge::InTab => pal.accent,
+        Badge::InTab | Badge::Pinned => pal.accent,
         Badge::Busy | Badge::Aborted => pal.warn,
         Badge::Error | Badge::FolderMissing => pal.danger,
         Badge::Fork(_) | Badge::Stub => pal.weak,
@@ -1507,6 +1612,7 @@ fn badge_hue(b: &Badge) -> crate::badge::Hue {
         Badge::Aborted => Hue::Orange,
         Badge::Fork(_) => Hue::Violet,
         Badge::FolderMissing => Hue::Orange,
+        Badge::Pinned => Hue::Amber,
         Badge::Stub => Hue::Teal,
     }
 }
@@ -1887,6 +1993,22 @@ fn detail_buttons(
             .clicked()
         {
             out.push(SessionsAction::Open(path.clone()));
+        }
+        let pin_label = if row.pinned { "Unpin" } else { "Pin" };
+        if action_button(ui, ICON_STAR, pin_label, input.omp, false)
+            .on_hover_text("Pinned sessions come first (Alt+K pins, Alt+Shift+K unpins)")
+            .clicked()
+        {
+            out.push(SessionsAction::Pin {
+                id: row.entry.id.clone(),
+                pinned: !row.pinned,
+            });
+        }
+        if action_button(ui, ICON_PENCIL, "Rename…", input.omp && idle, false)
+            .on_hover_text("Rename the session (Ctrl+R)")
+            .clicked()
+        {
+            out.push(SessionsAction::Rename(path.clone()));
         }
         transfer_button(
             ui,

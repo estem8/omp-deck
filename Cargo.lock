@@ -1161,10 +1161,11 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "deck-core"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "deck-host",
+ "deck-tsp",
  "dirs",
  "flate2",
  "getrandom 0.4.3",
@@ -1192,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "deck-host"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "alacritty_terminal",
  "base64 0.22.1",
@@ -1211,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "deck-relay"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1236,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "deck-remote"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "blake2 0.10.6",
@@ -1253,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "deck-service"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "deck-core",
@@ -1291,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "deck-term"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -1314,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "deck-tsp"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "log",
@@ -3696,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.25.2"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "deck-core",

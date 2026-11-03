@@ -39,6 +39,8 @@ pub enum Page {
     Overview,
     Details,
     Accounts,
+    /// omp's `/usage reset`: the banked rate-limit resets.
+    Resets,
 }
 
 #[derive(Default)]
@@ -53,6 +55,8 @@ pub struct ViewState {
     pub saved: Option<(String, usize)>,
     /// A pin/unpin is waiting for the omp session.
     pub pinning: bool,
+    /// The Saved resets page: what omp lists, and a spend in flight.
+    pub resets: crate::usage_resets::ResetsState,
 }
 
 impl ViewState {
@@ -100,6 +104,15 @@ pub enum UsageAction {
         provider: String,
         credential: Option<String>,
         label: Option<String>,
+    },
+    /// Read the saved resets of every stored account.
+    LoadResets,
+    /// Spend one saved reset of the stored account `credential` of `provider` (the app asks
+    /// `question` first).
+    SpendReset {
+        provider: String,
+        credential: String,
+        question: String,
     },
 }
 
@@ -190,6 +203,7 @@ fn body(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Vec<Us
                 Page::Overview => overview(ui, input, out),
                 Page::Details => details(ui, input, out),
                 Page::Accounts => accounts(ui, st, input, out),
+                Page::Resets => resets(ui, st, input, out),
             }
         });
 }
@@ -247,6 +261,7 @@ fn tabs(ui: &mut Ui, st: &mut ViewState) {
             (Page::Overview, "Overview"),
             (Page::Details, "Details"),
             (Page::Accounts, "Accounts"),
+            (Page::Resets, "Saved resets"),
         ] {
             if tab_chip(ui, label, st.page == page).clicked() {
                 st.page = page;
@@ -1027,6 +1042,196 @@ fn cell_tip(resp: &egui::Response, hm: &Heatmap, row: usize, week: usize) {
             });
         },
     );
+}
+
+// ------------------------------------------------------------------ saved resets
+
+/// omp's `/usage reset`: the saved rate-limit resets of the stored accounts, each with a Drafted
+/// Spend button (the app asks first). The list is read when the page first shows (the providers
+/// are asked, which takes seconds).
+fn resets(ui: &mut Ui, st: &mut ViewState, input: &ViewInput<'_>, out: &mut Vec<UsageAction>) {
+    let pal = Palette::of_ui(ui);
+    if !st.resets.requested {
+        out.push(UsageAction::LoadResets);
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Rate-limit resets your Codex and Claude plans have banked. Spending one \
+                     clears the limit it covers right away.",
+                )
+                .small()
+                .color(pal.weak),
+            )
+            .wrap(),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if st.resets.loading {
+            ui.add(Spin::new(15.0, pal.accent));
+            ui.label(
+                RichText::new("Asking the providers…")
+                    .small()
+                    .color(pal.weak),
+            );
+        } else if DraftButton::new("Reload")
+            .icon(ICON_REFRESH_CW)
+            .min_width(96.0)
+            .show(ui)
+            .on_hover_text("Ask the providers again")
+            .clicked()
+        {
+            out.push(UsageAction::LoadResets);
+        }
+    });
+    if let Some(e) = &st.resets.error {
+        Frame::NONE
+            .fill(theme::mix(pal.bar, pal.danger, 0.10))
+            .stroke(theme::status_stroke(pal, pal.danger, 0.35))
+            .corner_radius(theme::rad(8, 12))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(icon_text(ICON_CIRCLE_ALERT, 15.0, pal.danger));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("Could not read the saved resets. {e}"))
+                                .small()
+                                .color(pal.text),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+    }
+    let Some(list) = &st.resets.accounts else {
+        return;
+    };
+    let rows = crate::usage_resets::rows(list, input.session);
+    if rows.is_empty() {
+        empty_state(
+            ui,
+            ICON_KEY_ROUND,
+            pal.accent,
+            "No accounts",
+            crate::usage_resets::NO_ACCOUNTS,
+        );
+        return;
+    }
+    if let Some(msg) = crate::usage_resets::empty_message(list) {
+        Frame::NONE
+            .fill(theme::mix(pal.bar, pal.accent, 0.08))
+            .stroke(Stroke::new(1.0, pal.stroke))
+            .corner_radius(theme::rad(8, 12))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(icon_text(crate::icons::ICON_INFO, 15.0, pal.accent));
+                    ui.add(egui::Label::new(RichText::new(msg).color(pal.text)).wrap());
+                });
+            });
+    }
+    let busy = st.resets.spending.is_some();
+    for r in &rows {
+        reset_card(
+            ui,
+            r,
+            busy,
+            st.resets.is_spending(&r.provider, &r.credential),
+            out,
+        );
+    }
+}
+
+fn reset_card(
+    ui: &mut Ui,
+    r: &crate::usage_resets::AccountRow,
+    busy: bool,
+    spending: bool,
+    out: &mut Vec<UsageAction>,
+) {
+    let pal = Palette::of_ui(ui);
+    card_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            chip(ui, &r.provider_label, pal.accent);
+            ui.add(
+                egui::Label::new(theme::strong(&r.label).size(14.5).color(pal.text_strong))
+                    .truncate(),
+            );
+            if r.in_use {
+                chip(ui, "In use", pal.ok);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if spending {
+                    ui.add(Spin::new(17.0, pal.accent));
+                    return;
+                }
+                let tip = if !r.spendable {
+                    "This account has no saved reset"
+                } else if busy {
+                    "A reset is being spent"
+                } else {
+                    "Spend one saved reset (asks first)"
+                };
+                if DraftButton::new("Spend 1 reset")
+                    .kind(DraftKind::Primary)
+                    .enabled(r.spendable && !busy)
+                    .min_width(130.0)
+                    .show(ui)
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text(tip)
+                    .clicked()
+                {
+                    out.push(UsageAction::SpendReset {
+                        provider: r.provider.clone(),
+                        credential: r.credential.clone(),
+                        question: r.spend_question(),
+                    });
+                }
+            });
+        });
+        crate::card::kv(ui, 130.0, "Saved", |ui| {
+            ui.label(theme::strong(r.available.to_string()).color(pal.text_strong));
+        });
+        crate::card::kv(ui, 130.0, "Redeemable now", |ui| {
+            let color = if r.redeemable > 0 { pal.ok } else { pal.weak };
+            ui.label(theme::strong(r.redeemable.to_string()).color(color));
+        });
+        if let Some(d) = &r.soonest {
+            crate::card::kv(ui, 130.0, "Soonest expiry", |ui| {
+                ui.label(theme::strong(d).color(pal.text_strong));
+            });
+        }
+        if let Some(why) = &r.reason {
+            crate::card::kv(ui, 130.0, "Unavailable", |ui| {
+                ui.add(egui::Label::new(RichText::new(why).color(pal.warn)).wrap());
+            });
+        }
+        if let Some(e) = &r.error {
+            crate::card::kv(ui, 130.0, "Error", |ui| {
+                ui.add(egui::Label::new(RichText::new(e).color(pal.danger)).wrap());
+            });
+        }
+    });
+}
+
+/// A small bordered tag.
+fn chip(ui: &mut Ui, text: &str, color: Color32) {
+    Frame::NONE
+        .fill(color.gamma_multiply(0.16))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .corner_radius(theme::rad(4, 9))
+        .inner_margin(Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).small().strong().color(color));
+        });
 }
 
 // ------------------------------------------------------------------ accounts

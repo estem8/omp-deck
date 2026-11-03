@@ -2,6 +2,9 @@
 //! with a nav rail on the left (OmpDeck's own preferences, then omp's settings tabs) and the
 //! selected section on the right, with a search field that filters across every omp tab.
 
+use std::path::Path;
+
+use crate::advisor_page::{self, AdvisorAction, AdvisorInput, AdvisorState};
 use crate::agent_config::{self, AgentsAction, AgentsInput, AgentsState};
 use crate::icons::Icon;
 use crate::icons::{
@@ -12,6 +15,7 @@ use crate::icons::{
     ICON_SLIDERS_HORIZONTAL, ICON_SPARKLES, ICON_SUN, ICON_TERMINAL, ICON_TRIANGLE_ALERT,
     ICON_WRENCH,
 };
+use crate::icons::{ICON_FILE_PEN_LINE, ICON_PUZZLE};
 use crate::mobile_view::{self, MobileAction, MobileInput};
 use deck_core::config::{
     Density, GatewayMode, MAX_UI_SCALE, MIN_UI_SCALE, Theme, UiFont, UiFontKind, UiStyle,
@@ -32,6 +36,7 @@ use crate::omp_rows::{
     show_secret_modal, skeleton,
 };
 use crate::omp_settings::{Model, TabHits, TabModel};
+use crate::plugins_page::{self, PluginsAction, PluginsInput, PluginsState};
 use crate::sync_view::{self, SyncAction, SyncPage};
 use crate::theme::{self, Palette};
 use crate::update::{UpdateState, status_line};
@@ -47,6 +52,10 @@ enum Entry {
     Sync,
     Agents,
     Omp(usize),
+    /// omp's "Installed" page: the plugins `omp plugin list` reports.
+    Plugins,
+    /// `/advisor configure`: a `WATCHDOG.yml`.
+    Advisor,
 }
 
 impl Default for Entry {
@@ -133,10 +142,14 @@ struct OmpPane {
     model: Option<Model>,
     loading: bool,
     load_error: Option<String>,
+    /// omp's page that was asked for before the catalog was loaded.
+    pending_page: Option<String>,
     query: String,
     /// Search results for the query they were computed for.
     hits: Option<(String, Vec<TabHits>)>,
     modal: Option<Modal>,
+    /// The project's own settings file (JSON) of the active tab, which supplies some values.
+    layer: Option<Value>,
 }
 
 #[derive(Default)]
@@ -146,6 +159,10 @@ pub struct SettingsState {
     view_key: Option<(Option<Entry>, String)>,
     omp: OmpPane,
     pub agents: AgentsState,
+    pub plugins: PluginsState,
+    pub advisor: AdvisorState,
+    /// The project whose settings file `omp.layer` holds (`Some(None)`: no project).
+    layer_for: Option<Option<std::path::PathBuf>>,
     /// The backup server form (kept while switching pages).
     pub server_form: ServerForm,
     /// Drop keyboard focus held outside the window (the terminal) on its next frame.
@@ -158,10 +175,15 @@ pub struct SettingsState {
 impl SettingsState {
     /// The window opens: it takes the keyboard, and the agents page rereads the files.
     pub fn opened(&mut self) {
+        // The project's file may have changed since: read it again.
+        self.layer_for = None;
         self.release_focus = true;
         self.focus_held = false;
-        if self.selected == Entry::Agents {
-            self.agents.opened();
+        match self.selected {
+            Entry::Agents => self.agents.opened(),
+            Entry::Plugins => self.plugins.opened(),
+            Entry::Advisor => self.advisor.opened(),
+            _ => {}
         }
     }
 
@@ -172,10 +194,38 @@ impl SettingsState {
         pane.hits = None;
         match result {
             Ok(catalog) => {
-                pane.model = Some(Model::from_catalog(catalog, config_dir));
+                let mut model = Model::from_catalog(catalog, config_dir);
+                model.set_project_layer(pane.layer.as_ref());
+                pane.model = Some(model);
                 pane.load_error = None;
+                // A page omp has but OmpDeck's catalog lacks leaves the first one shown.
+                if let Some(id) = pane.pending_page.take() {
+                    self.show_omp_page(&id);
+                }
             }
-            Err(e) => pane.load_error = Some(e),
+            Err(e) => {
+                pane.pending_page = None;
+                pane.load_error = Some(e);
+            }
+        }
+    }
+
+    /// Show omp's settings (what omp's own `/settings` screen is): its category `page` (omp's
+    /// page ids are the catalog's tab ids), or the first. Applied when the catalog arrives if it
+    /// has not yet.
+    pub fn open_omp_page(&mut self, page: Option<&str>) {
+        self.selected = Entry::Omp(0);
+        self.omp.query.clear();
+        self.omp.pending_page = None;
+        let Some(id) = page else { return };
+        // OmpDeck's own pages (omp's "Installed" page is `plugins`) need no catalog.
+        if self.show_own_page(id) {
+            return;
+        }
+        if self.omp.model.is_none() {
+            self.omp.pending_page = Some(id.to_owned());
+        } else {
+            self.show_omp_page(id);
         }
     }
 
@@ -198,18 +248,95 @@ impl SettingsState {
         self.agents.opened();
     }
 
-    /// `(id, label)` of omp's settings categories once the catalog is loaded.
+    /// Show the Plugins page (rereading the plugin list).
+    pub fn show_plugins(&mut self) {
+        self.selected = Entry::Plugins;
+        self.omp.query.clear();
+        self.plugins.opened();
+    }
+
+    /// Show the Advisor page (rereading the file).
+    pub fn show_advisor(&mut self) {
+        self.selected = Entry::Advisor;
+        self.omp.query.clear();
+        self.advisor.opened();
+    }
+
+    /// The pages OmpDeck draws itself for what omp's `/settings` shows as its own pages: omp's
+    /// "Installed" page (`plugins`; `installed` and `plugin` are tolerated) and the advisor.
+    fn show_own_page(&mut self, id: &str) -> bool {
+        match id {
+            "plugins" | "plugin" | "installed" => self.show_plugins(),
+            "advisor" => self.show_advisor(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Show the search results for one omp setting key (a link to that setting).
+    pub fn show_omp_setting(&mut self, key: &str) {
+        self.selected = Entry::Omp(0);
+        self.omp.query = key.to_owned();
+    }
+    /// The effective value (saved, else default) of omp setting `key` as the loaded catalog has it.
+    pub fn omp_effective(&self, key: &str) -> Option<&Value> {
+        self.omp.model.as_ref()?.find(key)?.effective()
+    }
+
+    /// The project whose settings file the badges and hidden editors follow is `project`: the
+    /// file to read, when it is not the one already read (or being read). With no project there
+    /// is no file, and the marks are cleared at once.
+    pub fn layer_request(&mut self, project: Option<&Path>) -> Option<std::path::PathBuf> {
+        if self.layer_for.as_ref().map(|p| p.as_deref()) == Some(project) {
+            return None;
+        }
+        self.layer_for = Some(project.map(Path::to_path_buf));
+        match project {
+            Some(p) => Some(p.to_path_buf()),
+            None => {
+                self.apply_layer(None);
+                None
+            }
+        }
+    }
+
+    /// The settings file of `project` was read (`None`: it has none, or not a JSON object): the
+    /// rows it supplies get an "overridden by" badge, and omp's three editors that it hides go.
+    /// A reply for a project no longer followed is dropped.
+    pub fn project_layer(&mut self, project: &Path, layer: Option<Value>) {
+        if self.layer_for.as_ref().and_then(Option::as_deref) == Some(project) {
+            self.apply_layer(layer);
+        }
+    }
+
+    fn apply_layer(&mut self, layer: Option<Value>) {
+        let pane = &mut self.omp;
+        pane.layer = layer;
+        pane.hits = None;
+        if let Some(model) = &mut pane.model {
+            model.set_project_layer(pane.layer.as_ref());
+        }
+    }
+
+    /// `(id, label)` of omp's settings categories once the catalog is loaded, then the pages
+    /// OmpDeck draws itself.
     pub fn omp_pages(&self) -> Vec<(String, String)> {
-        self.omp.model.as_ref().map_or_else(Vec::new, |m| {
+        let mut pages: Vec<(String, String)> = self.omp.model.as_ref().map_or_else(Vec::new, |m| {
             m.tabs
                 .iter()
                 .map(|t| (t.id.clone(), t.label.clone()))
                 .collect()
-        })
+        });
+        pages.push(("plugins".to_owned(), "Plugins".to_owned()));
+        pages.push(("advisor".to_owned(), "Advisor".to_owned()));
+        pages
     }
 
     /// Show omp's settings category `id`; false when the catalog has none by that id.
     pub fn show_omp_page(&mut self, id: &str) -> bool {
+        if self.show_own_page(id) {
+            return true;
+        }
         let Some(i) = self
             .omp
             .model
@@ -259,6 +386,10 @@ pub struct SettingsInput<'a> {
     pub app_update: crate::app_update::SettingsCard<'a>,
     pub mobile: MobileCard<'a>,
     pub agents: AgentsInput<'a>,
+    /// The project of the active session tab.
+    pub project: Option<&'a Path>,
+    /// An omp session is open in the active tab (plugin changes and saved advisors reach it).
+    pub live_tab: bool,
 }
 
 /// The session-backend card: the stored choice and which backends exist on this machine.
@@ -313,6 +444,10 @@ pub enum SettingsAction {
     AppUpdate(crate::app_update::SettingsAction),
     /// Settings → Agents.
     Agents(AgentsAction),
+    /// Settings → Plugins.
+    Plugins(PluginsAction),
+    /// Settings → Advisor.
+    Advisor(AdvisorAction),
 }
 
 fn tab_icon(id: &str) -> Icon {
@@ -462,6 +597,7 @@ fn body(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>) -> Ve
                 .show(ui, |ui| nav(ui, state, input, searching));
         });
 
+    let mut jump: Option<&'static str> = None;
     let content = pane_frame().fill(pal.bg).outer_margin(Margin {
         left: 10,
         ..Margin::ZERO
@@ -520,6 +656,51 @@ fn body(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>) -> Ve
                                         .map(SettingsAction::Sync),
                                 ),
                                 Entry::Agents => {}
+                                Entry::Plugins | Entry::Advisor if !input.omp_found => {
+                                    not_found_card(ui, &mut actions)
+                                }
+                                Entry::Plugins => actions.extend(
+                                    plugins_page::show(
+                                        ui,
+                                        &mut state.plugins,
+                                        &PluginsInput {
+                                            project: input.project,
+                                            reload_tab: input.live_tab,
+                                        },
+                                    )
+                                    .into_iter()
+                                    .map(SettingsAction::Plugins),
+                                ),
+                                Entry::Advisor => {
+                                    let enabled = state
+                                        .omp
+                                        .model
+                                        .as_ref()
+                                        .and_then(|m| m.find(advisor_page::ENABLE_KEY))
+                                        .and_then(|r| r.effective())
+                                        .and_then(Value::as_bool);
+                                    let mut open = false;
+                                    actions.extend(
+                                        advisor_page::show(
+                                            ui,
+                                            &mut state.advisor,
+                                            &AdvisorInput {
+                                                project: input.project,
+                                                models: input.agents.models,
+                                                favorites: input.agents.favorites,
+                                                provider: input.agents.provider,
+                                                enabled,
+                                                live_tab: input.live_tab,
+                                            },
+                                            &mut open,
+                                        )
+                                        .into_iter()
+                                        .map(SettingsAction::Advisor),
+                                    );
+                                    if open {
+                                        jump = Some(advisor_page::ENABLE_KEY);
+                                    }
+                                }
                                 Entry::Omp(_) if !input.omp_found => {
                                     not_found_card(ui, &mut actions)
                                 }
@@ -531,6 +712,9 @@ fn body(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>) -> Ve
                     });
                 });
         });
+    if let Some(key) = jump {
+        state.show_omp_setting(key);
+    }
     show_modals(ui.ctx(), &mut state.omp, &mut actions);
     actions
 }
@@ -595,6 +779,31 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
     {
         state.show_agents();
     }
+    if nav_item(
+        ui,
+        ICON_PUZZLE,
+        "Plugins",
+        state.selected == Entry::Plugins && !searching,
+        None,
+    )
+    .on_hover_text("Installed omp plugins: enable, features and settings")
+    .clicked()
+    {
+        state.show_plugins();
+    }
+    let advisor_unsaved = state.advisor.unsaved();
+    if nav_item(
+        ui,
+        ICON_FILE_PEN_LINE,
+        "Advisor",
+        state.selected == Entry::Advisor && !searching,
+        advisor_unsaved.then_some(("unsaved", true)),
+    )
+    .on_hover_text("Advisors that review the session in the background (WATCHDOG.yml)")
+    .clicked()
+    {
+        state.show_advisor();
+    }
     match (&state.omp.model, input.omp_found) {
         (Some(model), true) => {
             let hits = state.omp.hits.as_ref().filter(|_| searching);
@@ -604,7 +813,7 @@ fn nav(ui: &mut Ui, state: &mut SettingsState, input: &SettingsInput<'_>, search
                         let n = hits.iter().find(|h| h.tab == i).map_or(0, |h| h.rows.len());
                         (n > 0).then(|| (n.to_string(), true))
                     }
-                    None => Some((tab.rows.len().to_string(), false)),
+                    None => Some((tab.visible().to_string(), false)),
                 };
                 let selected = !searching && state.selected == Entry::Omp(i);
                 if nav_item(
@@ -781,9 +990,11 @@ fn omp_view(ui: &mut Ui, pane: &mut OmpPane, view: View, actions: &mut Vec<Setti
         model,
         loading,
         load_error,
+        pending_page: _,
         query,
         hits,
         modal,
+        layer: _,
     } = pane;
     let Some(model) = model.as_mut() else {
         match (load_error.as_deref(), *loading) {
@@ -803,7 +1014,7 @@ fn omp_view(ui: &mut Ui, pane: &mut OmpPane, view: View, actions: &mut Vec<Setti
 
     let (title, sub) = match view {
         View::Tab(t) => match model.tabs.get(t) {
-            Some(tab) => (tab.label.clone(), format!("{} settings", tab.rows.len())),
+            Some(tab) => (tab.label.clone(), format!("{} settings", tab.visible())),
             None => return,
         },
         View::Search => {
@@ -847,11 +1058,19 @@ fn omp_view(ui: &mut Ui, pane: &mut OmpPane, view: View, actions: &mut Vec<Setti
         View::Tab(t) => {
             let TabModel { rows, sections, .. } = &mut model.tabs[t];
             for sec in sections.iter() {
+                if sec.rows.iter().all(|&ri| rows[ri].hidden()) {
+                    continue;
+                }
                 card(ui, &sec.title, |ui| {
-                    for (n, &ri) in sec.rows.iter().enumerate() {
+                    let mut n = 0;
+                    for &ri in &sec.rows {
+                        if rows[ri].hidden() {
+                            continue;
+                        }
                         if let Some(ev) = show_row(ui, &mut rows[ri], n == 0) {
                             events.push((t, ri, ev));
                         }
+                        n += 1;
                     }
                 });
             }
@@ -1736,5 +1955,101 @@ fn paint_style_preview(painter: &egui::Painter, rect: Rect, style: UiStyle) {
             Stroke::new(1.0, p.stroke),
             egui::StrokeKind::Inside,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deck_core::omp::SettingsTab;
+
+    use super::*;
+
+    fn catalog() -> SettingsCatalog {
+        let tab = |id: &str| SettingsTab {
+            id: id.into(),
+            label: id.into(),
+            settings: Vec::new(),
+        };
+        SettingsCatalog {
+            tabs: vec![tab("appearance"), tab("model"), tab("shell")],
+        }
+    }
+
+    fn selected(state: &SettingsState) -> Entry {
+        state.selected
+    }
+
+    #[test]
+    fn an_omp_page_asked_for_before_the_catalog_loads_shows_when_it_arrives() {
+        let mut state = SettingsState::default();
+        state.open_omp_page(Some("shell"));
+        assert_eq!(selected(&state), Entry::Omp(0));
+        state.catalog_loaded(Ok(catalog()), "~/.omp/agent".into());
+        assert_eq!(selected(&state), Entry::Omp(2));
+        // Consumed: a reload does not move the page again.
+        state.show_omp_page("model");
+        state.catalog_loaded(Ok(catalog()), "~/.omp/agent".into());
+        assert_eq!(selected(&state), Entry::Omp(1));
+    }
+
+    #[test]
+    fn an_omp_page_the_catalog_lacks_or_a_failed_load_leaves_the_first_page() {
+        let mut state = SettingsState::default();
+        state.open_omp_page(Some("bogus"));
+        state.catalog_loaded(Ok(catalog()), String::new());
+        assert_eq!(selected(&state), Entry::Omp(0));
+
+        let mut state = SettingsState::default();
+        state.open_omp_page(Some("shell"));
+        state.catalog_loaded(Err("no omp".into()), String::new());
+        state.catalog_loaded(Ok(catalog()), String::new());
+        assert_eq!(selected(&state), Entry::Omp(0));
+    }
+
+    #[test]
+    fn a_loaded_catalog_shows_the_page_at_once_and_none_means_the_first() {
+        let mut state = SettingsState::default();
+        state.catalog_loaded(Ok(catalog()), String::new());
+        state.open_omp_page(Some("model"));
+        assert_eq!(selected(&state), Entry::Omp(1));
+        state.open_omp_page(None);
+        assert_eq!(selected(&state), Entry::Omp(0));
+    }
+    #[test]
+    fn omps_installed_page_lands_on_plugins_even_before_the_catalog_loads() {
+        let mut state = SettingsState::default();
+        state.open_omp_page(Some("plugins"));
+        assert_eq!(selected(&state), Entry::Plugins);
+        // Nothing waits for the catalog: a later load leaves the page where it is.
+        state.catalog_loaded(Ok(catalog()), String::new());
+        assert_eq!(selected(&state), Entry::Plugins);
+        state.open_omp_page(Some("advisor"));
+        assert_eq!(selected(&state), Entry::Advisor);
+        assert!(state.show_omp_page("installed"));
+        assert_eq!(selected(&state), Entry::Plugins);
+        let pages = state.omp_pages();
+        assert!(pages.iter().any(|(id, _)| id == "plugins"));
+        assert!(pages.iter().any(|(id, _)| id == "advisor"));
+    }
+
+    #[test]
+    fn the_project_file_is_followed_per_project_and_a_stale_reply_is_dropped() {
+        let mut state = SettingsState::default();
+        let a = Path::new("/proj/a");
+        let b = Path::new("/proj/b");
+        assert_eq!(state.layer_request(Some(a)), Some(a.to_path_buf()));
+        // Asked once; the same project does not read the file again.
+        assert_eq!(state.layer_request(Some(a)), None);
+        assert_eq!(state.layer_request(Some(b)), Some(b.to_path_buf()));
+        state.project_layer(a, Some(serde_json::json!({"x": 1})));
+        assert!(state.omp.layer.is_none(), "the reply for a was dropped");
+        state.project_layer(b, Some(serde_json::json!({"x": 1})));
+        assert!(state.omp.layer.is_some());
+        // No project: nothing to read, and the marks go.
+        assert_eq!(state.layer_request(None), None);
+        assert!(state.omp.layer.is_none());
+        // Reopening the window reads it again.
+        state.opened();
+        assert_eq!(state.layer_request(Some(b)), Some(b.to_path_buf()));
     }
 }

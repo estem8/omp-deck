@@ -56,6 +56,8 @@ pub enum Badge {
     /// Fork of the session with this label (`None` = the parent is not in the store).
     Fork(Option<String>),
     FolderMissing,
+    /// Pinned in omp's `session-pins.json`.
+    Pinned,
     Stub,
 }
 
@@ -71,6 +73,7 @@ impl Badge {
             Badge::Fork(Some(p)) => Owned(format!("Fork of {p}")),
             Badge::Fork(None) => Borrowed("Fork"),
             Badge::FolderMissing => Borrowed("Folder missing"),
+            Badge::Pinned => Borrowed("Pinned"),
             Badge::Stub => Borrowed("Stub"),
         }
     }
@@ -86,6 +89,7 @@ impl Badge {
             Badge::Aborted => "Aborted",
             Badge::Fork(_) => "Fork",
             Badge::FolderMissing => "No folder",
+            Badge::Pinned => "Pinned",
             Badge::Stub => "Stub",
         }
     }
@@ -126,6 +130,8 @@ pub struct Row {
     /// Memory of the process tree running the session (from the Running poll).
     pub ram: Option<TreeMemory>,
     pub badges: Vec<Badge>,
+    /// Pinned in omp (`session-pins.json`, keyed by session id).
+    pub pinned: bool,
     pub cells: Cells,
     /// Laid-out cell text, reused across frames (see [`crate::paint_cache`]).
     pub paint: std::cell::RefCell<crate::paint_cache::PaintCache>,
@@ -330,7 +336,7 @@ fn status_rank(row: &Row) -> u8 {
             Badge::InTab => 3,
             Badge::FolderMissing => 2,
             Badge::Stub => 1,
-            Badge::Fork(_) => 0,
+            Badge::Fork(_) | Badge::Pinned => 0,
         });
     }
     rank
@@ -383,8 +389,12 @@ fn cmp_rows(a: &Row, b: &Row, sort: Sort) -> Ordering {
         Column::Activity => by_key(Some(a.activity()), Some(b.activity()), d, |x, y| x.cmp(y)),
         Column::Status => by_key(Some(status_rank(a)), Some(status_rank(b)), d, u8::cmp),
     };
-    // Ties: most recent activity first, then the path (a stable, total order).
-    main.then_with(|| b.activity().cmp(&a.activity()))
+    // Pinned sessions come first whatever the column (omp's resume list does the same); ties:
+    // most recent activity first, then the path (a stable, total order).
+    b.pinned
+        .cmp(&a.pinned)
+        .then(main)
+        .then_with(|| b.activity().cmp(&a.activity()))
         .then_with(|| a.entry.path.cmp(&b.entry.path))
 }
 
@@ -447,6 +457,8 @@ pub struct Model {
     /// Display name of a project (worktrees show their branch); others are `~`-abbreviated.
     labels: HashMap<PathBuf, String>,
     errors: HashMap<PathBuf, String>,
+    /// Ids of the pinned sessions.
+    pins: HashSet<String>,
     pub filter: Filter,
     pub sort: Sort,
     /// Project the table is scoped to (`None` = all projects).
@@ -476,6 +488,7 @@ impl Default for Model {
             ram: HashMap::new(),
             labels: HashMap::new(),
             errors: HashMap::new(),
+            pins: HashSet::new(),
             filter: Filter::default(),
             sort: Sort::default(),
             scope: None,
@@ -569,6 +582,7 @@ impl Model {
                     .unwrap_or(StatsSlot::Pending),
                 live: self.live.get(&entry.path).copied().unwrap_or_default(),
                 ram: self.ram.get(&entry.path).copied(),
+                pinned: self.pins.contains(&entry.id),
                 entry,
                 badges: Vec::new(),
                 cells: Cells::default(),
@@ -647,6 +661,38 @@ impl Model {
         }
         self.labels = labels;
         self.cells_stale = true;
+    }
+
+    /// The pinned session ids (omp's `session-pins.json`). Rows are re-flagged and re-sorted.
+    pub fn set_pins(&mut self, pins: HashSet<String>) {
+        if pins == self.pins {
+            return;
+        }
+        self.pins = pins;
+        for r in &mut self.rows {
+            r.pinned = self.pins.contains(&r.entry.id);
+        }
+        self.cells_stale = true;
+        self.view_stale = true;
+    }
+
+    /// Indices into [`Model::rows`] of the sessions the resume list shows: those of `scope`
+    /// (`None` = every project) that match `text`, pinned first, then the most recently active
+    /// (omp's resume picker order). Call after [`Model::prepare`].
+    pub fn resume_order(&self, scope: Option<&Path>, text: &str) -> Vec<usize> {
+        let filter = Filter {
+            text: text.to_owned(),
+            ..Filter::default()
+        };
+        let sort = Sort::default();
+        let mut out: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| {
+                let r = &self.rows[i];
+                scope.is_none_or(|s| r.entry.cwd == s) && filter.matches(r, self.now)
+            })
+            .collect();
+        out.sort_by(|&a, &b| cmp_rows(&self.rows[a], &self.rows[b], sort));
+        out
     }
 
     pub fn project_label(&self, cwd: &Path) -> String {
@@ -960,6 +1006,9 @@ pub fn compact_model(id: &str) -> String {
 
 fn badges(r: &Row, fork: Option<Option<String>>) -> Vec<Badge> {
     let mut out = Vec::new();
+    if r.pinned {
+        out.push(Badge::Pinned);
+    }
     if r.live.running {
         out.push(Badge::Running);
     }
@@ -1639,5 +1688,81 @@ mod tests {
         assert_eq!(compact(950), "950");
         assert_eq!(compact(12_345), "12.3k");
         assert_eq!(compact(4_500_000), "4.5M");
+    }
+
+    fn resume_titles(m: &Model, scope: Option<&Path>, text: &str) -> Vec<String> {
+        m.resume_order(scope, text)
+            .iter()
+            .map(|&i| m.rows()[i].entry.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn resume_lists_pinned_sessions_first_then_the_newest() {
+        let mut m = model(vec![
+            entry("new", "/p", 1, 10),
+            entry("old", "/p", 9, 10),
+            entry("older", "/p", 20, 10),
+            entry("mid", "/p", 5, 10),
+        ]);
+        assert_eq!(
+            resume_titles(&m, None, ""),
+            ["new", "mid", "old", "older"],
+            "newest first without pins"
+        );
+        m.set_pins(HashSet::from(["id-older".to_owned(), "id-old".to_owned()]));
+        m.prepare(now());
+        assert_eq!(
+            resume_titles(&m, None, ""),
+            ["old", "older", "new", "mid"],
+            "the pinned two first (newest of them first), then the rest newest first"
+        );
+        m.set_pins(HashSet::new());
+        m.prepare(now());
+        assert_eq!(
+            resume_titles(&m, None, "")[0],
+            "new",
+            "unpinning restores the order"
+        );
+    }
+
+    #[test]
+    fn resume_is_scoped_to_the_project_and_filtered() {
+        let mut m = model(vec![
+            entry("a1", "/p", 1, 10),
+            entry("a2", "/p", 3, 10),
+            entry("b1", "/q", 2, 10),
+        ]);
+        m.prepare(now());
+        assert_eq!(resume_titles(&m, Some(Path::new("/p")), ""), ["a1", "a2"]);
+        assert_eq!(
+            resume_titles(&m, None, ""),
+            ["a1", "b1", "a2"],
+            "every project when unscoped"
+        );
+        assert_eq!(
+            resume_titles(&m, None, "prompt of b1"),
+            ["b1"],
+            "the filter reads prompts"
+        );
+        assert!(resume_titles(&m, Some(Path::new("/q")), "a1").is_empty());
+    }
+
+    #[test]
+    fn pinned_sessions_stay_on_top_whatever_the_sort_column() {
+        let mut m = model(vec![
+            entry("big", "/p", 1, 9_000),
+            entry("small", "/p", 2, 10),
+            entry("pinned-mid", "/p", 3, 500),
+        ]);
+        m.set_pins(HashSet::from(["id-pinned-mid".to_owned()]));
+        m.prepare(now());
+        assert_eq!(names(&m)[0], "pinned-mid");
+        let row = m
+            .rows()
+            .iter()
+            .find(|r| r.pinned)
+            .map(|r| r.badges.contains(&Badge::Pinned));
+        assert_eq!(row, Some(true), "the Pinned badge marks the row");
     }
 }

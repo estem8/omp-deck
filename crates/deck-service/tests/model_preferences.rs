@@ -13,12 +13,18 @@ use deck_service::settings::{Edit, Snapshot};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-struct Owner(Child);
+struct Owner(Child, String);
 
 impl Drop for Owner {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // Whatever the owner left in its host namespace.
+        if let Ok(ns) = deck_host::Namespace::new(&self.1) {
+            for name in ns.list() {
+                let _ = ns.kill(&name);
+            }
+        }
     }
 }
 
@@ -35,6 +41,7 @@ fn owner(profile: &Profile) -> Owner {
             .stderr(Stdio::null())
             .spawn()
             .expect("start private gateway"),
+        profile.host_namespace.clone(),
     )
 }
 

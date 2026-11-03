@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use deck_core::ctl::{CtlCommand, CtlReply};
+use deck_core::ctl::{BranchSummary, CtlCommand, CtlReply};
 use deck_core::mux::{new_session_name, session_name_for};
+use deck_core::omp::SettingsCatalog;
 use deck_core::tree::SessionTree;
-use deck_service::gateway::protocol::{Done, Mutation, Topic, TopicValue};
+use deck_service::gateway::protocol::{Answer, Done, Mutation, Query, Topic, TopicValue};
 use egui::{Key, Modifiers};
 
 use super::App;
@@ -38,6 +39,11 @@ pub(super) struct TreeUi {
     revision: u64,
     /// The cache revision of the topic last taken.
     seen: u64,
+    /// omp's `branchSummary.enabled`, read when the window opened (`None` until it answers or
+    /// when it cannot be read: Go here then does not ask).
+    summary_enabled: Option<bool>,
+    /// A label change is on its way to the session file.
+    labeling: bool,
 }
 
 /// What the open tabs say about the session being forked.
@@ -97,10 +103,79 @@ fn fork_gate(f: &ForkFacts) -> Result<(), &'static str> {
     }
 }
 
+/// Whether a live-control tree action (Go here, Re-answer) is available: the tab's control link,
+/// then "nothing else running", then "omp idle". The first reason wins.
+fn live_action_gate(
+    link: Result<(), &'static str>,
+    busy: bool,
+    idle: bool,
+) -> Result<(), &'static str> {
+    link?;
+    if busy {
+        return Err("Another tree action is still running");
+    }
+    if idle {
+        Ok(())
+    } else {
+        Err("omp is busy — wait for it to finish")
+    }
+}
+
+/// omp's `branchSummary.enabled` in the settings catalog (its effective value, else the default).
+fn branch_summary_enabled(catalog: &SettingsCatalog) -> Option<bool> {
+    catalog
+        .tabs
+        .iter()
+        .flat_map(|t| &t.settings)
+        .find(|s| s.key == "branchSummary.enabled")
+        .and_then(|s| s.value.as_ref().or(s.default.as_ref()))
+        .and_then(serde_json::Value::as_bool)
+}
+
+/// omp's status for a Go here to the entry the tab is already on.
+const ALREADY_THERE: &str = "Already at this point";
+
+/// What a settled Go here means for the window.
+#[derive(Debug, PartialEq, Eq)]
+struct NavigateOutcome {
+    /// Close the tree and return to the tab (not when nothing moved).
+    close: bool,
+    /// The toast text, and whether it is a success (otherwise a plain notice).
+    toast: String,
+    success: bool,
+}
+
+/// omp's own `message` is shown as it is; "Already at this point" keeps the window open.
+fn navigate_outcome(user: bool, message: Option<&str>) -> NavigateOutcome {
+    match message {
+        Some(m) => NavigateOutcome {
+            close: m != ALREADY_THERE,
+            toast: m.to_owned(),
+            success: false,
+        },
+        None => NavigateOutcome {
+            close: true,
+            toast: if user {
+                "Moved before that prompt — its text is back in the editor"
+            } else {
+                "Moved there — new prompts continue from this point"
+            }
+            .to_owned(),
+            success: true,
+        },
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TreeOp {
     Fork,
-    Navigate { user: bool },
+    /// `summarizing`: omp is writing a summary of the branch left (can take a while).
+    Navigate {
+        user: bool,
+        summarizing: bool,
+    },
+    /// omp asks the question again in the tab; settles when it is answered or cancelled.
+    Reanswer,
 }
 /// The one operation in flight (a second one is refused until it settles).
 pub(super) struct TreeBusy {
@@ -125,7 +200,7 @@ impl App {
         self.gw.subscribe(Topic::Tree(session.clone()));
         self.tree = Some(TreeUi {
             state: TreeState::new(title.clone()),
-            session,
+            session: session.clone(),
             cwd,
             id,
             title,
@@ -133,6 +208,19 @@ impl App {
             error: None,
             revision: 0,
             seen: 0,
+            summary_enabled: None,
+            labeling: false,
+        });
+        // Go here asks about a branch summary only while omp's setting is on.
+        self.gw.query(Query::OmpSettings, move |app, result| {
+            let enabled = match result {
+                Ok(Answer::OmpSettings(c)) => branch_summary_enabled(&c),
+                _ => None,
+            };
+            if let Some(t) = app.tree.as_mut().filter(|t| t.session == session) {
+                t.summary_enabled = enabled;
+                app.ctx.request_repaint();
+            }
         });
         self.ctx.request_repaint();
     }
@@ -202,7 +290,7 @@ impl App {
         let active = match self.tabs.get(self.active) {
             Some(t) if t.role == TabRole::Session && t.session_path() == Some(session) => t,
             _ if self.tree_has_tab(session) => {
-                return Err("Switch to this session's tab to use Go here");
+                return Err("Switch to this session's tab first");
             }
             _ => return Err("Open the session in a tab with live control first"),
         };
@@ -217,11 +305,8 @@ impl App {
         Ok(())
     }
 
+    /// Go here and Re-answer: both drive the active tab's omp, which must be idle.
     fn tree_navigate_gate(&self, session: &Path) -> Result<(), &'static str> {
-        self.tree_link(session)?;
-        if self.tree_busy.is_some() {
-            return Err("Another tree action is still running");
-        }
         let idle = self
             .live_snapshot()
             .and_then(|s| s.main_idle)
@@ -231,10 +316,15 @@ impl App {
                     .map(|t| Activity::of_terminal(t.terminal()) == Activity::Idle)
             })
             .unwrap_or(false);
-        if idle {
-            Ok(())
+        live_action_gate(self.tree_link(session), self.tree_busy.is_some(), idle)
+    }
+
+    /// Labels go through the gateway (live tab or file), one at a time.
+    fn tree_label_gate(&self) -> Result<(), &'static str> {
+        if self.tree_busy.is_some() || self.tree.as_ref().is_some_and(|t| t.labeling) {
+            Err("Another tree action is still running")
         } else {
-            Err("omp is busy — wait for it to finish")
+            Ok(())
         }
     }
 
@@ -325,6 +415,15 @@ impl App {
         self.take_tree();
         let navigate = self.tree_navigate_gate(&session);
         let fork = self.tree_fork_gate(&session);
+        let label = self.tree_label_gate();
+        let busy = self.tree_busy.as_ref().map(|b| match b.op {
+            TreeOp::Navigate {
+                summarizing: true, ..
+            } => "Summarizing the branch… this can take a while",
+            TreeOp::Navigate { .. } => "Moving to the entry…",
+            TreeOp::Reanswer => "Waiting for your answer in the tab…",
+            TreeOp::Fork => "Forking…",
+        });
         let live = self
             .live_snapshot()
             .filter(|_| self.ctl_root() == Some(session.as_path()));
@@ -344,6 +443,10 @@ impl App {
                 live_leaf: live.as_ref().and_then(|s| s.leaf.as_deref()),
                 navigate,
                 fork,
+                summary_prompt: ui_state.summary_enabled == Some(true),
+                label,
+                reanswer: navigate,
+                busy,
                 now,
             },
         );
@@ -351,7 +454,15 @@ impl App {
             match a {
                 TreeAction::Close => self.close_tree(),
                 TreeAction::Fork { entry, what } => self.tree_fork(&session, entry, what),
-                TreeAction::Navigate { entry, user } => self.tree_navigate(&session, entry, user),
+                TreeAction::Navigate {
+                    entry,
+                    user,
+                    summary,
+                } => self.tree_navigate(&session, entry, user, summary),
+                TreeAction::SetLabel { entry, label } => {
+                    self.tree_set_label(&session, entry, label)
+                }
+                TreeAction::Reanswer { entry } => self.tree_reanswer(&session, entry),
                 TreeAction::Copy { text, what } => self.copy_text(&text, what),
                 TreeAction::Notice(text) => self.toasts.info(&self.ctx, text),
             }
@@ -395,22 +506,94 @@ impl App {
         );
     }
 
-    fn tree_navigate(&mut self, session: &Path, entry: String, user: bool) {
+    fn tree_navigate(&mut self, session: &Path, entry: String, user: bool, summary: BranchSummary) {
         if self.tree_navigate_gate(session).is_err() {
             return;
         }
+        let summarizing = summary != BranchSummary::None;
         let command = CtlCommand::Navigate {
             root: session.to_path_buf(),
             entry_id: entry,
+            summary,
         };
         if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
             self.tree_busy = Some(TreeBusy {
-                op: TreeOp::Navigate { user },
+                op: TreeOp::Navigate { user, summarizing },
                 cwd: PathBuf::new(),
                 title: String::new(),
                 what: String::new(),
                 seq: self.activation_seq,
             });
+        }
+    }
+
+    /// Set or remove the label of `entry`; the tree topic brings the change back into the view.
+    fn tree_set_label(&mut self, session: &Path, entry: String, label: Option<String>) {
+        if self.tree_label_gate().is_err() {
+            return;
+        }
+        if let Some(t) = self.tree.as_mut() {
+            t.labeling = true;
+        }
+        let removing = label.is_none();
+        self.gw.mutate(
+            Mutation::SessionLabel {
+                file: session.to_path_buf(),
+                entry_id: entry,
+                label,
+            },
+            move |app, result| app.on_tree_labeled(removing, result),
+        );
+    }
+
+    fn on_tree_labeled(&mut self, removing: bool, result: Result<Done, String>) {
+        if let Some(t) = self.tree.as_mut() {
+            t.labeling = false;
+        }
+        // A live tab answers with omp's reply, a closed session with nothing.
+        let failure = match result {
+            Ok(Done::Ctl(r)) if !r.ok => Some(r.error.unwrap_or_else(|| "omp refused".to_owned())),
+            Ok(_) => None,
+            Err(e) => Some(crate::summary::strip_context(&e).to_owned()),
+        };
+        match failure {
+            Some(why) => self.toasts.notify(
+                &self.ctx,
+                ToastKind::Error,
+                format!("Could not change the label: {why}"),
+            ),
+            None => self.toasts.success(
+                &self.ctx,
+                if removing {
+                    "Label removed"
+                } else {
+                    "Label saved"
+                },
+            ),
+        }
+    }
+
+    /// Re-answer an `ask` result: omp asks the question again in the tab, so the tree gives way
+    /// to it. The reply comes when the question is answered (or cancelled).
+    fn tree_reanswer(&mut self, session: &Path, entry: String) {
+        if self.tree_navigate_gate(session).is_err() {
+            return;
+        }
+        let command = CtlCommand::ReanswerAsk {
+            root: session.to_path_buf(),
+            entry_id: entry,
+        };
+        if self.ctl_command(command, |app, r| app.on_tree_reply(r)) {
+            self.tree_busy = Some(TreeBusy {
+                op: TreeOp::Reanswer,
+                cwd: PathBuf::new(),
+                title: String::new(),
+                what: String::new(),
+                seq: self.activation_seq,
+            });
+            self.close_tree();
+            self.toasts
+                .info(&self.ctx, "Answer the question in the tab");
         }
     }
 
@@ -431,22 +614,30 @@ impl App {
                 .error
                 .clone()
                 .unwrap_or_else(|| "omp refused".to_owned());
-            self.tree_failed(busy.op, &why);
+            // Cancelling the question is the user's own choice, not a failure.
+            if busy.op == TreeOp::Reanswer && why == "cancelled" {
+                self.toasts.info(&self.ctx, "Re-answer cancelled");
+            } else {
+                self.tree_failed(busy.op, &why);
+            }
             return;
         }
-        // Only "Go here" settles over the live link; a fork goes through the gateway.
-        let TreeOp::Navigate { user } = busy.op else {
-            return;
-        };
-        self.close_tree();
-        self.toasts.success(
-            &self.ctx,
-            if user {
-                "Moved before that prompt — its text is back in the editor"
-            } else {
-                "Moved there — new prompts continue from this point"
-            },
-        );
+        match busy.op {
+            // A fork goes through the gateway, not this link.
+            TreeOp::Fork => {}
+            TreeOp::Reanswer => self.toasts.success(&self.ctx, "Answer replaced"),
+            TreeOp::Navigate { user, .. } => {
+                let outcome = navigate_outcome(user, reply.message.as_deref());
+                if outcome.close {
+                    self.close_tree();
+                }
+                if outcome.success {
+                    self.toasts.success(&self.ctx, outcome.toast);
+                } else {
+                    self.toasts.info(&self.ctx, outcome.toast);
+                }
+            }
+        }
     }
 
     /// The gateway's fork finished.
@@ -490,6 +681,7 @@ impl App {
         let what = match op {
             TreeOp::Fork => "fork",
             TreeOp::Navigate { .. } => "go there",
+            TreeOp::Reanswer => "re-answer",
         };
         let text = if why.eq_ignore_ascii_case("busy") {
             "omp is busy — try again when it is idle".to_owned()
@@ -552,5 +744,77 @@ mod tests {
         let mut f = facts(TabFact::None, RunFact::Stopped);
         f.omp = false;
         assert!(fork_gate(&f).is_err());
+    }
+
+    #[test]
+    fn live_actions_report_the_first_reason() {
+        assert_eq!(live_action_gate(Ok(()), false, true), Ok(()));
+        assert_eq!(
+            live_action_gate(Err("no link"), true, false),
+            Err("no link"),
+            "no link beats busy beats not-idle"
+        );
+        assert_eq!(
+            live_action_gate(Ok(()), true, false),
+            Err("Another tree action is still running")
+        );
+        assert_eq!(
+            live_action_gate(Ok(()), false, false),
+            Err("omp is busy — wait for it to finish")
+        );
+    }
+
+    #[test]
+    fn omp_status_is_shown_and_only_a_move_closes_the_tree() {
+        let moved = navigate_outcome(true, None);
+        assert!(moved.close && moved.success);
+        assert!(moved.toast.contains("text is back in the editor"));
+        // Nothing moved: say so and stay in the tree.
+        let same = navigate_outcome(false, Some("Already at this point"));
+        assert!(!same.close && !same.success);
+        assert_eq!(same.toast, "Already at this point");
+        // Any other status of omp is shown as it is, after the move.
+        let other = navigate_outcome(false, Some("Summary written"));
+        assert!(other.close);
+        assert_eq!(other.toast, "Summary written");
+    }
+
+    #[test]
+    fn the_branch_summary_prompt_follows_the_effective_setting() {
+        use deck_core::omp::{Setting, SettingKind, SettingsTab};
+        use serde_json::json;
+        let catalog = |value: Option<serde_json::Value>, default: Option<serde_json::Value>| {
+            SettingsCatalog {
+                tabs: vec![SettingsTab {
+                    id: "t".to_owned(),
+                    label: "T".to_owned(),
+                    settings: vec![Setting {
+                        key: "branchSummary.enabled".to_owned(),
+                        kind: SettingKind::Bool,
+                        value,
+                        default,
+                        description: String::new(),
+                        secret: false,
+                    }],
+                }],
+            }
+        };
+        assert_eq!(
+            branch_summary_enabled(&catalog(Some(json!(true)), Some(json!(false)))),
+            Some(true)
+        );
+        assert_eq!(
+            branch_summary_enabled(&catalog(None, Some(json!(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            branch_summary_enabled(&catalog(Some(json!(false)), None)),
+            Some(false)
+        );
+        assert_eq!(branch_summary_enabled(&catalog(None, None)), None);
+        assert_eq!(
+            branch_summary_enabled(&SettingsCatalog { tabs: Vec::new() }),
+            None
+        );
     }
 }

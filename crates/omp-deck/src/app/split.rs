@@ -116,6 +116,8 @@ struct Requests {
     dividers: Vec<(usize, f32)>,
     open_url: Option<String>,
     chat_url: Option<String>,
+    /// An omp screen that OmpDeck answers with its own, and the pane that asked.
+    redirect: Option<(usize, crate::chat_view::Redirect)>,
     copy_link: Option<String>,
 }
 
@@ -437,6 +439,9 @@ impl App {
                             .font_size(font_size)
                             .show(&mut child);
                         refused = refused.or(out.refused);
+                        if let Some(r) = out.redirect {
+                            frame.redirect = Some((slot, r));
+                        }
                         (out.response, out.open_url)
                     } else {
                         let out = TerminalView::new(t.terminal_mut())
@@ -556,6 +561,11 @@ impl App {
             self.close_pane(slot);
         } else if let Some(slot) = frame.focus {
             self.focus_pane(slot);
+        }
+        // The redirect acts on the pane's tab: it is the active one first.
+        if let Some((slot, redirect)) = frame.redirect {
+            self.focus_pane(slot);
+            self.apply_redirect(redirect);
         }
         if let Some(url) = frame.chat_url {
             self.open_chat_link(url);

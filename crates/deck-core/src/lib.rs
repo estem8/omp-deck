@@ -13,6 +13,7 @@ pub(crate) mod git;
 pub mod inventory;
 pub mod mux;
 pub mod omp;
+pub mod pins;
 pub mod platform;
 pub mod selfupdate;
 pub mod sessions;

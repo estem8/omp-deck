@@ -34,7 +34,9 @@ use deck_core::fleet::{FleetSnapshot, FleetTarget};
 use deck_core::inventory::{InventoryEntry, SessionStats};
 use deck_core::mux::MuxKind;
 use deck_core::omp::{
-    DeleteTarget, ModelInfo, MoveOutcome, SettingsCatalog, UpdateKind, UpdateStatus,
+    AdvisorDoc, AdvisorScope, DeleteTarget, ForeignSession, ForeignSource, ModelInfo, MoveOutcome,
+    PluginConfig, PluginFeatures, PluginList, PluginScope, ResetAccounts, SettingsCatalog,
+    UpdateKind, UpdateStatus,
 };
 use deck_core::selfupdate::{Applied, InstallKind, Release};
 use deck_core::sessions::ProjectGroup;
@@ -401,6 +403,30 @@ pub enum Query {
     AgentDefs {
         projects: Vec<PathBuf>,
     },
+    /// `omp plugin list --json`: npm and marketplace plugins with their manifests.
+    PluginList,
+    /// `omp plugin config list <pkg> --json`: stored values (secrets masked) and the manifest
+    /// schema.
+    PluginConfig {
+        pkg: String,
+    },
+    /// The saved usage resets (`omp usage reset --json`) of every stored account, or of one
+    /// provider (`anthropic` / `openai-codex`). Queries the providers: can take seconds.
+    UsageResets {
+        provider: Option<String>,
+    },
+    /// The Claude Code or Codex sessions omp finds, newest first.
+    ForeignSessions {
+        source: ForeignSource,
+    },
+    /// The `WATCHDOG.yml` of `scope` for the project of `cwd`, as omp reads it (an absent file
+    /// is an empty document).
+    AdvisorConfig {
+        cwd: PathBuf,
+        scope: AdvisorScope,
+    },
+    /// The ids of the sessions pinned in omp's `session-pins.json` (read-only).
+    SessionPins,
 }
 
 /// A query's result.
@@ -442,6 +468,12 @@ pub enum Answer {
     RunningDetail(RunningDetail),
     AgentDefs(AgentCatalog),
     WorktreeVerdict(WorktreeVerdict),
+    PluginList(PluginList),
+    PluginConfig(PluginConfig),
+    UsageResets(ResetAccounts),
+    ForeignSessions(Vec<ForeignSession>),
+    AdvisorConfig(AdvisorDoc),
+    SessionPins(BTreeSet<String>),
 }
 
 /// [`Query::WorktreeDestination`]'s answer.
@@ -1346,6 +1378,89 @@ pub enum Mutation {
         session: Option<String>,
         place: ContinueIn,
     },
+    /// `omp plugin enable|disable <name> --scope <scope>`. `cwd`: the project a `Project` scope
+    /// belongs to (omp's own working directory otherwise). Once it succeeded, `reload` (the
+    /// session the user is looking at) gets `/reload-plugins` typed as soon as it is idle (queued
+    /// until then, never typed over a running turn; dropped silently when the tab is gone).
+    PluginEnable {
+        name: String,
+        enabled: bool,
+        scope: PluginScope,
+        cwd: Option<PathBuf>,
+        reload: Option<SessionTarget>,
+    },
+    /// The enabled features of `pkg` become exactly `features`; [`Done::PluginFeatures`] is the
+    /// state omp reports afterwards. `reload` as for [`Mutation::PluginEnable`].
+    PluginFeatures {
+        pkg: String,
+        features: Vec<String>,
+        reload: Option<SessionTarget>,
+    },
+    /// Sets (`Some`: a string, number or boolean) or deletes (`None`: back to the default) one
+    /// plugin setting. `reload` as for [`Mutation::PluginEnable`].
+    PluginConfigSet {
+        pkg: String,
+        key: String,
+        value: Option<serde_json::Value>,
+        reload: Option<SessionTarget>,
+    },
+    /// Spends one saved reset of the stored account `credential` of `provider`
+    /// (`omp usage reset <provider>/<credential>`; not idempotent, never retried). [`Done::Message`]
+    /// is omp's confirmation; usage is fetched again afterwards (omp invalidates its own report
+    /// cache when the spend succeeds, so no `usage invalidate` is run).
+    UsageResetSpend {
+        provider: String,
+        credential: String,
+    },
+    /// Pins or unpins session `id` in omp's `session-pins.json`.
+    SessionPin {
+        id: String,
+        pinned: bool,
+    },
+    /// Renames the session `file`. A session a controller of this gateway runs is renamed by
+    /// typing `/rename <title>` into it (the status bar's Rename; [`Done::Submitted`]); any other
+    /// session through omp's lease-checked helper ([`Done::Message`]: the title as stored). A
+    /// session open in an omp this gateway does not control is refused.
+    SessionRename {
+        file: PathBuf,
+        title: String,
+    },
+    /// Sets (`Some`) or removes (`None`/blank) the label of entry `entry_id` in session `file`:
+    /// through live control when a running session holds it ([`Done::Ctl`]), else through omp's
+    /// lease-checked helper ([`Done::Unit`]).
+    SessionLabel {
+        file: PathBuf,
+        entry_id: String,
+        label: Option<String>,
+    },
+    /// Imports the Claude Code / Codex session `id` as a new omp session ([`Done::Path`]: the new
+    /// file). `cwd` replaces the foreign project folder when that no longer exists.
+    ForeignImport {
+        source: ForeignSource,
+        id: String,
+        cwd: PathBuf,
+    },
+    /// Saves the advisor document `doc` of `scope` (an empty document deletes the file).
+    /// `apply`: a session whose omp should use it now: with live control the save and the
+    /// apply go through it, else the file is written headless. [`Done::Message`] is omp's text.
+    AdvisorSave {
+        cwd: PathBuf,
+        scope: AdvisorScope,
+        doc: AdvisorDoc,
+        apply: Option<SessionTarget>,
+    },
+    /// Types `/resume <file name>` into the session `target` (omp switches that tab to `file`; its
+    /// slash command takes a session id or file name, not a path).
+    /// Sent at once when omp is idle. While a turn runs it is refused before it is journaled
+    /// ([`Rejected::Busy`](crate::controller::Rejected::Busy)) so the client can ask the user;
+    /// `force` repeats it: the turn is stopped first (the status bar's Stop), then the command
+    /// waits for omp to be idle (at most 10 s) and goes in. Like [`Mutation::Submit`] it ends
+    /// with [`Done::Submitted`] once the command's delivery is final.
+    ResumeHere {
+        target: SessionTarget,
+        file: PathBuf,
+        force: bool,
+    },
 }
 
 /// Where [`Mutation::OpenOnDesktop`] places a newly opened tab.
@@ -1470,6 +1585,16 @@ impl Mutation {
             Mutation::WorktreeFinish { .. } => "worktree-finish",
             Mutation::WorktreeRetire { .. } => "worktree-retire",
             Mutation::WorktreeContinue { .. } => "worktree-continue",
+            Mutation::PluginEnable { .. } => "plugin-enable",
+            Mutation::PluginFeatures { .. } => "plugin-features",
+            Mutation::PluginConfigSet { .. } => "plugin-config-set",
+            Mutation::UsageResetSpend { .. } => "usage-reset-spend",
+            Mutation::SessionPin { .. } => "session-pin",
+            Mutation::SessionRename { .. } => "session-rename",
+            Mutation::SessionLabel { .. } => "session-label",
+            Mutation::ForeignImport { .. } => "foreign-import",
+            Mutation::AdvisorSave { .. } => "advisor-save",
+            Mutation::ResumeHere { .. } => "resume-here",
         }
     }
 
@@ -1488,7 +1613,8 @@ impl Mutation {
             | Mutation::InboxDismiss(t)
             | Mutation::Review { target: t, .. }
             | Mutation::AnswerUi { target: t, .. }
-            | Mutation::WorktreeMoveSession { target: t, .. } => Some(t),
+            | Mutation::WorktreeMoveSession { target: t, .. }
+            | Mutation::ResumeHere { target: t, .. } => Some(t),
             _ => None,
         }
     }
@@ -1660,6 +1786,11 @@ pub enum Done {
     },
     /// [`Mutation::AgentEdit`]: the definition as now on disk.
     AgentFile(Box<AgentFile>),
+    /// A text omp (or the helper) answered with: [`Mutation::UsageResetSpend`],
+    /// [`Mutation::AdvisorSave`], a helper-made [`Mutation::SessionRename`].
+    Message(String),
+    /// [`Mutation::PluginFeatures`]: the features state omp reports after the change.
+    PluginFeatures(PluginFeatures),
 }
 
 /// What a config restore would change ([`deck_core::backup::RestorePlan`]).

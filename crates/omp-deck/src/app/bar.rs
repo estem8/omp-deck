@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use deck_core::ctl::CtlCommand;
 use deck_core::platform;
 use deck_core::sessions::{SessionEntry, abbreviate_home};
 use deck_core::status::SessionStats;
@@ -29,7 +30,7 @@ use super::{App, PendingConfirm};
 use crate::card;
 use crate::confirm::{self, Confirm, Dialog};
 use crate::icons::{ICON_FOLD_VERTICAL, ICON_HANDSHAKE, ICON_PENCIL};
-use crate::model_picker::PickerAction;
+use crate::model_picker::{self, PickerAction, SessionExtras};
 use crate::statusbar::{self, BarAction, BarInput};
 use crate::tabs::{Tab, TabRole};
 use crate::theme::Palette;
@@ -315,6 +316,10 @@ impl App {
                 counts: self.agents_view.counts,
                 open: self.dash.open,
             },
+            session: SessionExtras {
+                tab: tab.uid,
+                task_unavailable: model_picker::task_unavailable(self.ctl_link()),
+            },
         };
         let actions = statusbar::show(ui, &self.bar_view, &mut self.picker, &input);
         if actions.is_empty() {
@@ -341,6 +346,7 @@ impl App {
                 self.dirty = true;
             }
             BarAction::Picker(PickerAction::Effort(level)) => self.queue_effort(level),
+            BarAction::TaskModel(model) => self.set_task_model(model),
             BarAction::Run(a) => self.run_action(a),
             BarAction::AskHandoff => self.open_action_dialog(ActionDialog::Handoff {
                 focus: String::new(),
@@ -363,9 +369,13 @@ impl App {
         }
     }
 
-    /// Asks the gateway for omp's model catalog.
+    /// Asks the gateway for omp's model catalog and, beside it, its settings (the picker's roles).
     pub(super) fn reload_models(&mut self) {
-        if !self.omp_found() || self.models.is_loading() {
+        if !self.omp_found() {
+            return;
+        }
+        self.reload_roles();
+        if self.models.is_loading() {
             return;
         }
         self.models.begin();
@@ -377,6 +387,70 @@ impl App {
             app.models.finish(models);
             app.ctx.request_repaint();
         });
+    }
+
+    /// Re-reads omp's settings for the picker's quick roles (`modelRoles`) and the configured
+    /// task-agent model; a failed read keeps the roles known so far.
+    fn reload_roles(&mut self) {
+        self.gw
+            .query(Query::OmpSettings, |app, result| match result {
+                Ok(Answer::OmpSettings(catalog)) => {
+                    app.models.set_roles(&catalog);
+                    app.ctx.request_repaint();
+                }
+                Ok(other) => log::debug!("roles: unexpected answer {other:?}"),
+                Err(e) => log::debug!("roles: omp settings unavailable: {e}"),
+            });
+    }
+
+    /// Task mode of the model picker: sets (`Some`) or clears (`None`) the active tab's
+    /// session-only task-agent model override through live control, then tells the user what omp
+    /// answered. The reply is remembered for the picker's summary: omp has no way to read it back.
+    pub(super) fn set_task_model(&mut self, model: Option<String>) {
+        let Some(uid) = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.role == TabRole::Session)
+            .map(|t| t.uid)
+        else {
+            return;
+        };
+        let root = self.ctl_root().map(PathBuf::from);
+        let wanted = model.clone();
+        self.ctl_command(
+            CtlCommand::TaskModelOverride { root, model },
+            move |app, reply| {
+                match reply {
+                    Ok(r) if r.ok => {
+                        let now = r.value.as_ref().and_then(|v| v.as_str()).map(str::to_owned);
+                        app.picker.record_task_override(uid, now.clone());
+                        let text = match (wanted, now) {
+                            (Some(m), _) => format!(
+                                "Task agents use {m} (this session only). Use /agents to persist."
+                            ),
+                            (None, Some(m)) => {
+                                format!("Override cleared: task agents use {m} again")
+                            }
+                            (None, None) => {
+                                "Override cleared: task agents use the session's model".to_owned()
+                            }
+                        };
+                        app.toasts.success(&app.ctx, text);
+                    }
+                    Ok(r) => app.toasts.error(
+                        &app.ctx,
+                        format!(
+                            "Task model not changed: {}",
+                            r.error.as_deref().unwrap_or("omp refused it")
+                        ),
+                    ),
+                    Err(e) => app
+                        .toasts
+                        .error(&app.ctx, format!("Task model not changed: {e}")),
+                }
+                app.ctx.request_repaint();
+            },
+        );
     }
 
     /// The model the active session runs as far as the deck knows: an unconfirmed switch's

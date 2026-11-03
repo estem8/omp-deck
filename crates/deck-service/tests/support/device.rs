@@ -197,14 +197,22 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // Our own test backend only (never the default tmux server).
+        // Our own test backend only (never the default tmux server): the owner first, then every
+        // session it left behind.
+        if let Some(pid) = self.owner_pid() {
+            kill_process(pid);
+        }
+        // Host-backend sessions outlive the owner (and their sockets go with the root): end every
+        // session of this test's namespace.
+        if let Ok(ns) = deck_host::Namespace::new(&self.ns) {
+            for name in ns.list() {
+                let _ = ns.kill(&name);
+            }
+        }
         if !cfg!(windows) {
             let _ = Command::new("tmux")
                 .args(["-L", &self.ns, "kill-server"])
                 .output();
-        }
-        if let Some(pid) = self.owner_pid() {
-            kill_process(pid);
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }

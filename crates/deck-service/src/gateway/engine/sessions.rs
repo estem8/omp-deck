@@ -671,7 +671,8 @@ impl Engine {
     /// A client that left will never answer: its draft confirmations are declined.
     pub(super) fn decline_confirmations(&mut self, client: &str) {
         // Commands a worktree flow typed for this client are its to confirm too.
-        let flows = self.worktree_owned(client);
+        let mut flows = self.worktree_owned(client);
+        flows.extend(self.defer.owned(client));
         for m in &mut self.sess.managed {
             let target = m.ctl.target().clone();
             let ids: Vec<_> = m
@@ -835,10 +836,12 @@ impl Engine {
             let Some(record) = d.record else {
                 continue;
             };
-            // A worktree flow's typed command reports to the client that started the flow.
+            // A worktree flow's typed command reports to the client that started the flow, and a
+            // command typed on a client's behalf ([`super::deferred`]) to that client.
             let client = self
                 .worktree
                 .owner(&record.key)
+                .or_else(|| self.defer.owner(&record.key))
                 .unwrap_or(&record.key.client)
                 .to_owned();
             self.to_client(
@@ -852,8 +855,11 @@ impl Engine {
                 continue;
             }
             self.worktree_request_ended(&record);
+            self.deferred_request_ended(&record);
             if self.sess.submits.remove(&record.key).is_some() {
-                let key = record.key.clone();
+                let mut record = record;
+                let key = self.journaled_key(record.key.clone());
+                record.key = key.clone();
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Submitted(record))));
             }
         }
@@ -935,13 +941,19 @@ impl Engine {
             .collect();
         for key in pending {
             self.sess.submits.remove(&key);
-            let outcome = match m.ctl.request_by_key(&key) {
+            let mut outcome = match m.ctl.request_by_key(&key) {
                 Some(r) if r.delivery.is_final() => {
                     Outcome::Done(Box::new(Done::Submitted(r.clone())))
                 }
                 _ => Outcome::Cancelled,
             };
-            self.finish_journal(&key, outcome);
+            let journaled = self.journaled_key(key);
+            if let Outcome::Done(done) = &mut outcome
+                && let Done::Submitted(r) = &mut **done
+            {
+                r.key = journaled.clone();
+            }
+            self.finish_journal(&journaled, outcome);
         }
         // Views of the removed controller.
         self.views.retain(|_, v| {
@@ -1267,11 +1279,30 @@ impl Engine {
             }
         }
         for (key, result) in finished {
-            let answer_ui = self.jobs.get(&key).is_some_and(|j| j.label == "answer-ui");
-            let result = if answer_ui {
-                answer_ui_result(result)
-            } else {
-                result
+            let label = self.jobs.get(&key).map(|j| j.label);
+            let result = match label {
+                Some("answer-ui") => answer_ui_result(result),
+                // The extension's reply is the verdict: its refusal is the error.
+                Some("session-label") => result.and_then(|d| match d {
+                    Done::Ctl(reply) => {
+                        crate::gateway::jobs::ctl_ok(reply, "omp did not set the label")
+                    }
+                    other => Ok(other),
+                }),
+                Some("advisor-save") => result.and_then(|d| match d {
+                    Done::Ctl(reply) => {
+                        crate::gateway::jobs::ctl_ok(reply, "omp did not save the advisors").map(
+                            |d| match d {
+                                Done::Ctl(r) => {
+                                    Done::Message(r.message.unwrap_or_else(|| "Saved".to_owned()))
+                                }
+                                other => other,
+                            },
+                        )
+                    }
+                    other => Ok(other),
+                }),
+                _ => result,
             };
             self.job_finished(key, result);
         }
@@ -1998,6 +2029,8 @@ mod tests {
                 error: error.map(str::to_owned),
                 new_file: None,
                 leaf: None,
+                value: None,
+                message: None,
             }))
         };
         assert!(matches!(

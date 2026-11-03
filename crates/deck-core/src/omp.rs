@@ -9,6 +9,19 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value};
 
+mod plugins;
+mod sess;
+mod usage_reset;
+
+pub use plugins::{
+    MarketplaceEntry, MarketplacePlugin, NpmPlugin, PluginConfig, PluginFeature, PluginFeatures,
+    PluginList, PluginManifest, PluginScope, PluginSetting, PluginSettingKind,
+};
+pub use sess::{
+    AdvisorDoc, AdvisorEntry, AdvisorSaved, AdvisorScope, ForeignSession, ForeignSource, SessError,
+};
+pub use usage_reset::{ResetAccount, ResetAccounts, ResetCredit};
+
 use crate::platform;
 
 #[derive(Debug, thiserror::Error)]

@@ -30,7 +30,18 @@ pub struct Change {
 
 /// Picking the session's own model with a level is just an `/effort`; picking it without one
 /// changes nothing (omp records no event, so it could never be confirmed).
+///
+/// A role alias (`@smol`, `@default`, a custom role: `/switch @role[:level]`) is resolved by omp
+/// itself: the deck cannot know which model it names, so the change expects no particular model
+/// (`selector` is `None`, only a requested level is confirmed) and is never "the same model".
 pub fn plan_switch(current: Option<&str>, selector: &str, level: Option<&str>) -> Option<Change> {
+    if selector.starts_with('@') {
+        return Some(Change {
+            command: switch_command(selector, level),
+            selector: None,
+            level: level.map(str::to_owned),
+        });
+    }
     if current == Some(selector) {
         return level.map(|l| Change {
             command: effort_command(l),
@@ -121,6 +132,25 @@ mod tests {
         assert_eq!(c.selector.as_deref(), Some("a/c"));
         let c = plan_switch(None, "a/c", None).expect("switch");
         assert_eq!(c.command, "/switch a/c");
+    }
+
+    #[test]
+    fn a_role_alias_is_switched_by_omp_and_expects_no_model() {
+        let c = plan_switch(Some("a/b"), "@smol", None).expect("a role is never a no-op");
+        assert_eq!(c.command, "/switch @smol");
+        assert_eq!((c.selector, c.level), (None, None));
+        // The same text as the current model's selector is still a role, never "no change".
+        let c = plan_switch(Some("@smol"), "@smol", Some("low")).expect("switch");
+        assert_eq!(c.command, "/switch @smol:low");
+        assert_eq!((c.selector, c.level.as_deref()), (None, Some("low")));
+        // Nothing named a model, so nothing waits for one: only the level is confirmed.
+        let p = Pending {
+            selector: None,
+            level: Some("low".to_owned()),
+            since: Instant::now(),
+        };
+        assert!(p.confirmed_by(Some("x/y"), Some("low"), None));
+        assert!(!p.confirmed_by(Some("x/y"), Some("high"), None));
     }
 
     #[test]

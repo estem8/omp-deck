@@ -275,6 +275,106 @@ export default async function ompdeckCtl(api: any) {
         return cut;
       }
 
+      const sameRoot = (cmd: any): boolean => { const want = rootFile(); return typeof cmd.root === "string" && !!want && cmd.root === want; };
+      const commandContext = (): any => registry.get("Main")?.session?.extensionRunner?.createCommandContext?.();
+      // Redraws omp's transcript after a session-level tree move (the command context does the drawing, but only for moves it
+      // makes itself). A move that appended an entry (branch summary, re-answered ask) leaves the leaf on the file's last entry:
+      // reload rebuilds the screen from it. A bare move is in memory only: undo it and replay it through the command context.
+      async function redraw(oldLeaf: string | null, id: string, moved: any): Promise<void> {
+        const cc = commandContext();
+        if (moved?.summaryEntry || moved?.askReanswerCommitted) {
+          if (typeof cc?.reload !== "function") throw new Error("redraw unavailable");
+          await cc.reload();
+          if (moved.editorText && typeof mainCtx.ui?.setEditorText === "function" && !String(mainCtx.ui.getEditorText?.() ?? "").trim()) mainCtx.ui.setEditorText(moved.editorText);
+        } else {
+          if (oldLeaf === null || typeof mainCtx.sessionManager.branch !== "function") throw new Error("redraw unavailable");
+          mainCtx.sessionManager.branch(oldLeaf);
+          await cc.navigateTree(id, { summarize: false });
+        }
+      }
+      // == the /tree selector's "re-answer ask": omp's own ask dialog opens in the tab; the new answer becomes a sibling result
+      // and the turn resumes. Resolves once that happened (or the dialog was cancelled), however long the user takes.
+      async function reanswerAsk(cmd: any): Promise<any> {
+        if (!sameRoot(cmd)) return { ok: false, error: "session changed" };
+        if (mainIdle() !== true) return { ok: false, error: "busy" };
+        const sm = mainCtx.sessionManager;
+        const sess = mainSession();
+        const id = String(cmd.entryId ?? "");
+        const entry = sm.getEntry?.(id);
+        if (!entry) return { ok: false, error: "no such entry" };
+        if (entry.type !== "message" || entry.message?.role !== "toolResult" || entry.message?.toolName !== "ask") return { ok: false, error: "not an ask result" };
+        if (typeof sess?.navigateTree !== "function" || typeof sess.buildAskReanswerContext !== "function") return { ok: false, error: "re-answering unavailable" };
+        let AskTool: any, ToolAbortError: any;
+        try {
+          ({ AskTool } = await import("@oh-my-pi/pi-coding-agent/tools/ask"));
+          ({ ToolAbortError } = await import("@oh-my-pi/pi-coding-agent/tools/tool-errors"));
+        } catch (e) { log("ask import failed: " + e); return { ok: false, error: "re-answering unavailable" }; }
+        const oldLeaf = mainLeaf();
+        const probe = await sess.navigateTree(id, { allowAskReopen: true, requireIdle: true });
+        if (probe?.cancelled) return { ok: false, error: "navigation cancelled" };
+        if (!probe?.reopenAsk) {
+          // omp could not recover the original questions and made the plain leaf move onto the result.
+          await redraw(oldLeaf, id, probe);
+          schedule();
+          return { ok: true, leaf: mainLeaf(), message: "The original questions are unavailable: moved to the answer instead." };
+        }
+        const toolSession = { cwd: sm.getCwd(), hasUI: true, settings: sess.settings, getSessionFile: () => sm.getSessionFile() ?? null, getSessionSpawns: () => null, getPlanModeState: () => sess.getPlanModeState?.() };
+        let answer: any;
+        try {
+          answer = await new AskTool(toolSession).execute("tree-reanswer", { questions: probe.reopenAsk.questions }, undefined, undefined, sess.buildAskReanswerContext(mainCtx.ui));
+        } catch (e: any) {
+          if (e instanceof ToolAbortError) return { ok: false, error: "cancelled" };
+          throw e;
+        }
+        if (answer?.details?.chatRedirect) return { ok: false, error: "Chat about this is not available when re-answering from the tree" };
+        const done = await sess.navigateTree(id, { allowAskReopen: true, reanswerAskResult: answer, requireIdle: true });
+        if (done?.cancelled) return { ok: false, error: "navigation cancelled" };
+        await redraw(oldLeaf, id, done);
+        if (done.askReanswerCommitted) sess.resumeAfterAskReanswer();
+        schedule();
+        return { ok: true, leaf: mainLeaf() };
+      }
+      // == `/advisor configure`: read or save one WATCHDOG.yml, then apply the merged roster to the running session.
+      async function advisorConfig(cmd: any): Promise<any> {
+        if (typeof cmd.root === "string" && !sameRoot(cmd)) return { ok: false, error: "session changed" };
+        const scope = cmd.scope === "user" ? "user" : cmd.scope === "project" ? "project" : null;
+        if (!scope) return { ok: false, error: "unknown scope" };
+        let adv: any;
+        try { adv = await import("./ompdeck-advisor.ts"); } catch (e) { log("advisor module failed: " + e); return { ok: false, error: "advisor configuration unavailable" }; }
+        const dirs = adv.dirsFor(mainCtx.sessionManager.getCwd());
+        const file = adv.resolveEditPath(scope, dirs);
+        if (cmd.doc === null || cmd.doc === undefined) return { ok: true, value: { path: file, doc: await adv.loadDoc(file) } };
+        const doc = cmd.doc;
+        if (typeof doc !== "object" || !Array.isArray(doc.advisors)) return { ok: false, error: "doc.advisors must be a list" };
+        const removed = await adv.saveDoc(file, doc);
+        let active: number | null = null;
+        const sess = mainSession();
+        if (typeof sess?.applyAdvisorConfigs === "function") {
+          const found = await adv.discover(mainCtx.sessionManager.getCwd(), dirs.agentDir);
+          active = sess.applyAdvisorConfigs(found.advisors, found.sharedInstructions, found.sharedMaxNotesPerUpdate);
+        }
+        schedule();
+        const what = removed ? `Removed ${scope} WATCHDOG.yml` : `Saved ${scope} WATCHDOG.yml`;
+        return { ok: true, value: { path: file, doc: await adv.loadDoc(file), removed, active }, message: active === null ? what : `${what} — ${active} advisor${active === 1 ? "" : "s"} active.` };
+      }
+      // == omp's task mode of the model picker: the Task subagent model, layered onto the runtime settings (never persisted).
+      async function taskModelOverride(cmd: any): Promise<any> {
+        if (typeof cmd.root === "string" && !sameRoot(cmd)) return { ok: false, error: "session changed" };
+        const sess = mainSession();
+        if (!sess?.settings) return { ok: false, error: "settings unavailable" };
+        let task: any;
+        try { task = await import("@oh-my-pi/pi-coding-agent/task/settings"); } catch (e) { log("task settings failed: " + e); return { ok: false, error: "task model override unavailable" }; }
+        const setting = task.cfgTaskAgentModelOverrides;
+        if (typeof cmd.model === "string" && cmd.model) {
+          if (!/^[^/\s]+\/\S+$/.test(cmd.model)) return { ok: false, error: "model must be provider/id" };
+          setting.override(sess.settings, { ...setting.get(sess.settings), task: cmd.model });
+        } else {
+          setting.override(sess.settings, undefined); // drop the runtime layer: the configured value applies again
+        }
+        const now = setting.get(sess.settings)?.task;
+        return { ok: true, value: Array.isArray(now) ? now[0] ?? null : now ?? null };
+      }
+
       async function handle(cmd: any): Promise<any> {
         if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
         if (cmd.t === "fork_at" || cmd.t === "navigate") {
@@ -287,12 +387,25 @@ export default async function ompdeckCtl(api: any) {
           if (cmd.t === "navigate") {
             // navigateTree has no streaming guard of its own: idle only.
             if (mainIdle() !== true) return { ok: false, error: "busy" };
-            const cc = registry.get("Main")?.session?.extensionRunner?.createCommandContext?.();
+            const cc = commandContext();
             if (typeof cc?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
-            const r = await cc.navigateTree(id, { summarize: false });
+            const oldLeaf = mainLeaf();
+            if (cmd.summarize === true) {
+              // The command context's navigateTree cannot carry custom instructions: run the session's own (what /tree does), then redraw.
+              const sess = mainSession();
+              if (typeof sess?.navigateTree !== "function") return { ok: false, error: "navigation unavailable" };
+              const instructions = typeof cmd.customInstructions === "string" && cmd.customInstructions.trim() ? cmd.customInstructions : undefined;
+              const r = await sess.navigateTree(id, { summarize: true, customInstructions: instructions, requireIdle: true });
+              if (r?.aborted) return { ok: false, error: "summarization cancelled" };
+              if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+              await redraw(oldLeaf, id, r);
+            } else {
+              const r = await cc.navigateTree(id, { summarize: false });
+              if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
+            }
             schedule();
-            if (r?.cancelled) return { ok: false, error: "navigation cancelled" };
-            return { ok: true, leaf: mainLeaf() };
+            const leaf = mainLeaf();
+            return leaf === oldLeaf && id === oldLeaf ? { ok: true, leaf, message: "Already at this point" } : { ok: true, leaf };
           }
           if (entry.type !== "message") return { ok: false, error: "only message entries can be forked" };
           if (!SessionManager) return { ok: false, error: "fork unavailable" };
@@ -337,6 +450,21 @@ export default async function ompdeckCtl(api: any) {
           schedule();
           return { ok: true };
         }
+        if (cmd.t === "set_label") {
+          // == the /tree selector's label edit: a `label` entry appended to the live session (any state; it is only an append).
+          if (!sameRoot(cmd)) return { ok: false, error: "session changed" };
+          const sm = mainCtx.sessionManager;
+          const id = String(cmd.entryId ?? "");
+          if (!sm.getEntry?.(id)) return { ok: false, error: "no such entry" };
+          if (typeof sm.appendLabelChange !== "function") return { ok: false, error: "labels unavailable" };
+          const label = typeof cmd.label === "string" && cmd.label.trim() ? cmd.label.trim() : undefined;
+          sm.appendLabelChange(id, label);
+          schedule();
+          return { ok: true };
+        }
+        if (cmd.t === "reanswer_ask") return reanswerAsk(cmd);
+        if (cmd.t === "advisor_config") return advisorConfig(cmd);
+        if (cmd.t === "task_model_override") return taskModelOverride(cmd);
         if (cmd.t !== "kill" && cmd.t !== "revive" && cmd.t !== "chat") return { ok: false, error: "unknown cmd" };
         // The tab may have moved to another root session (/new, /resume) since the command was composed.
         const want = rootFile();

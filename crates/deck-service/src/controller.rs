@@ -59,6 +59,10 @@ pub const WORKTREE_MOVE_LABEL: &str = "Move to worktree";
 pub const WORKTREE_FINISH_LABEL: &str = "Finish worktree";
 /// Job label of the `/move <dir>` relocation (a finished worktree's session into its repository).
 pub const MOVE_TO_LABEL: &str = "Move to folder";
+/// Job label of `/resume <name>`: the tab switches to another session file.
+pub const RESUME_LABEL: &str = "Resume session";
+/// Job label of `/reload-plugins` (typed after a plugin change).
+pub const RELOAD_PLUGINS_LABEL: &str = "Reload plugins";
 /// Job labels of composer text delivered while omp works.
 pub const STEER_LABEL: &str = "Steer";
 pub const FOLLOW_UP_LABEL: &str = "Follow-up";
@@ -257,6 +261,13 @@ pub enum Command {
     WorktreeFinish { prompt: String },
     /// `/move <dest>`: omp moves the session (file, artifacts, process cwd) into `dest`.
     MoveTo { dest: std::path::PathBuf },
+    /// `/resume <name>`: omp switches this tab to the session `file`. omp's slash command takes
+    /// a session id or file name (prefix), never a path, so the file's name without `.jsonl` is
+    /// typed (omp finds it in this folder's sessions, then in all of them). It aborts a running
+    /// turn, so the controller only types it while omp is idle.
+    Resume { file: std::path::PathBuf },
+    /// `/reload-plugins`: omp reloads its plugins in this session.
+    ReloadPlugins,
     /// Text pasted while omp works, then Enter (steer the running turn) or, with `follow_up`,
     /// Ctrl+Q (omp queues it for after the turn). Busy only; a blank text is refused (an empty
     /// Enter while busy aborts the turn).
@@ -281,6 +292,8 @@ pub enum CommandKind {
     WorktreeFinish,
     MoveTo,
     Steer { follow_up: bool },
+    Resume,
+    ReloadPlugins,
     Compose { mode: ComposeMode },
 }
 
@@ -294,6 +307,8 @@ impl Command {
             Command::WorktreeMove { .. } => CommandKind::WorktreeMove,
             Command::WorktreeFinish { .. } => CommandKind::WorktreeFinish,
             Command::MoveTo { .. } => CommandKind::MoveTo,
+            Command::Resume { .. } => CommandKind::Resume,
+            Command::ReloadPlugins => CommandKind::ReloadPlugins,
             Command::Steer { follow_up, .. } => CommandKind::Steer {
                 follow_up: *follow_up,
             },
@@ -996,6 +1011,33 @@ impl SessionController {
                     .ok_or(Rejected::BadPath)?;
                 Ok((
                     Job::slash(MOVE_TO_LABEL, &format!("/move {text}"), Requires::Idle),
+                    None,
+                ))
+            }
+            Command::Resume { file } => {
+                if self.is_busy() {
+                    return Err(Rejected::Busy);
+                }
+                let name = file
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| {
+                        file.is_absolute()
+                            && !n.is_empty()
+                            && !n.chars().any(|c| c.is_control() || c.is_whitespace())
+                    })
+                    .ok_or(Rejected::BadPath)?;
+                Ok((
+                    Job::slash(RESUME_LABEL, &format!("/resume {name}"), Requires::Idle),
+                    None,
+                ))
+            }
+            Command::ReloadPlugins => {
+                if self.is_busy() {
+                    return Err(Rejected::Busy);
+                }
+                Ok((
+                    Job::slash(RELOAD_PLUGINS_LABEL, "/reload-plugins", Requires::Idle),
                     None,
                 ))
             }

@@ -9,14 +9,16 @@ use std::time::Duration;
 use crate::icons::Icon;
 use crate::icons::{
     ICON_CHECK, ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_CIRCLE_ALERT, ICON_REFRESH_CW,
-    ICON_SEARCH, ICON_STAR,
+    ICON_SEARCH, ICON_STAR, ICON_UNDO_2,
 };
-use deck_core::omp::{ModelInfo, Pricing};
+use deck_core::omp::{ModelInfo, Pricing, SettingsCatalog};
 use egui::{
     Align2, Color32, CursorIcon, FontId, Margin, Response, RichText, Sense, Stroke, StrokeKind,
     TextEdit, Ui, pos2, vec2,
 };
+use serde_json::Value;
 
+use crate::agent_ctl::Link;
 use crate::chat_view::{Ink, hairline, pop};
 use crate::theme;
 use crate::widgets::{icon_text, paint_icon};
@@ -37,7 +39,11 @@ pub struct ModelsCache {
     pub state: LoadState,
     list: Vec<ModelInfo>,
     index: HashMap<String, usize>,
-    /// Bumps whenever `list` changes (invalidates cached rows and views).
+    /// The quick roles of omp's `modelRoles` config (see [`roles_from_config`]).
+    roles: Vec<RoleEntry>,
+    /// The task-agent model omp's config names (`task.agentModelOverrides.task`).
+    task_model: Option<String>,
+    /// Bumps whenever `list` or the roles change (invalidates cached rows and views).
     pub generation: u64,
 }
 
@@ -47,6 +53,8 @@ impl Default for ModelsCache {
             state: LoadState::NotLoaded,
             list: Vec::new(),
             index: HashMap::new(),
+            roles: Vec::new(),
+            task_model: None,
             generation: 0,
         }
     }
@@ -84,6 +92,21 @@ impl ModelsCache {
     pub fn is_loading(&self) -> bool {
         self.state == LoadState::Loading
     }
+
+    /// The quick roles, `@default`, `@smol`, `@slow` first; empty until omp's settings are read.
+    pub fn roles(&self) -> &[RoleEntry] {
+        &self.roles
+    }
+
+    /// Takes the roles and the configured task-agent model of a freshly read settings catalog.
+    pub fn set_roles(&mut self, catalog: &SettingsCatalog) {
+        let (roles, task_model) = roles_from_catalog(catalog);
+        if roles != self.roles || task_model != self.task_model {
+            self.roles = roles;
+            self.task_model = task_model;
+            self.generation += 1;
+        }
+    }
 }
 
 // ------------------------------------------------------------------ pure logic
@@ -100,6 +123,12 @@ pub enum Row {
     UnavailableFavorite(usize),
     /// Index into the catalog.
     Model(usize),
+    /// Header of the quick roles.
+    RolesHeader,
+    /// Index into the roles of the catalog.
+    Role(usize),
+    /// Task mode: the row that drops the session's task-agent override.
+    ClearOverride,
 }
 
 /// A model matches when every query word occurs in its `provider name id` (case-insensitive).
@@ -111,6 +140,148 @@ fn matches_words(m: &ModelInfo, words: &[String]) -> bool {
     words.iter().all(|w| hay.contains(w.as_str()))
 }
 
+// ------------------------------------------------------------------ quick roles
+
+/// Roles that name no chat model (omp's media, search and judge kinds, the small helper roles):
+/// switching the session to one makes no sense, so the picker leaves them out.
+const NON_CHAT_ROLES: [&str; 7] = [
+    "image",
+    "web",
+    "speech",
+    "dictation",
+    "judge",
+    "tiny",
+    "memory",
+];
+/// omp's quick roles, always offered and in this order.
+const BUILTIN_ROLES: [&str; 3] = ["default", "smol", "slow"];
+
+/// One quick role (`@smol`) and the model omp's config assigns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleEntry {
+    pub role: String,
+    /// The configured value, `:level` suffix kept; `None` = the role is not configured.
+    pub model: Option<String>,
+}
+
+impl RoleEntry {
+    /// What `/switch` takes for this role: omp resolves the alias itself.
+    pub fn selector(&self) -> String {
+        format!("@{}", self.role)
+    }
+
+    /// The configured model and its thinking level, the suffix split off.
+    fn target(&self) -> Option<(&str, Option<&str>)> {
+        self.model.as_deref().map(crate::omp_settings::split_level)
+    }
+
+    fn provider(&self) -> Option<&str> {
+        self.target()
+            .and_then(|(m, _)| m.split_once('/'))
+            .map(|(p, _)| p)
+    }
+}
+
+/// The quick roles from omp's `modelRoles` value: `@default`, `@smol`, `@slow` always (configured
+/// or not), then every other chat role the config assigns a model, alphabetical. Each role once.
+pub fn roles_from_config(value: Option<&Value>) -> Vec<RoleEntry> {
+    let configured = value.and_then(Value::as_object);
+    let model_of = |role: &str| {
+        configured
+            .and_then(|m| m.get(role))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let mut roles: Vec<RoleEntry> = BUILTIN_ROLES
+        .iter()
+        .map(|r| RoleEntry {
+            role: (*r).to_owned(),
+            model: model_of(r),
+        })
+        .collect();
+    if let Some(map) = configured {
+        // A name with whitespace or a colon cannot be typed as `/switch @name`.
+        let mut custom: Vec<&str> = map
+            .keys()
+            .map(String::as_str)
+            .filter(|k| {
+                !BUILTIN_ROLES.contains(k)
+                    && !NON_CHAT_ROLES.contains(k)
+                    && !k.is_empty()
+                    && !k.chars().any(|c| c.is_whitespace() || c == ':')
+            })
+            .collect();
+        custom.sort_unstable();
+        roles.extend(custom.into_iter().filter_map(|k| {
+            model_of(k).map(|model| RoleEntry {
+                role: k.to_owned(),
+                model: Some(model),
+            })
+        }));
+    }
+    roles
+}
+
+/// The quick roles and the configured task-agent model (`task.agentModelOverrides.task`, first
+/// pattern of a list) of omp's settings catalog.
+pub fn roles_from_catalog(catalog: &SettingsCatalog) -> (Vec<RoleEntry>, Option<String>) {
+    let value = |key: &str| {
+        catalog
+            .tabs
+            .iter()
+            .flat_map(|t| &t.settings)
+            .find(|s| s.key == key)
+            .and_then(|s| s.value.as_ref().or(s.default.as_ref()))
+    };
+    let task = value("task.agentModelOverrides")
+        .and_then(|v| v.get("task"))
+        .and_then(|t| match t {
+            Value::String(s) => Some(s.as_str()),
+            Value::Array(a) => a.first().and_then(Value::as_str),
+            _ => None,
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    (roles_from_config(value("modelRoles")), task)
+}
+
+/// A search that starts with `@` browses the quick roles, as omp's picker does; the text after
+/// the `@` narrows them.
+pub fn role_query(query: &str) -> Option<&str> {
+    query.trim_start().strip_prefix('@').map(str::trim)
+}
+
+/// The roles an `@` search shows: those whose name contains the text, name-prefix matches first.
+fn role_rows(roles: &[RoleEntry], rest: &str) -> Vec<Row> {
+    let rest = rest.to_lowercase();
+    let mut hits: Vec<usize> = (0..roles.len())
+        .filter(|&i| roles[i].role.to_lowercase().contains(&rest))
+        .collect();
+    hits.sort_by_key(|&i| !roles[i].role.to_lowercase().starts_with(&rest));
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![Row::RolesHeader];
+    rows.extend(hits.into_iter().map(Row::Role));
+    rows
+}
+
+/// The roles an ordinary search lists: every word occurs in `@role model`; a provider filter
+/// keeps the roles whose model that provider serves.
+fn role_hits(roles: &[RoleEntry], words: &[String], provider: Option<&str>) -> Vec<usize> {
+    (0..roles.len())
+        .filter(|&i| {
+            let r = &roles[i];
+            let hay = format!("@{} {}", r.role, r.model.as_deref().unwrap_or("")).to_lowercase();
+            provider.is_none_or(|p| r.provider() == Some(p))
+                && words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .collect()
+}
+
 /// Favorites first (in the order they were starred), then provider groups alphabetical with the
 /// newest model first ([`crate::model_order`]). `provider` limits the list to one provider.
 /// Favorites obey the provider filter and the search; groups without a match are omitted.
@@ -120,10 +291,27 @@ pub fn build_rows(
     provider: Option<&str>,
     favorites: &[String],
 ) -> Vec<Row> {
+    build_rows_with_roles(models, &[], query, provider, favorites)
+}
+
+/// [`build_rows`] with the quick roles: a search starting with `@` lists only the matching roles;
+/// otherwise the roles that match form a "Roles" group between the favorites and the providers.
+pub fn build_rows_with_roles(
+    models: &[ModelInfo],
+    roles: &[RoleEntry],
+    query: &str,
+    provider: Option<&str>,
+    favorites: &[String],
+) -> Vec<Row> {
+    if !roles.is_empty()
+        && let Some(rest) = role_query(query)
+    {
+        return role_rows(roles, rest);
+    }
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let wanted =
         |m: &ModelInfo| provider.is_none_or(|p| m.provider == p) && matches_words(m, &words);
-    let mut rows = Vec::with_capacity(models.len() + 8);
+    let mut rows = Vec::with_capacity(models.len() + roles.len() + 9);
 
     for (favorite, selector) in favorites.iter().enumerate() {
         let row = match models.iter().position(|m| m.selector == *selector) {
@@ -144,6 +332,12 @@ pub fn build_rows(
             rows.push(Row::FavoritesHeader);
         }
         rows.push(row);
+    }
+
+    let hits = role_hits(roles, &words, provider);
+    if !hits.is_empty() {
+        rows.push(Row::RolesHeader);
+        rows.extend(hits.into_iter().map(Row::Role));
     }
 
     // Rank within the provider's whole list, so a search never reshuffles what stays visible.
@@ -185,7 +379,12 @@ pub fn palette_models(models: &[ModelInfo], favorites: &[String]) -> Vec<(usize,
         .filter_map(|r| match r {
             Row::Favorite(i) => Some((i, true)),
             Row::Model(i) => Some((i, false)),
-            Row::Header(_) | Row::FavoritesHeader | Row::UnavailableFavorite(_) => None,
+            Row::Header(_)
+            | Row::FavoritesHeader
+            | Row::UnavailableFavorite(_)
+            | Row::RolesHeader
+            | Row::Role(_)
+            | Row::ClearOverride => None,
         })
         .fold(Vec::new(), |mut out, (i, star)| {
             if !out.iter().any(|(j, _)| *j == i) {
@@ -345,8 +544,16 @@ pub struct PickerState {
     refocus_search: bool,
     /// Bumped on every open: part of the list's scroll id so an old scroll offset never survives.
     opens: u64,
-    /// Open the popup on the next drawn frame (the command palette's "Switch model…").
-    open_requested: bool,
+    /// Open the popup on the next drawn frame (the command palette's "Switch model…", omp's own
+    /// model picker redirected): asked at, so a request nobody drew for does not open it later.
+    open_requested: Option<std::time::Instant>,
+    /// The popup's target is the session's task agents instead of the session (omp's task mode).
+    task_mode: bool,
+    /// The task-agent model each tab's last `TaskModelOverride` left in effect (omp has no read
+    /// path for the session-only layer), keyed by the tab.
+    task_overrides: HashMap<u64, Option<String>>,
+    /// A task-model pick of this frame (`None` inside = clear the override), taken by `show_with`.
+    task_pick: Option<Option<String>>,
 }
 
 /// Everything the cached rows were built from.
@@ -355,12 +562,27 @@ struct RowsKey {
     generation: u64,
     provider: Option<String>,
     favorites: Vec<String>,
+    roles: bool,
+    task: bool,
 }
 
 impl PickerState {
     /// Ask for the dropdown to open as if its chip had been clicked.
     pub fn request_open(&mut self) {
-        self.open_requested = true;
+        self.open_requested = Some(std::time::Instant::now());
+    }
+
+    /// Remember the model task agents of `tab` run on now (omp's reply to `TaskModelOverride`:
+    /// the override, else the configured model; `None` = they inherit the session's).
+    pub fn record_task_override(&mut self, tab: u64, effective: Option<String>) {
+        self.task_overrides.insert(tab, effective);
+    }
+
+    /// The model task agents of `tab` run on: what omp last answered for the tab, else the
+    /// configured one; `None` = they inherit the session's.
+    fn task_now(&self, catalog: &ModelsCache, tab: Option<u64>) -> Option<String> {
+        tab.and_then(|t| self.task_overrides.get(&t).cloned())
+            .unwrap_or_else(|| catalog.task_model.clone())
     }
 
     fn refresh_providers(&mut self, catalog: &ModelsCache) {
@@ -375,21 +597,38 @@ impl PickerState {
         wanted.filter(|w| self.providers.iter().any(|(p, _)| p == w))
     }
 
-    fn refresh_rows(&mut self, catalog: &ModelsCache, input: &PickerInput<'_>) {
+    /// `with_roles`: the session picker, which lists the quick roles (never in task mode: a task
+    /// override names a model, not a role).
+    fn refresh_rows(&mut self, catalog: &ModelsCache, input: &PickerInput<'_>, with_roles: bool) {
         let provider = self.effective_provider(input.provider);
+        let roles = with_roles && !self.task_mode;
         let fresh = self.rows_key.as_ref().is_some_and(|k| {
             k.generation == catalog.generation
                 && k.search == self.search
                 && k.provider.as_deref() == provider
                 && k.favorites == input.favorites
+                && k.roles == roles
+                && k.task == self.task_mode
         });
         if !fresh {
-            self.rows = build_rows(catalog.all(), &self.search, provider, input.favorites);
+            let listed: &[RoleEntry] = if roles { catalog.roles() } else { &[] };
+            self.rows = build_rows_with_roles(
+                catalog.all(),
+                listed,
+                &self.search,
+                provider,
+                input.favorites,
+            );
+            if self.task_mode && self.search.trim().is_empty() {
+                self.rows.insert(0, Row::ClearOverride);
+            }
             self.rows_key = Some(RowsKey {
                 search: self.search.clone(),
                 generation: catalog.generation,
                 provider: provider.map(str::to_owned),
                 favorites: input.favorites.to_vec(),
+                roles,
+                task: self.task_mode,
             });
         }
     }
@@ -397,7 +636,7 @@ impl PickerState {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PickerAction {
-    /// `/switch <selector>[:level]`
+    /// `/switch <selector>[:level]`; the selector is a model or a role alias (`@smol`).
     Switch {
         selector: String,
         level: Option<String>,
@@ -433,6 +672,34 @@ pub struct PickerInput<'a> {
     pub provider: Option<&'a str>,
     /// What the Thinking row says while there is no current model.
     pub unset: &'a str,
+}
+
+/// What only the session picker (the status bar's) offers on top of choosing a model.
+pub struct SessionExtras<'a> {
+    /// The tab the popup acts on: its task-agent model is remembered under this key.
+    pub tab: u64,
+    /// Why the "Task agents" target cannot be used now, `None` when it can (it needs live control).
+    pub task_unavailable: Option<&'a str>,
+}
+
+/// What the session picker's user chose in a frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Picked {
+    pub actions: Vec<PickerAction>,
+    /// Task mode: the model task agents are to run on (`Some(Some(provider/id))`), or the
+    /// override to be dropped (`Some(None)`). It needs live control.
+    pub task_model: Option<Option<String>>,
+}
+
+/// Why task mode is unavailable for a tab whose live-control link is `link`.
+pub fn task_unavailable(link: Link) -> Option<&'static str> {
+    match link {
+        Link::Live => None,
+        Link::Connecting => Some("Live control is still connecting; try again in a moment"),
+        Link::ReadOnly => Some("Needs live control; this tab runs without it"),
+        Link::Lost => Some("Needs live control; the connection to this tab was lost"),
+        Link::Ended => Some("omp has exited in this tab"),
+    }
 }
 
 /// `(provider, models)` alphabetical (case-insensitive).
@@ -680,6 +947,9 @@ fn option_row(ui: &mut Ui, ink: &Ink, text: &str, selected: bool) -> bool {
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
+/// How long a request to open the popup stays valid while the chip is not being drawn.
+const REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 const POPUP_W: f32 = 500.0;
 /// Space kept free at the window edges when the popup is clamped.
 const POPUP_MARGIN: f32 = 16.0;
@@ -692,10 +962,34 @@ pub fn show(
     state: &mut PickerState,
     input: &PickerInput<'_>,
 ) -> Vec<PickerAction> {
+    show_with(chip, state, input, None).actions
+}
+
+/// [`show`] for a session's picker: the quick roles join the list and the head offers the "Task
+/// agents" target.
+pub fn show_session(
+    chip: &Response,
+    state: &mut PickerState,
+    input: &PickerInput<'_>,
+    extras: &SessionExtras<'_>,
+) -> Picked {
+    show_with(chip, state, input, Some(extras))
+}
+
+fn show_with(
+    chip: &Response,
+    state: &mut PickerState,
+    input: &PickerInput<'_>,
+    extras: Option<&SessionExtras<'_>>,
+) -> Picked {
     let mut actions = Vec::new();
     let ctx = chip.ctx.clone();
     let popup_id = egui::Popup::default_response_id(chip);
-    if std::mem::take(&mut state.open_requested) {
+    if state
+        .open_requested
+        .take()
+        .is_some_and(|at| at.elapsed() < REQUEST_TTL)
+    {
         egui::Popup::open_id(&ctx, popup_id);
     }
     let open = egui::Popup::is_id_open(&ctx, popup_id);
@@ -708,6 +1002,7 @@ pub fn show(
         state.search.clear();
         state.staged_level = None;
         state.provider_open = false;
+        state.task_mode = false;
         state.rows_key = None;
         state.rows.clear();
     } else if !state.was_open {
@@ -715,6 +1010,7 @@ pub fn show(
         state.search.clear();
         state.staged_level = None;
         state.provider_open = false;
+        state.task_mode = false;
         state.rows_key = None;
         state.rows.clear();
         state.opens += 1;
@@ -726,6 +1022,10 @@ pub fn show(
         actions.push(PickerAction::Refresh);
     }
     state.was_open = open;
+    // Task agents need live control; without it (or in a plain picker) the popup stays on the session.
+    if extras.is_none_or(|e| e.task_unavailable.is_some()) {
+        state.task_mode = false;
+    }
     let popup_w = POPUP_W.min(ctx.content_rect().width() - 2.0 * POPUP_MARGIN);
     egui::Popup::from_toggle_button_response(chip)
         .align(egui::RectAlign::TOP_START)
@@ -744,12 +1044,12 @@ pub fn show(
             crate::card::chrome(ui, Margin::ZERO, fill, |ui| {
                 ui.set_width(popup_w);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                head_band(ui, &ink, input, &mut actions);
+                head_band(ui, &ink, input, state, extras, &mut actions);
                 egui::Frame::NONE
                     .inner_margin(Margin::same(BODY_PAD))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        body(ui, &ink, state, input, just_opened, &mut actions);
+                        body(ui, &ink, state, input, extras, just_opened, &mut actions);
                     });
             });
         });
@@ -759,10 +1059,14 @@ pub fn show(
             PickerAction::ToggleFavorite(_) | PickerAction::SetProvider(_)
         )
     });
-    if actions.iter().any(|a| !a.keeps_popup_open()) {
+    let task_model = state.task_pick.take();
+    if task_model.is_some() || actions.iter().any(|a| !a.keeps_popup_open()) {
         egui::Popup::close_id(&ctx, popup_id);
     }
-    actions
+    Picked {
+        actions,
+        task_model,
+    }
 }
 
 /// Height of the header band and the padding of the body under it.
@@ -785,9 +1089,111 @@ fn band_points(rect: egui::Rect, r: f32) -> Vec<egui::Pos2> {
     pts
 }
 
-/// The sheet's header: title and model count on the accent-washed band, the reload button at
-/// its right.
-fn head_band(ui: &mut Ui, ink: &Ink, input: &PickerInput<'_>, actions: &mut Vec<PickerAction>) {
+/// The two targets of the picker head: the session itself, or the agents it spawns (omp's task
+/// mode).
+const TARGETS: [&str; 2] = ["This session", "Task agents"];
+
+/// The head's target switch, its right edge at `right`; returns its left edge. The "Task agents"
+/// side is dimmed and explains itself when `unavailable`.
+fn target_toggle(
+    ui: &mut Ui,
+    ink: &Ink,
+    band: egui::Rect,
+    right: f32,
+    state: &mut PickerState,
+    unavailable: Option<&str>,
+) -> f32 {
+    const H: f32 = 26.0;
+    const INSET: f32 = 3.0;
+    let font = ink.label(12.0);
+    let widths = TARGETS.map(|t| {
+        ui.painter()
+            .layout_no_wrap(t.to_owned(), font.clone(), ink.text())
+            .size()
+            .x
+            + 20.0
+    });
+    let total = widths.iter().sum::<f32>() + 2.0 * INSET;
+    let plate = egui::Rect::from_min_size(
+        pos2(right - total, band.center().y - H / 2.0),
+        vec2(total, H),
+    );
+    ui.painter().rect(
+        plate,
+        theme::rad(8, 12),
+        ink.chip(),
+        Stroke::new(1.0, ink.line()),
+        StrokeKind::Inside,
+    );
+    let mut x = plate.left() + INSET;
+    for (i, (label, w)) in TARGETS.iter().zip(widths).enumerate() {
+        let seg = egui::Rect::from_min_size(pos2(x, plate.top() + INSET), vec2(w, H - 2.0 * INSET));
+        x += w;
+        let task = i == 1;
+        let on = task == state.task_mode;
+        let disabled = task && unavailable.is_some();
+        let resp = ui.interact(
+            seg,
+            ui.scope_id().with(("picker-target", i)),
+            if disabled {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
+        );
+        let hot =
+            ui.ctx()
+                .animate_bool_with_time(resp.id.with("hot"), resp.hovered() && !disabled, 0.08);
+        let p = ui.painter();
+        let fg = if disabled {
+            ink.faint()
+        } else if on {
+            ink.accent_text()
+        } else {
+            theme::mix(ink.dim(), ink.strong(), hot)
+        };
+        if on {
+            p.rect(
+                seg,
+                theme::rad(6, 10),
+                ink.wash(ink.b),
+                Stroke::new(1.0, ink.edge(ink.b)),
+                StrokeKind::Inside,
+            );
+        } else if hot > 0.0 {
+            pop(p, seg, theme::rad(6, 10), ink, hot);
+        }
+        let g = p.layout_no_wrap((*label).to_owned(), font.clone(), fg);
+        p.galley(seg.center() - g.size() / 2.0, g, fg);
+        let tip = match (task, unavailable) {
+            (true, Some(why)) => why,
+            (true, None) => "Choose the model task agents use (this session only)",
+            (false, _) => "Switch the model of this session",
+        };
+        let clicked = resp.clicked();
+        resp.on_hover_text(tip).on_hover_cursor(if disabled {
+            CursorIcon::NotAllowed
+        } else {
+            CursorIcon::PointingHand
+        });
+        if clicked && !on {
+            state.task_mode = task;
+            state.refocus_search = true;
+        }
+    }
+    plate.left()
+}
+
+/// The sheet's header: title and model count on the accent-washed band, the target switch (session
+/// picker) and the reload button at its right.
+fn head_band(
+    ui: &mut Ui,
+    ink: &Ink,
+    input: &PickerInput<'_>,
+    state: &mut PickerState,
+    extras: Option<&SessionExtras<'_>>,
+    actions: &mut Vec<PickerAction>,
+) {
     let (band, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEAD_H), Sense::hover());
     let r = f32::from(theme::popup_radius()).min(HEAD_H / 2.0);
     let (c0, c1) = ink.head();
@@ -808,7 +1214,32 @@ fn head_band(ui: &mut Ui, ink: &Ink, input: &PickerInput<'_>, actions: &mut Vec<
         ],
         Stroke::new(1.0, ink.line()),
     );
-    let title = p.layout_no_wrap("Model".to_owned(), ink.label(13.0), ink.strong());
+    let reload = egui::Rect::from_center_size(
+        pos2(band.right() - f32::from(BODY_PAD) - 13.0, band.center().y),
+        vec2(26.0, 26.0),
+    );
+    let free_right = match extras {
+        Some(e) => target_toggle(
+            ui,
+            ink,
+            band,
+            reload.left() - 8.0,
+            state,
+            e.task_unavailable,
+        ),
+        None => reload.left(),
+    };
+    let p = ui.painter();
+    let title = p.layout_no_wrap(
+        if state.task_mode {
+            "Task model"
+        } else {
+            "Model"
+        }
+        .to_owned(),
+        ink.label(13.0),
+        ink.strong(),
+    );
     let x = band.left() + f32::from(BODY_PAD);
     let after = x + title.size().x + 12.0;
     p.galley(
@@ -818,20 +1249,19 @@ fn head_band(ui: &mut Ui, ink: &Ink, input: &PickerInput<'_>, actions: &mut Vec<
     );
     let n = input.catalog.all().len();
     if n > 0 {
-        p.text(
-            pos2(after, band.center().y),
-            Align2::LEFT_CENTER,
-            format!("{n} models"),
-            ink.label(12.0),
-            ink.dim(),
-        );
+        let count = p.layout_no_wrap(format!("{n} models"), ink.label(12.0), ink.dim());
+        // The count gives way to the target switch in a narrow window.
+        if after + count.size().x + 12.0 <= free_right {
+            p.galley(
+                pos2(after, band.center().y - count.size().y / 2.0),
+                count,
+                ink.dim(),
+            );
+        }
     }
 
     // Reload.
-    let rect = egui::Rect::from_center_size(
-        pos2(band.right() - f32::from(BODY_PAD) - 13.0, band.center().y),
-        vec2(26.0, 26.0),
-    );
+    let rect = reload;
     let resp = ui.interact(rect, ui.scope_id().with("picker-reload"), Sense::click());
     let hot = ui
         .ctx()
@@ -877,6 +1307,7 @@ fn body(
     ink: &Ink,
     state: &mut PickerState,
     input: &PickerInput<'_>,
+    extras: Option<&SessionExtras<'_>>,
     just_opened: bool,
     actions: &mut Vec<PickerAction>,
 ) {
@@ -885,30 +1316,38 @@ fn body(
     search_field(ui, ink, state, just_opened);
     state.refresh_providers(input.catalog);
     provider_dropdown(ui, ink, state, input);
-    // Thinking pills for the session's current model.
-    let current_model = input.current.and_then(|s| input.catalog.get(s));
-    let options = level_options(current_model);
-    ui.label(
-        RichText::new("THINKING")
-            .font(ink.label(11.0))
-            .color(ink.dim()),
-    );
-    if options.is_empty() {
-        let text = match (input.current, current_model) {
-            (None, _) => input.unset,
-            (Some(_), None) => "Current model is not in the catalog",
-            (Some(_), Some(_)) => "This model has no adjustable thinking",
-        };
-        ui.label(RichText::new(text).font(ink.prose(12.5)).color(ink.dim()));
+    let catalog = input.catalog;
+    // The model task agents run on now: what omp last answered for this tab, else its config.
+    let task_now = state.task_now(catalog, extras.map(|e| e.tab));
+    let task_mode = state.task_mode;
+    if task_mode {
+        task_summary(ui, ink, catalog, task_now.as_deref());
     } else {
-        let selected = state
-            .staged_level
-            .clone()
-            .or_else(|| input.level.map(str::to_owned));
-        if let Some(l) = pills(ui, ink, &options, selected.as_deref()) {
-            state.staged_level = Some(l.clone());
-            if selected.as_deref() != Some(l.as_str()) {
-                actions.push(PickerAction::Effort(l));
+        // Thinking pills for the session's current model.
+        let current_model = input.current.and_then(|s| catalog.get(s));
+        let options = level_options(current_model);
+        ui.label(
+            RichText::new("THINKING")
+                .font(ink.label(11.0))
+                .color(ink.dim()),
+        );
+        if options.is_empty() {
+            let text = match (input.current, current_model) {
+                (None, _) => input.unset,
+                (Some(_), None) => "Current model is not in the catalog",
+                (Some(_), Some(_)) => "This model has no adjustable thinking",
+            };
+            ui.label(RichText::new(text).font(ink.prose(12.5)).color(ink.dim()));
+        } else {
+            let selected = state
+                .staged_level
+                .clone()
+                .or_else(|| input.level.map(str::to_owned));
+            if let Some(l) = pills(ui, ink, &options, selected.as_deref()) {
+                state.staged_level = Some(l.clone());
+                if selected.as_deref() != Some(l.as_str()) {
+                    actions.push(PickerAction::Effort(l));
+                }
             }
         }
     }
@@ -918,8 +1357,11 @@ fn body(
     // measured when it opened), sized for the longest list this catalog can produce: every model,
     // favorites repeated, headers. The provider options replace it in place, so opening them never
     // resizes (and thus never moves) the popup.
-    let catalog = input.catalog;
-    let longest = catalog.all().len() + input.favorites.len() + state.providers.len() + 2;
+    let longest = catalog.all().len()
+        + input.favorites.len()
+        + catalog.roles().len()
+        + state.providers.len()
+        + 4;
     let fixed_list_h = LIST_H.min(ROW_H * longest as f32);
     if state.provider_open && !state.providers.is_empty() {
         provider_options(ui, ink, state, input, actions, fixed_list_h);
@@ -954,12 +1396,18 @@ fn body(
         }
         _ => {}
     }
-    state.refresh_rows(catalog, input);
+    state.refresh_rows(catalog, input, extras.is_some());
     if state.rows.is_empty() {
         ui.horizontal(|ui| {
             ui.label(icon_text(ICON_SEARCH, 16.0, ink.dim()));
-            let text = if catalog.all().is_empty() {
+            let roles_only = role_query(&state.search).is_some()
+                && !catalog.roles().is_empty()
+                && extras.is_some()
+                && !task_mode;
+            let text = if catalog.all().is_empty() && !roles_only {
                 "omp lists no models (no provider configured?)"
+            } else if roles_only {
+                "No role matches"
             } else {
                 "No model matches"
             };
@@ -969,6 +1417,7 @@ fn body(
     }
     ui.spacing_mut().item_spacing.y = 0.0;
     let list_h = fixed_list_h;
+    let mut task_pick: Option<Option<String>> = None;
     egui::ScrollArea::vertical()
         // A new query, provider or reopened popup starts at the top.
         .id_salt((
@@ -991,6 +1440,27 @@ fn body(
                         header_row(ui, ink, "Favorites", Some(ICON_STAR));
                         continue;
                     }
+                    Row::RolesHeader => {
+                        header_row(ui, ink, "Roles", None);
+                        continue;
+                    }
+                    Row::Role(role) => {
+                        if let Some(entry) = catalog.roles().get(*role) {
+                            let model = entry.target().map(|(m, _)| m);
+                            let info = model.and_then(|m| catalog.get(m));
+                            let current = model.is_some() && input.current == model;
+                            if role_row(ui, ink, entry, info, current) {
+                                actions.push(role_action(entry));
+                            }
+                        }
+                        continue;
+                    }
+                    Row::ClearOverride => {
+                        if clear_row(ui, ink) {
+                            task_pick = Some(None);
+                        }
+                        continue;
+                    }
                     Row::UnavailableFavorite(favorite) => {
                         if let Some(selector) = input.favorites.get(*favorite)
                             && unavailable_row(ui, ink, selector)
@@ -1005,20 +1475,203 @@ fn body(
                 let Some(m) = catalog.all().get(idx) else {
                     continue;
                 };
-                let is_current = input.current == Some(m.selector.as_str());
+                let is_current = if task_mode {
+                    task_now.as_deref() == Some(m.selector.as_str())
+                } else {
+                    input.current == Some(m.selector.as_str())
+                };
                 let starred = input.favorites.contains(&m.selector);
                 let show_provider = section == 0 && input.provider.is_none();
                 let out = model_row(ui, ink, m, is_current, starred, section, show_provider);
                 if out.star_clicked {
                     actions.push(PickerAction::ToggleFavorite(m.selector.clone()));
                 } else if out.clicked && !is_current {
-                    actions.push(PickerAction::Switch {
-                        selector: m.selector.clone(),
-                        level: level_for_switch(m, state.staged_level.as_deref()),
-                    });
+                    if task_mode {
+                        task_pick = Some(Some(m.selector.clone()));
+                    } else {
+                        actions.push(PickerAction::Switch {
+                            selector: m.selector.clone(),
+                            level: level_for_switch(m, state.staged_level.as_deref()),
+                        });
+                    }
                 }
             }
         });
+    state.task_pick = task_pick;
+}
+
+/// What picking a quick role sends: `/switch @role`, omp resolving the alias (and the role's own
+/// thinking level) itself.
+fn role_action(entry: &RoleEntry) -> PickerAction {
+    PickerAction::Switch {
+        selector: entry.selector(),
+        level: None,
+    }
+}
+
+/// Task mode's summary under the search: the model task agents run on now.
+fn task_summary(ui: &mut Ui, ink: &Ink, catalog: &ModelsCache, now: Option<&str>) {
+    ui.label(
+        RichText::new("TASK AGENTS")
+            .font(ink.label(11.0))
+            .color(ink.dim()),
+    );
+    match now {
+        Some(selector) => {
+            let name = catalog.get(selector).map_or_else(
+                || selector.to_owned(),
+                |m| format!("{} ({selector})", short_model_name(&m.name)),
+            );
+            ui.label(
+                RichText::new(format!("Run on {name}"))
+                    .font(ink.prose(13.0))
+                    .color(ink.strong()),
+            );
+        }
+        None => {
+            ui.label(
+                RichText::new("No override: task agents use the session's model")
+                    .font(ink.prose(12.5))
+                    .color(ink.dim()),
+            );
+        }
+    }
+    ui.label(
+        RichText::new("Applies to this session only. Use /agents to persist.")
+            .font(ink.prose(12.0))
+            .color(ink.dim()),
+    );
+}
+
+/// One quick-role row: `@role`, the thinking level of its model and the model itself. True when
+/// clicked.
+fn role_row(
+    ui: &mut Ui,
+    ink: &Ink,
+    entry: &RoleEntry,
+    model: Option<&ModelInfo>,
+    current: bool,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.08);
+    let p = ui.painter();
+    row_plate(p, rect.shrink2(vec2(0.0, 1.0)), ink, current, hov);
+    let left = rect.left() + 12.0;
+    if current {
+        paint_icon(
+            p,
+            pos2(left + 8.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            ICON_CHECK,
+            17.0,
+            ink.p.ok,
+        );
+    }
+    let name_x = left + 24.0;
+    let (top_y, bottom_y) = (rect.center().y - 7.0, rect.center().y + 8.0);
+    let right = rect.right() - 12.0;
+    let mut name_right = right;
+    if let Some((_, Some(level))) = entry.target() {
+        let g = p.layout_no_wrap(
+            thinking_short(level).to_owned(),
+            ink.label(11.0),
+            ink.text(),
+        );
+        let pill = egui::Rect::from_min_size(
+            pos2(right - g.size().x - 10.0, top_y - 8.0),
+            vec2(g.size().x + 10.0, 16.0),
+        );
+        p.rect(
+            pill,
+            theme::rad(4, 8),
+            ink.chip(),
+            Stroke::new(1.0, ink.line()),
+            StrokeKind::Inside,
+        );
+        p.galley(pill.center() - g.size() / 2.0, g, ink.text());
+        name_right = pill.left() - 10.0;
+    }
+    let g = fitted(
+        p,
+        &entry.selector(),
+        ink.prose(13.5),
+        if current {
+            ink.strong()
+        } else {
+            ink.accent_text()
+        },
+        name_right - name_x,
+    );
+    p.galley(
+        pos2(name_x, top_y - g.size().y / 2.0),
+        g,
+        Color32::PLACEHOLDER,
+    );
+    let detail = match (model, entry.target()) {
+        (Some(m), _) => format!("{} · {}", short_model_name(&m.name), m.selector),
+        (None, Some((selector, _))) => format!("{selector} · not in the model list"),
+        (None, None) => "Not set: omp picks its own model".to_owned(),
+    };
+    let g = fitted(p, &detail, ink.prose(12.0), ink.dim(), right - name_x);
+    p.galley(
+        pos2(name_x, bottom_y - g.size().y / 2.0),
+        g,
+        Color32::PLACEHOLDER,
+    );
+    let tip = format!(
+        "/switch {}\n{}",
+        entry.selector(),
+        match &entry.model {
+            Some(m) => format!("Role model: {m}"),
+            None => "The role has no model in omp's config".to_owned(),
+        }
+    );
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// Task mode's first row: drops the session-only task model override. True when clicked.
+fn clear_row(ui: &mut Ui, ink: &Ink) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.08);
+    let p = ui.painter();
+    row_plate(p, rect.shrink2(vec2(0.0, 1.0)), ink, false, hov);
+    paint_icon(
+        p,
+        pos2(rect.left() + 20.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        ICON_UNDO_2,
+        17.0,
+        ink.accent_text(),
+    );
+    let x = rect.left() + 36.0;
+    p.text(
+        pos2(x, rect.center().y - 7.0),
+        Align2::LEFT_CENTER,
+        "Clear override",
+        ink.prose(13.5),
+        ink.text(),
+    );
+    let g = fitted(
+        p,
+        "Task agents go back to the configured model, else the session's",
+        ink.prose(12.0),
+        ink.dim(),
+        rect.right() - 12.0 - x,
+    );
+    p.galley(
+        pos2(x, rect.center().y + 8.0 - g.size().y / 2.0),
+        g,
+        Color32::PLACEHOLDER,
+    );
+    resp.on_hover_text("Drop the session-only task model override")
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// A group label in the chat view's picker voice: the group's name in small accent capitals with
@@ -1493,7 +2146,7 @@ mod tests {
             let mut state = PickerState::default();
             ctx.run_ui(egui::RawInput::default(), |ui| {
                 let ink = Ink::new(ui, 13.0);
-                body(ui, &ink, &mut state, &input, false, &mut Vec::new());
+                body(ui, &ink, &mut state, &input, None, false, &mut Vec::new());
             })
             .textures_delta
             .clear();
@@ -1668,5 +2321,334 @@ mod tests {
         assert_eq!(level_for_switch(&c[1], Some("xhigh")), None);
         assert_eq!(level_for_switch(&c[0], Some("high")), None);
         assert_eq!(level_for_switch(&c[1], None), None);
+    }
+}
+
+#[cfg(test)]
+mod roles_and_task_tests {
+    use deck_core::omp::{Setting, SettingKind, SettingsTab};
+    use serde_json::json;
+
+    use super::*;
+
+    fn role(name: &str, model: Option<&str>) -> RoleEntry {
+        RoleEntry {
+            role: name.to_owned(),
+            model: model.map(str::to_owned),
+        }
+    }
+
+    fn model(provider: &str, id: &str) -> ModelInfo {
+        ModelInfo {
+            selector: format!("{provider}/{id}"),
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: id.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn catalog_with(settings: Vec<(&str, SettingKind, Value)>) -> SettingsCatalog {
+        SettingsCatalog {
+            tabs: vec![SettingsTab {
+                id: "model".into(),
+                label: "Model".into(),
+                settings: settings
+                    .into_iter()
+                    .map(|(key, kind, value)| Setting {
+                        key: key.into(),
+                        kind,
+                        value: Some(value),
+                        default: None,
+                        description: String::new(),
+                        secret: false,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// The role names in list order.
+    fn names(roles: &[RoleEntry]) -> Vec<&str> {
+        roles.iter().map(|r| r.role.as_str()).collect()
+    }
+
+    #[test]
+    fn role_list_is_the_builtins_then_custom_roles_without_duplicates() {
+        let roles = roles_from_config(Some(&json!({
+            "smol": "a/b:low",
+            "review": "c/d",
+            "default": "x/y",
+            "commit": "e/f",
+            // Not chat roles, not typable, or not configured: never offered.
+            "image": "g/h",
+            "tiny": "i/j",
+            "bad name": "k/l",
+            "a:b": "m/n",
+            "blank": "  ",
+            "number": 3,
+        })));
+        assert_eq!(
+            names(&roles),
+            ["default", "smol", "slow", "commit", "review"]
+        );
+        assert_eq!(roles[0].model.as_deref(), Some("x/y"));
+        assert_eq!(roles[1].model.as_deref(), Some("a/b:low"));
+        assert_eq!(
+            roles[2].model, None,
+            "an unconfigured built-in is still listed"
+        );
+        let mut unique = names(&roles);
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), roles.len());
+
+        for nothing in [None, Some(&json!(null)), Some(&json!([1, 2]))] {
+            let roles = roles_from_config(nothing);
+            assert_eq!(names(&roles), ["default", "smol", "slow"]);
+            assert!(roles.iter().all(|r| r.model.is_none()));
+        }
+    }
+
+    #[test]
+    fn roles_and_task_model_come_from_the_settings_catalog() {
+        let mut cache = ModelsCache::default();
+        let list = catalog_with(vec![
+            (
+                "modelRoles",
+                SettingKind::Record,
+                json!({"default": "a/b", "plan": "c/d:high"}),
+            ),
+            (
+                "task.agentModelOverrides",
+                SettingKind::Record,
+                json!({"task": ["e/f", "g/h"], "explore": "i/j"}),
+            ),
+        ]);
+        cache.set_roles(&list);
+        assert_eq!(names(cache.roles()), ["default", "smol", "slow", "plan"]);
+        assert_eq!(cache.task_model.as_deref(), Some("e/f"));
+        let generation = cache.generation;
+        cache.set_roles(&list);
+        assert_eq!(
+            cache.generation, generation,
+            "unchanged roles keep the cached rows"
+        );
+
+        cache.set_roles(&catalog_with(vec![(
+            "task.agentModelOverrides",
+            SettingKind::Record,
+            json!({"task": "k/l"}),
+        )]));
+        assert_eq!(names(cache.roles()), ["default", "smol", "slow"]);
+        assert_eq!(cache.task_model.as_deref(), Some("k/l"));
+        assert!(cache.generation > generation);
+        cache.set_roles(&catalog_with(vec![]));
+        assert_eq!(cache.task_model, None);
+    }
+
+    #[test]
+    fn an_at_search_lists_only_the_matching_roles_prefix_matches_first() {
+        let roles = vec![
+            role("default", Some("a/b")),
+            role("smol", Some("a/c")),
+            role("slow", None),
+            role("lint", Some("a/d")),
+        ];
+        let models = vec![model("a", "b"), model("a", "c")];
+        let list = |q: &str| build_rows_with_roles(&models, &roles, q, None, &[]);
+        assert_eq!(
+            list("@"),
+            [
+                Row::RolesHeader,
+                Row::Role(0),
+                Row::Role(1),
+                Row::Role(2),
+                Row::Role(3)
+            ],
+            "roles lead in their list order and no model follows"
+        );
+        // `l` starts "lint" and only occurs inside the others.
+        assert_eq!(
+            list("@l"),
+            [
+                Row::RolesHeader,
+                Row::Role(3),
+                Row::Role(0),
+                Row::Role(1),
+                Row::Role(2)
+            ]
+        );
+        assert_eq!(
+            list("  @ S "),
+            [Row::RolesHeader, Row::Role(1), Row::Role(2)]
+        );
+        assert_eq!(list("@SMOL"), [Row::RolesHeader, Row::Role(1)]);
+        assert!(list("@nothing").is_empty());
+        // Without roles an `@` query is an ordinary (empty) model search.
+        assert!(build_rows_with_roles(&models, &[], "@", None, &[]).is_empty());
+    }
+
+    #[test]
+    fn roles_form_a_group_between_favorites_and_providers() {
+        let roles = vec![
+            role("default", Some("a/b")),
+            role("smol", Some("z/c:low")),
+            role("slow", None),
+        ];
+        let models = vec![model("a", "b"), model("z", "c")];
+        let favorites = vec!["z/c".to_owned()];
+        let rows = build_rows_with_roles(&models, &roles, "", None, &favorites);
+        assert_eq!(
+            rows[..7],
+            [
+                Row::FavoritesHeader,
+                Row::Favorite(1),
+                Row::RolesHeader,
+                Row::Role(0),
+                Row::Role(1),
+                Row::Role(2),
+                Row::Header("a".to_owned()),
+            ]
+        );
+        // Words match `@role model`, so a model name finds the roles that use it.
+        assert_eq!(
+            build_rows_with_roles(&models, &roles, "z/c", None, &[])[..2],
+            [Row::RolesHeader, Row::Role(1)]
+        );
+        // A provider filter keeps the roles whose model that provider serves (an unset role has none).
+        assert_eq!(
+            build_rows_with_roles(&models, &roles, "", Some("a"), &[])[..2],
+            [Row::RolesHeader, Row::Role(0)]
+        );
+        // The plain picker passes no roles.
+        assert!(!build_rows(&models, "", None, &[]).contains(&Row::RolesHeader));
+    }
+
+    #[test]
+    fn picking_sends_the_selector_strings_omp_takes() {
+        // A role is switched to by alias, never by its model: omp resolves it and applies its level.
+        assert_eq!(
+            role_action(&role("smol", Some("a/b:low"))),
+            PickerAction::Switch {
+                selector: "@smol".to_owned(),
+                level: None
+            }
+        );
+        assert_eq!(role("review", None).selector(), "@review");
+        assert_eq!(
+            role("smol", Some("a/b:low")).target(),
+            Some(("a/b", Some("low")))
+        );
+        assert_eq!(role("slow", Some("a/b")).target(), Some(("a/b", None)));
+        assert_eq!(role("slow", None).target(), None);
+        assert_eq!(role_query("@smol"), Some("smol"));
+        assert_eq!(role_query("smol"), None);
+    }
+
+    #[test]
+    fn task_agents_need_live_control() {
+        assert_eq!(task_unavailable(Link::Live), None);
+        for link in [Link::Connecting, Link::ReadOnly, Link::Lost, Link::Ended] {
+            assert!(task_unavailable(link).is_some(), "{link:?}");
+        }
+    }
+
+    #[test]
+    fn the_task_model_in_effect_is_omps_last_answer_else_its_config() {
+        let mut cache = ModelsCache::default();
+        cache.set_roles(&catalog_with(vec![(
+            "task.agentModelOverrides",
+            SettingKind::Record,
+            json!({"task": "cfg/m"}),
+        )]));
+        let mut state = PickerState::default();
+        assert_eq!(state.task_now(&cache, Some(1)).as_deref(), Some("cfg/m"));
+        state.record_task_override(1, Some("set/m".to_owned()));
+        assert_eq!(state.task_now(&cache, Some(1)).as_deref(), Some("set/m"));
+        // Another tab is unaffected; an answer of "nothing" is remembered too.
+        assert_eq!(state.task_now(&cache, Some(2)).as_deref(), Some("cfg/m"));
+        state.record_task_override(2, None);
+        assert_eq!(state.task_now(&cache, Some(2)), None);
+        assert_eq!(state.task_now(&cache, None).as_deref(), Some("cfg/m"));
+    }
+
+    /// Runs the session picker `frames` frames with `state`; returns the actions it produced.
+    fn run(
+        ctx: &egui::Context,
+        state: &mut PickerState,
+        cache: &ModelsCache,
+        extras: &SessionExtras<'_>,
+        frames: usize,
+    ) -> Vec<PickerAction> {
+        let input = PickerInput {
+            catalog: cache,
+            current: Some("a/b"),
+            level: None,
+            favorites: &[],
+            provider: None,
+            unset: "No current model",
+        };
+        let mut actions = Vec::new();
+        for _ in 0..frames {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let chip = ui.button("Models");
+                actions.extend(show_session(&chip, state, &input, extras).actions);
+            })
+            .textures_delta
+            .clear();
+        }
+        actions
+    }
+
+    fn loaded() -> ModelsCache {
+        let mut cache = ModelsCache::default();
+        cache.finish(Ok(vec![model("a", "b"), model("a", "c")]));
+        cache.set_roles(&catalog_with(vec![(
+            "modelRoles",
+            SettingKind::Record,
+            json!({"smol": "a/c"}),
+        )]));
+        cache
+    }
+
+    #[test]
+    fn session_picker_lists_roles_and_task_mode_swaps_them_for_the_clear_row() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        let cache = loaded();
+        let live = SessionExtras {
+            tab: 7,
+            task_unavailable: None,
+        };
+        let mut state = PickerState::default();
+        state.request_open();
+        run(&ctx, &mut state, &cache, &live, 3);
+        assert!(state.rows.contains(&Row::RolesHeader));
+        assert!(!state.rows.contains(&Row::ClearOverride));
+
+        state.task_mode = true;
+        run(&ctx, &mut state, &cache, &live, 2);
+        assert_eq!(state.rows.first(), Some(&Row::ClearOverride));
+        assert!(!state.rows.contains(&Row::RolesHeader), "{:?}", state.rows);
+        assert!(state.rows.contains(&Row::Model(0)));
+    }
+
+    #[test]
+    fn task_mode_is_refused_without_live_control() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+        let cache = loaded();
+        let blind = SessionExtras {
+            tab: 7,
+            task_unavailable: task_unavailable(Link::ReadOnly),
+        };
+        let mut state = PickerState::default();
+        state.request_open();
+        run(&ctx, &mut state, &cache, &blind, 3);
+        state.task_mode = true;
+        run(&ctx, &mut state, &cache, &blind, 2);
+        assert!(!state.task_mode);
+        assert!(!state.rows.contains(&Row::ClearOverride));
     }
 }

@@ -6,8 +6,9 @@
 //! `user: ` / `assistant: ` / `developer: ` role prefix.
 //!
 //! Parsing is a streaming pass over the file: bodies are only materialised as far as a row needs
-//! (first 200 characters of text blocks; `toolResult` bodies are skipped; tool-call arguments stay
-//! borrowed `RawValue`s that are rendered once). Lines above [`MAX_LINE`] are never buffered
+//! (first 200 characters of text blocks; `toolResult` / `bashExecution` bodies keep only their
+//! first 200 characters for [`TreeNode::search_text`]; tool-call arguments stay borrowed
+//! `RawValue`s that are rendered once). Lines above [`MAX_LINE`] are never buffered
 //! beyond that size and are read by their prefix only (`type`, `id`, `parentId`, `timestamp`,
 //! `role`, `toolName`).
 //!
@@ -41,6 +42,11 @@ const TEXT_LIMIT: usize = 200;
 const GATHER_LIMIT: usize = 2000;
 /// Error text of an assistant row (omp: first 80 characters).
 const ERROR_LIMIT: usize = 80;
+/// Characters of each searchable piece kept in [`TreeNode::search_text`]: omp's `SEARCH_TEXT_LIMIT`
+/// (`tree-selector.ts`), applied to message / custom-message bodies and every other free-text piece.
+const SEARCH_LIMIT: usize = 200;
+/// Most `ttsr_injection` rule names kept in [`TreeNode::search_text`].
+const MAX_RULES: usize = 64;
 /// Longest line that is parsed; longer ones are read by prefix only.
 const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Bytes of an oversized line searched for `type` / `id` / `parentId` / `timestamp` / `role`.
@@ -89,6 +95,30 @@ impl NodeKind {
     }
 }
 
+/// `attribution` of a custom message (omp `MessageAttribution`): omp's own normalisation, any
+/// value other than `"user"` is `Agent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Attribution {
+    User,
+    Agent,
+}
+
+impl Attribution {
+    fn of(s: &str) -> Attribution {
+        if s == "user" {
+            Attribution::User
+        } else {
+            Attribution::Agent
+        }
+    }
+}
+
+/// omp `isUserTurnInitiator`: custom message types that start a user turn when attributed to the
+/// user (`skill-prompt`, and the collab peer prompt `collab-prompt`).
+fn is_user_initiator(custom_type: &str) -> bool {
+    matches!(custom_type, "skill-prompt" | "collab-prompt")
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TreeNode {
     pub id: String,
@@ -109,6 +139,39 @@ pub struct TreeNode {
     /// Recorded cost of every entry before this one in the file (all branches, hidden
     /// `model_usage` records included); this entry's own usage is not in it.
     pub cost_before: RecordedCost,
+    /// The text omp's `/tree` search matches this entry against (`tree-selector.ts`
+    /// `#getSearchableText`) minus the label, which lives in [`SessionTree::labels`]; the
+    /// consumer prepends it. Space-joined pieces, in omp's order, each non-empty piece capped at
+    /// 200 characters (omp's `SEARCH_TEXT_LIMIT`), raw (not control-stripped):
+    /// - `message`: the role, the content's text blocks (for tool results and bash executions
+    ///   too), a bash execution's command;
+    /// - `custom_message`: the custom type, then the advisor qualifier + note text, or the content
+    ///   with its `<system-*>` wrapper stripped;
+    /// - `compaction`; `branch summary` + the summary; `model` + the model;
+    /// - `model usage` + purpose, role, provider, model;
+    /// - `thinking` + level; `custom` + type; `label` + the label; `service tier` + each
+    ///   family and tier; `title` + title; `mode` + mode; `credential pin` + provider;
+    /// - `ttsr injection` + each injected rule name (first 64); `reset boundary`; `session init`.
+    ///
+    /// Entries too large to parse carry only their role / type keyword.
+    #[serde(default)]
+    pub search_text: String,
+    /// A `custom_message` entry's or `custom`-role message's `attribution`; `None` when the entry
+    /// has no such field or is another kind.
+    #[serde(default)]
+    pub attribution: Option<Attribution>,
+    /// omp's `isUserRequestEntry`: a `user` message, a `custom`-role message or a `custom_message`
+    /// entry with string/array content that is a user turn initiator (`skill-prompt` /
+    /// `collab-prompt` attributed to `"user"`). Not set for lines too large to parse, except
+    /// `user` messages.
+    #[serde(default)]
+    pub user_request: bool,
+    /// The `toolName` of a `toolResult` message (omp identifies an `ask` answer for
+    /// `navigateTree`'s `allowAskReopen` as `role == "toolResult" && toolName == "ask"`). `None`
+    /// for every other kind, and for a tool result without a readable name. Tool calls are not
+    /// nodes of their own.
+    #[serde(default)]
+    pub tool_name: Option<String>,
 }
 
 /// A sum of omp's recorded `usage.cost.total` (USD) over a prefix of the session file.
@@ -507,23 +570,26 @@ fn format_tool_call(name: &str, raw: Option<&RawValue>) -> String {
 #[derive(Deserialize)]
 struct Key<'a>(#[serde(borrow)] Cow<'a, str>);
 
-/// Text blocks of a message / custom_message `content`, gathered only as far as rows need.
+/// Text blocks of a message / custom_message `content`, gathered only as far as rows need: at
+/// most `LIMIT` characters.
 #[derive(Default)]
-struct Content {
+struct Content<const LIMIT: usize = GATHER_LIMIT> {
     text: String,
     chars: usize,
     truncated: bool,
     has_text: bool,
+    /// The content was a string or an array (omp `isCustomMessageContent`).
+    valid: bool,
     /// (toolCall id, rendered row) of the assistant's tool calls.
     calls: Vec<(String, String)>,
 }
 
-impl Content {
+impl<const LIMIT: usize> Content<LIMIT> {
     fn add_text(&mut self, s: &str) {
         if !self.has_text && !is_blank_text(s) {
             self.has_text = true;
         }
-        let room = GATHER_LIMIT - self.chars;
+        let room = LIMIT - self.chars;
         if room == 0 {
             self.truncated |= !s.is_empty();
             return;
@@ -549,21 +615,27 @@ struct Block<'a> {
     arguments: Option<&'a RawValue>,
 }
 
-impl<'de> Deserialize<'de> for Content {
+impl<'de, const LIMIT: usize> Deserialize<'de> for Content<LIMIT> {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Content;
+        struct V<const L: usize>;
+        impl<'de, const L: usize> Visitor<'de> for V<L> {
+            type Value = Content<L>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("message content")
             }
-            fn visit_str<E>(self, s: &str) -> Result<Content, E> {
-                let mut c = Content::default();
+            fn visit_str<E>(self, s: &str) -> Result<Content<L>, E> {
+                let mut c = Content::<L> {
+                    valid: true,
+                    ..Default::default()
+                };
                 c.add_text(s);
                 Ok(c)
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Content, A::Error> {
-                let mut c = Content::default();
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Content<L>, A::Error> {
+                let mut c = Content::<L> {
+                    valid: true,
+                    ..Default::default()
+                };
                 while let Some(b) = seq.next_element::<Block<'de>>()? {
                     match b.ty.as_deref() {
                         Some("text") => {
@@ -582,27 +654,27 @@ impl<'de> Deserialize<'de> for Content {
                 }
                 Ok(c)
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Content, A::Error> {
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Content<L>, A::Error> {
                 while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
                 Ok(Content::default())
             }
-            fn visit_unit<E>(self) -> Result<Content, E> {
+            fn visit_unit<E>(self) -> Result<Content<L>, E> {
                 Ok(Content::default())
             }
-            fn visit_bool<E>(self, _: bool) -> Result<Content, E> {
+            fn visit_bool<E>(self, _: bool) -> Result<Content<L>, E> {
                 Ok(Content::default())
             }
-            fn visit_i64<E>(self, _: i64) -> Result<Content, E> {
+            fn visit_i64<E>(self, _: i64) -> Result<Content<L>, E> {
                 Ok(Content::default())
             }
-            fn visit_u64<E>(self, _: u64) -> Result<Content, E> {
+            fn visit_u64<E>(self, _: u64) -> Result<Content<L>, E> {
                 Ok(Content::default())
             }
-            fn visit_f64<E>(self, _: f64) -> Result<Content, E> {
+            fn visit_f64<E>(self, _: f64) -> Result<Content<L>, E> {
                 Ok(Content::default())
             }
         }
-        d.deserialize_any(V)
+        d.deserialize_any(V::<LIMIT>)
     }
 }
 
@@ -782,11 +854,15 @@ impl<'de> Deserialize<'de> for TaskDetails {
 struct Msg {
     role: Option<String>,
     content: Option<Content>,
+    /// Content of a tool result / bash execution: only its search text is kept.
+    body: Option<Content<SEARCH_LIMIT>>,
     stop_reason: Option<String>,
     error_message: Option<String>,
     tool_call_id: Option<String>,
     tool_name: Option<String>,
     command: Option<String>,
+    custom_type: Option<String>,
+    attribution: Option<String>,
     recovery: Option<Recovery>,
     /// `usage` (counted for assistants only).
     usage: Option<UsageVal>,
@@ -808,12 +884,15 @@ impl<'de> Deserialize<'de> for Msg {
                     match &*key {
                         "role" => msg.role = m.next_value()?,
                         "content" => match msg.role.as_deref() {
-                            // Bodies of tool output are never shown: skip without allocating.
+                            // Bodies of tool output are only searched: keep their first 200
+                            // characters, nothing else.
                             Some("toolResult" | "bashExecution") => {
-                                m.next_value::<IgnoredAny>()?;
+                                msg.body = Some(m.next_value()?)
                             }
                             _ => msg.content = Some(m.next_value()?),
                         },
+                        "customType" => msg.custom_type = m.next_value()?,
+                        "attribution" => msg.attribution = m.next_value()?,
                         "stopReason" => msg.stop_reason = m.next_value()?,
                         "errorMessage" => msg.error_message = m.next_value()?,
                         "toolCallId" => msg.tool_call_id = m.next_value()?,
@@ -843,6 +922,58 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
+/// `injectedRules` of a `ttsr_injection`: the first [`MAX_RULES`] rule names; anything of the
+/// wrong shape is no rules.
+#[derive(Default)]
+struct Rules(Vec<String>);
+
+impl<'de> Deserialize<'de> for Rules {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Rules;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of rule names")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Rules, A::Error> {
+                let mut rules = Vec::new();
+                while rules.len() < MAX_RULES {
+                    match s.next_element::<Value>()? {
+                        Some(Value::String(r)) => rules.push(r),
+                        Some(_) => {}
+                        None => return Ok(Rules(rules)),
+                    }
+                }
+                while s.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Rules(rules))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Rules, A::Error> {
+                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Rules::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+            fn visit_unit<E>(self) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Rules, E> {
+                Ok(Rules::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Deserialize)]
 struct Line<'a> {
     #[serde(rename = "type", borrow)]
@@ -862,6 +993,10 @@ struct Line<'a> {
     /// `custom_message` content.
     #[serde(default)]
     content: Option<Content>,
+    #[serde(default, borrow)]
+    attribution: Option<Cow<'a, str>>,
+    #[serde(default, rename = "injectedRules")]
+    injected_rules: Option<Rules>,
     #[serde(default, borrow)]
     details: Option<&'a RawValue>,
     #[serde(default, borrow)]
@@ -906,8 +1041,8 @@ struct AdvisorNote {
     severity: Option<String>,
 }
 
-/// omp `advisorTreeDisplay` + row label.
-fn advisor_text(details: Option<&RawValue>) -> String {
+/// omp `advisorTreeDisplay`: (qualifier, note text), both cleaned.
+fn advisor_parts(details: Option<&RawValue>) -> (String, String) {
     let notes = details
         .and_then(|d| serde_json::from_str::<AdvisorDetails>(d.get()).ok())
         .map(|d| d.notes)
@@ -938,12 +1073,18 @@ fn advisor_text(details: Option<&RawValue>) -> String {
         .chain(severities)
         .collect::<Vec<_>>()
         .join(", ");
+    (qualifier, clean(&texts.join(" ")))
+}
+
+/// `advisorTreeDisplay` + row label.
+fn advisor_text(details: Option<&RawValue>) -> String {
+    let (qualifier, text) = advisor_parts(details);
     let label = if qualifier.is_empty() {
         "advisor: ".to_owned()
     } else {
         format!("advisor ({qualifier}): ")
     };
-    format!("{label}{}", clean(&texts.join(" ")))
+    format!("{label}{text}")
 }
 
 fn kind_of_role(role: &str) -> NodeKind {
@@ -988,6 +1129,10 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
     let mut has_text = false;
     let mut stop_reason = None;
     let mut bill = Bill::Nothing;
+    let mut parts: Vec<String> = Vec::new();
+    let mut attribution = None;
+    let mut user_request = false;
+    let mut tool_name = None;
     let (kind, text) = match line.ty.as_ref() {
         "message" => {
             let mut msg = line.message.unwrap_or_default();
@@ -1030,6 +1175,25 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
                 )),
                 _ => format!("[{role}]"),
             };
+            let body = match msg.body.take() {
+                Some(b) => b.text,
+                None => truncate_chars(&content.text, SEARCH_LIMIT).to_owned(),
+            };
+            parts.push(role.clone());
+            push_piece(&mut parts, &body);
+            if kind == NodeKind::BashExecution {
+                push_piece(&mut parts, msg.command.as_deref().unwrap_or(""));
+            }
+            if role == "custom" {
+                attribution = msg.attribution.as_deref().map(Attribution::of);
+                user_request = attribution == Some(Attribution::User)
+                    && msg.custom_type.as_deref().is_some_and(is_user_initiator);
+            } else {
+                user_request = kind == NodeKind::User;
+            }
+            if kind == NodeKind::ToolResult {
+                tool_name = msg.tool_name.clone();
+            }
             calls = content.calls;
             bill = match kind {
                 NodeKind::Assistant => msg.usage.as_ref().map_or(Bill::Unknown, UsageVal::bill),
@@ -1045,11 +1209,19 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
         }
         "custom_message" => {
             let ct = line.custom_type.as_deref().unwrap_or("custom");
+            attribution = line.attribution.as_deref().map(Attribution::of);
+            let c = line.content.unwrap_or_default();
+            user_request =
+                c.valid && attribution == Some(Attribution::User) && is_user_initiator(ct);
+            parts.push(ct.to_owned());
             let text = if ct == "advisor" {
+                let (qualifier, note) = advisor_parts(line.details);
+                push_piece(&mut parts, &qualifier);
+                push_piece(&mut parts, &note);
                 row(&advisor_text(line.details))
             } else {
-                let c = line.content.unwrap_or_default();
                 let body = strip_system_wrapper(&c.text, c.truncated);
+                push_piece(&mut parts, body);
                 row(&format!("[{ct}]: {}", clean(body)))
             };
             (NodeKind::CustomMessage(ct.to_owned()), text)
@@ -1094,6 +1266,8 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
                 .thinking_level
                 .flatten()
                 .unwrap_or_else(|| "off".to_owned());
+            parts.push("thinking".to_owned());
+            parts.push(level.clone());
             (NodeKind::ThinkingChange, format!("[thinking: {level}]"))
         }
         "custom" => {
@@ -1105,6 +1279,8 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
         }
         "label" => {
             let value = line.label.flatten();
+            parts.push("label".to_owned());
+            push_piece(&mut parts, value.as_deref().unwrap_or(""));
             let shown = value.clone().unwrap_or_else(|| "(cleared)".to_owned());
             if let Some(target) = line.target_id.as_deref() {
                 label = Some((target.to_owned(), value.filter(|l| !l.is_empty())));
@@ -1144,6 +1320,61 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
         ),
         other => (NodeKind::Setting(other.to_owned()), type_row(&clean(other))),
     };
+    // Keywords of the entry types that carry no message body (omp `#getSearchableText`).
+    let piece = |parts: &mut Vec<String>, s: &Option<Cow<'_, str>>| {
+        push_piece(parts, s.as_deref().unwrap_or(""));
+    };
+    match line.ty.as_ref() {
+        "compaction" => parts.push("compaction".to_owned()),
+        "branch_summary" => {
+            parts.push("branch summary".to_owned());
+            piece(&mut parts, &line.summary);
+        }
+        "model_change" => {
+            parts.push("model".to_owned());
+            piece(&mut parts, &line.model);
+        }
+        "model_usage" => {
+            parts.push("model usage".to_owned());
+            for f in [&line.purpose, &line.role, &line.provider, &line.model] {
+                push_piece(&mut parts, &str_or(f, ""));
+            }
+        }
+        "custom" => {
+            parts.push("custom".to_owned());
+            piece(&mut parts, &line.custom_type);
+        }
+        "service_tier_change" => {
+            parts.push("service tier".to_owned());
+            for (family, tier) in line.service_tier.iter().flatten() {
+                if let Some(tier) = tier.as_str().filter(|t| !t.is_empty()) {
+                    push_piece(&mut parts, family);
+                    push_piece(&mut parts, tier);
+                }
+            }
+        }
+        "title_change" => {
+            parts.push("title".to_owned());
+            piece(&mut parts, &line.title);
+        }
+        "mode_change" => {
+            parts.push("mode".to_owned());
+            piece(&mut parts, &line.mode);
+        }
+        "credential_pin" => {
+            parts.push("credential pin".to_owned());
+            piece(&mut parts, &line.provider);
+        }
+        "ttsr_injection" => {
+            parts.push("ttsr injection".to_owned());
+            for rule in line.injected_rules.iter().flat_map(|r| &r.0) {
+                push_piece(&mut parts, rule);
+            }
+        }
+        "reset_boundary" => parts.push("reset boundary".to_owned()),
+        "session_init" => parts.push("session init".to_owned()),
+        _ => {}
+    }
     Ok(Some(Parsed {
         node: TreeNode {
             id: id.to_owned(),
@@ -1155,6 +1386,10 @@ fn parse_line(bytes: &[u8], tools: &HashMap<String, String>) -> Result<Option<Pa
             stop_reason,
             active_leaf: line.active_leaf,
             cost_before: RecordedCost::default(),
+            search_text: parts.join(" "),
+            attribution,
+            user_request,
+            tool_name,
         },
         label,
         calls,
@@ -1174,6 +1409,44 @@ fn head_field<'a>(head: &'a [u8], key: &str) -> Option<Option<&'a str>> {
     let rest = rest.strip_prefix(b"\"")?;
     let end = memchr(b'"', rest)?;
     std::str::from_utf8(&rest[..end]).ok().map(Some)
+}
+
+/// A non-empty `s`, cut at [`SEARCH_LIMIT`] characters, as one more piece of a search text.
+fn push_piece(parts: &mut Vec<String>, s: &str) {
+    if !s.is_empty() {
+        parts.push(truncate_chars(s, SEARCH_LIMIT).to_owned());
+    }
+}
+
+/// The keyword omp's search text starts a kind with (all that survives of a line too large to
+/// parse).
+fn type_keyword(kind: &NodeKind) -> &str {
+    match kind {
+        NodeKind::User => "user",
+        NodeKind::Assistant => "assistant",
+        NodeKind::ToolResult => "toolResult",
+        NodeKind::Developer => "developer",
+        NodeKind::BashExecution => "bashExecution",
+        NodeKind::OtherRole(role) => role,
+        NodeKind::CustomMessage(_) => "",
+        NodeKind::Compaction => "compaction",
+        NodeKind::BranchSummary => "branch summary",
+        NodeKind::ModelChange => "model",
+        NodeKind::ModelUsage => "model usage",
+        NodeKind::ThinkingChange => "thinking",
+        NodeKind::Label => "label",
+        NodeKind::Custom(_) => "custom",
+        NodeKind::Setting(ty) => match ty.as_str() {
+            "service_tier_change" => "service tier",
+            "title_change" => "title",
+            "mode_change" => "mode",
+            "credential_pin" => "credential pin",
+            "ttsr_injection" => "ttsr injection",
+            "reset_boundary" => "reset boundary",
+            "session_init" => "session init",
+            _ => "",
+        },
+    }
 }
 
 /// Node for a line too large to parse: type, ids, role and tool name from its prefix only. A
@@ -1206,6 +1479,13 @@ fn parse_oversize(
         "custom" => NodeKind::Custom(String::new()),
         other => NodeKind::Setting(other.to_owned()),
     };
+    let search_text = type_keyword(&kind).to_owned();
+    let user_request = kind == NodeKind::User;
+    let tool_name = if kind == NodeKind::ToolResult {
+        head_field(head, "toolName").flatten().map(str::to_owned)
+    } else {
+        None
+    };
     // The cost of an unread usage record is unknown; other entries record nothing.
     let bill = match &kind {
         NodeKind::Assistant | NodeKind::ModelUsage | NodeKind::OtherRole(_) => Bill::Unknown,
@@ -1232,6 +1512,10 @@ fn parse_oversize(
             stop_reason: None,
             active_leaf: leaf,
             cost_before: RecordedCost::default(),
+            search_text,
+            attribution: None,
+            user_request,
+            tool_name,
         },
         label: None,
         calls: Vec::new(),
@@ -1876,5 +2160,214 @@ mod tests {
             parse_oversize(br#"{"type":"custom","x":"#, 1, None),
             Ok(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn node(json: &str) -> TreeNode {
+        parse_line(json.as_bytes(), &HashMap::new())
+            .unwrap()
+            .unwrap()
+            .node
+    }
+
+    #[test]
+    fn tool_result_body_is_searchable_and_bounded() {
+        let long = "z".repeat(5000);
+        let n = node(&format!(
+            r#"{{"type":"message","id":"t","parentId":null,"message":{{"role":"toolResult","toolCallId":"c","toolName":"read","content":[{{"type":"text","text":"alpha beta"}},{{"type":"image","data":"AAAA"}},{{"type":"text","text":"{long}"}}]}}}}"#
+        ));
+        assert_eq!(n.kind, NodeKind::ToolResult);
+        assert_eq!(n.text, "[read]");
+        assert!(n.search_text.starts_with("toolResult alpha beta"));
+        assert_eq!(n.search_text.chars().count(), "toolResult ".len() + 200);
+        assert!(!n.user_request);
+    }
+
+    #[test]
+    fn message_roles_and_bash_command() {
+        let n = node(
+            r#"{"type":"message","id":"b","parentId":null,"message":{"role":"bashExecution","command":"cargo test","output":"ok"}}"#,
+        );
+        assert_eq!(n.search_text, "bashExecution cargo test");
+        let n = node(
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        );
+        assert_eq!(n.search_text, "assistant hello");
+        let n = node(
+            r#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"fix login"}}"#,
+        );
+        assert_eq!(n.search_text, "user fix login");
+        assert!(n.user_request);
+    }
+
+    #[test]
+    fn model_usage_purpose_and_provider() {
+        let n = node(
+            r#"{"type":"model_usage","id":"m","parentId":null,"purpose":"title-gen","role":"smol","provider":"anthropic","model":"haiku","usage":{"cost":{"total":0.1}}}"#,
+        );
+        assert_eq!(n.search_text, "model usage title-gen smol anthropic haiku");
+    }
+
+    #[test]
+    fn ttsr_rule_names_are_searchable_and_capped() {
+        let n = node(
+            r#"{"type":"ttsr_injection","id":"r","parentId":null,"injectedRules":["no-unwrap","use-thiserror",7]}"#,
+        );
+        assert_eq!(n.search_text, "ttsr injection no-unwrap use-thiserror");
+        let many = (0..200)
+            .map(|i| format!(r#""r{i}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let n = node(&format!(
+            r#"{{"type":"ttsr_injection","id":"r","parentId":null,"injectedRules":[{many}]}}"#
+        ));
+        assert_eq!(n.search_text.split(' ').count(), 2 + MAX_RULES);
+        let n = node(r#"{"type":"ttsr_injection","id":"r","parentId":null,"injectedRules":"x"}"#);
+        assert_eq!(n.search_text, "ttsr injection");
+    }
+
+    #[test]
+    fn custom_message_attribution_and_user_request() {
+        let cm = |ct: &str, attr: &str, content: &str| {
+            node(&format!(
+                r#"{{"type":"custom_message","id":"c","parentId":null,"customType":"{ct}",{attr}"content":{content},"display":true}}"#
+            ))
+        };
+        let n = cm("skill-prompt", r#""attribution":"user","#, r#""run it""#);
+        assert_eq!(n.attribution, Some(Attribution::User));
+        assert!(n.user_request);
+        assert_eq!(n.search_text, "skill-prompt run it");
+        let n = cm(
+            "collab-prompt",
+            r#""attribution":"user","#,
+            r#"[{"type":"text","text":"peer"}]"#,
+        );
+        assert!(n.user_request);
+        // agent-attributed, unattributed, other types and unsendable content are not requests
+        let n = cm("skill-prompt", r#""attribution":"agent","#, r#""x""#);
+        assert_eq!(n.attribution, Some(Attribution::Agent));
+        assert!(!n.user_request);
+        let n = cm("skill-prompt", "", r#""x""#);
+        assert_eq!(n.attribution, None);
+        assert!(!n.user_request);
+        assert!(!cm("reminder", r#""attribution":"user","#, r#""x""#).user_request);
+        assert!(!cm("skill-prompt", r#""attribution":"user","#, "5").user_request);
+        // the system wrapper is stripped from the searchable body
+        let n = cm(
+            "note",
+            "",
+            r#""<system-notice>\nJob done\n</system-notice>""#,
+        );
+        assert_eq!(n.search_text, "note Job done");
+    }
+
+    #[test]
+    fn custom_role_message_attribution() {
+        let n = node(
+            r#"{"type":"message","id":"c","parentId":null,"message":{"role":"custom","customType":"collab-prompt","attribution":"user","content":"hi"}}"#,
+        );
+        assert_eq!(n.kind, NodeKind::OtherRole("custom".into()));
+        assert_eq!(n.attribution, Some(Attribution::User));
+        assert!(n.user_request);
+        assert_eq!(n.search_text, "custom hi");
+        let n = node(
+            r#"{"type":"message","id":"c","parentId":null,"message":{"role":"custom","customType":"reminder","attribution":"user","content":"hi"}}"#,
+        );
+        assert!(!n.user_request);
+    }
+
+    #[test]
+    fn advisor_and_per_type_keywords() {
+        let n = node(
+            r#"{"type":"custom_message","id":"a","parentId":null,"customType":"advisor","content":"","details":{"notes":[{"note":"check x","advisor":"gpt","severity":"blocker"}]}}"#,
+        );
+        assert_eq!(n.search_text, "advisor gpt, blocker check x");
+        let kw = |json: &str| node(json).search_text;
+        assert_eq!(
+            kw(
+                r#"{"type":"service_tier_change","id":"s","serviceTier":{"openai":"priority","x":""}}"#
+            ),
+            "service tier openai priority"
+        );
+        assert_eq!(
+            kw(r#"{"type":"title_change","id":"s","title":"New"}"#),
+            "title New"
+        );
+        assert_eq!(
+            kw(r#"{"type":"mode_change","id":"s","mode":"plan"}"#),
+            "mode plan"
+        );
+        assert_eq!(
+            kw(r#"{"type":"credential_pin","id":"s","provider":"openai"}"#),
+            "credential pin openai"
+        );
+        assert_eq!(
+            kw(r#"{"type":"branch_summary","id":"s","summary":"did things"}"#),
+            "branch summary did things"
+        );
+        assert_eq!(
+            kw(r#"{"type":"model_change","id":"s","model":"a/b"}"#),
+            "model a/b"
+        );
+        assert_eq!(
+            kw(r#"{"type":"thinking_level_change","id":"s"}"#),
+            "thinking off"
+        );
+        assert_eq!(
+            kw(r#"{"type":"label","id":"s","targetId":"x","label":"keep"}"#),
+            "label keep"
+        );
+        assert_eq!(
+            kw(r#"{"type":"reset_boundary","id":"s"}"#),
+            "reset boundary"
+        );
+        assert_eq!(kw(r#"{"type":"session_init","id":"s"}"#), "session init");
+        assert_eq!(kw(r#"{"type":"compaction","id":"s"}"#), "compaction");
+        assert_eq!(
+            kw(r#"{"type":"custom","id":"s","customType":"x"}"#),
+            "custom x"
+        );
+        assert_eq!(kw(r#"{"type":"mystery","id":"s"}"#), "");
+    }
+
+    #[test]
+    fn oversize_lines_keep_only_their_keyword() {
+        let p = parse_oversize(
+            br#"{"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"#,
+            9 << 20,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.node.search_text, "user");
+        assert!(p.node.user_request);
+    }
+
+    #[test]
+    fn tool_result_name_identifies_ask_answers() {
+        let n = node(
+            r#"{"type":"message","id":"t","parentId":null,"message":{"role":"toolResult","toolCallId":"c","toolName":"ask","content":[{"type":"text","text":"yes"}]}}"#,
+        );
+        assert_eq!(n.tool_name.as_deref(), Some("ask"));
+        let n = node(
+            r#"{"type":"message","id":"t","parentId":null,"message":{"role":"toolResult","content":"x"}}"#,
+        );
+        assert_eq!(n.tool_name, None);
+        let n = node(
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","toolName":"ask","content":"x"}}"#,
+        );
+        assert_eq!(n.tool_name, None, "only tool results carry a tool name");
+        let p = parse_oversize(
+            br#"{"type":"message","id":"t","parentId":null,"message":{"role":"toolResult","toolName":"ask","content":"#,
+            9 << 20,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.node.tool_name.as_deref(), Some("ask"));
     }
 }

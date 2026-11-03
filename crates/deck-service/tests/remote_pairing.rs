@@ -226,6 +226,13 @@ impl Drop for Sandbox {
         if let Some(pid) = self.owner_pid() {
             kill_process(pid, cfg!(windows));
         }
+        // Host-backend sessions outlive the owner (and their sockets go with the root): end every
+        // session of this test's namespace.
+        if let Ok(ns) = deck_host::Namespace::new(&self.ns) {
+            for name in ns.list() {
+                let _ = ns.kill(&name);
+            }
+        }
         // Our own test namespace only (never the default tmux server).
         if !cfg!(windows) {
             let _ = Command::new("tmux")

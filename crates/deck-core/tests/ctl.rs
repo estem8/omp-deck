@@ -220,18 +220,14 @@ fn commands_map_to_reply_ids() {
                 kill,
                 CtlReply {
                     ok: true,
-                    error: None,
-                    new_file: None,
-                    leaf: None,
+                    ..CtlReply::default()
                 }
             ),
             (
                 chat,
                 CtlReply {
                     ok: true,
-                    error: None,
-                    new_file: None,
-                    leaf: None,
+                    ..CtlReply::default()
                 }
             ),
             (
@@ -239,8 +235,7 @@ fn commands_map_to_reply_ids() {
                 CtlReply {
                     ok: false,
                     error: Some("no such subagent".into()),
-                    new_file: None,
-                    leaf: None,
+                    ..CtlReply::default()
                 }
             ),
         ]
@@ -265,6 +260,7 @@ fn fork_at_and_navigate_round_trip() {
     let nav = client.send(CtlCommand::Navigate {
         root: "/s/main.jsonl".into(),
         entry_id: "u2".into(),
+        summary: deck_core::ctl::BranchSummary::Custom("focus on tests".into()),
     });
     let mut rd = BufReader::new(s.try_clone().unwrap());
     let mut got = Vec::new();
@@ -280,6 +276,8 @@ fn fork_at_and_navigate_round_trip() {
     assert_eq!(got[1]["t"], "navigate");
     assert_eq!(got[1]["entryId"], "u2");
     assert_eq!(got[1]["rid"], nav);
+    assert_eq!(got[1]["summarize"], true);
+    assert_eq!(got[1]["customInstructions"], "focus on tests");
 
     say(
         &mut s,
@@ -301,6 +299,114 @@ fn fork_at_and_navigate_round_trip() {
     );
     assert!(replies[0].1.ok);
     assert_eq!(replies[1].1.error.as_deref(), Some("busy"));
+}
+
+#[test]
+fn navigate_summary_and_new_commands_encode_and_replies_carry_value_and_message() {
+    use deck_core::ctl::BranchSummary;
+    use deck_core::omp::AdvisorScope;
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = fake(tmp.path());
+    let client = CtlClient::spawn(tmp.path().to_path_buf(), || {});
+    let mut s = srv.accept();
+    say(&mut s, HELLO);
+    say(&mut s, &snapshot_line(1, ""));
+    snapshot(&client);
+
+    let root = || std::path::PathBuf::from("/s/main.jsonl");
+    let ids = [
+        client.send(CtlCommand::Navigate {
+            root: root(),
+            entry_id: "a".into(),
+            summary: BranchSummary::None,
+        }),
+        client.send(CtlCommand::Navigate {
+            root: root(),
+            entry_id: "b".into(),
+            summary: BranchSummary::Summarize,
+        }),
+        client.send(CtlCommand::SetLabel {
+            root: root(),
+            entry_id: "c".into(),
+            label: None,
+        }),
+        client.send(CtlCommand::ReanswerAsk {
+            root: root(),
+            entry_id: "d".into(),
+        }),
+        client.send(CtlCommand::AdvisorConfig {
+            root: None,
+            scope: AdvisorScope::User,
+            doc: Some(serde_json::json!({"advisors": []})),
+        }),
+        client.send(CtlCommand::TaskModelOverride {
+            root: None,
+            model: Some("fake/fake-1".into()),
+        }),
+    ];
+    let mut rd = BufReader::new(s.try_clone().unwrap());
+    let mut got = Vec::new();
+    for _ in 0..ids.len() {
+        let mut l = String::new();
+        rd.read_line(&mut l).unwrap();
+        got.push(serde_json::from_str::<serde_json::Value>(&l).unwrap());
+    }
+    let (n0, n1) = (&got[0], &got[1]);
+    assert_eq!(
+        (n0["t"].as_str(), n0["summarize"].clone()),
+        (Some("navigate"), false.into())
+    );
+    assert!(n0["customInstructions"].is_null());
+    assert_eq!(n1["summarize"], true);
+    assert!(
+        n1["customInstructions"].is_null(),
+        "the default prompt sends no instructions"
+    );
+    assert_eq!(got[2]["t"], "set_label");
+    assert_eq!(got[2]["entryId"], "c");
+    assert!(got[2]["label"].is_null(), "no label removes it");
+    assert_eq!(
+        (got[3]["t"].as_str(), got[3]["entryId"].as_str()),
+        (Some("reanswer_ask"), Some("d"))
+    );
+    assert_eq!(got[4]["t"], "advisor_config");
+    assert_eq!(got[4]["scope"], "user");
+    assert_eq!(got[4]["doc"], serde_json::json!({"advisors": []}));
+    assert!(got[4]["root"].is_null());
+    assert_eq!(
+        (got[5]["t"].as_str(), got[5]["model"].as_str()),
+        (Some("task_model_override"), Some("fake/fake-1"))
+    );
+
+    say(
+        &mut s,
+        &format!(
+            r#"{{"t":"reply","rid":{},"ok":true,"leaf":"x","message":"Already at this point"}}"#,
+            ids[0]
+        ),
+    );
+    say(
+        &mut s,
+        &format!(
+            r#"{{"t":"reply","rid":{},"ok":true,"value":{{"path":"/w/WATCHDOG.yml"}},"message":"Saved user WATCHDOG.yml — 0 advisors active."}}"#,
+            ids[4]
+        ),
+    );
+    let mut replies = Vec::new();
+    wait_for("2 replies", || {
+        replies.extend(client.take_replies());
+        replies.len() >= 2
+    });
+    replies.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        replies[0].1.message.as_deref(),
+        Some("Already at this point")
+    );
+    assert_eq!(replies[0].1.leaf.as_deref(), Some("x"));
+    assert_eq!(
+        replies[1].1.value.as_ref().unwrap()["path"],
+        "/w/WATCHDOG.yml"
+    );
 }
 
 #[test]

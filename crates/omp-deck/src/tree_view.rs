@@ -10,9 +10,11 @@ use crate::icons::Icon;
 use crate::icons::{
     ICON_ALIGN_LEFT, ICON_ARROW_RIGHT, ICON_BOOKMARK, ICON_COINS, ICON_COPY,
     ICON_CORNER_DOWN_RIGHT, ICON_CROSSHAIR, ICON_FOLD_VERTICAL, ICON_GIT_FORK, ICON_KEY_ROUND,
-    ICON_LIST_TREE, ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH, ICON_X,
+    ICON_LIST_TREE, ICON_MESSAGES_SQUARE, ICON_SCROLL_TEXT, ICON_SPARKLES, ICON_USER, ICON_WRENCH,
+    ICON_X,
 };
 use deck_core::config::UiFont;
+use deck_core::ctl::BranchSummary;
 use deck_core::tree::{NodeKind, RecordedCost, SessionTree};
 use egui::Galley;
 use egui::epaint::CubicBezierShape;
@@ -24,17 +26,26 @@ use egui::{
 
 use crate::badge::{Badge, Hue};
 use crate::card;
+use crate::confirm::{self, Dialog, Reply};
 use crate::theme::{self, Palette};
-use crate::tree_layout::{self, Filter, Layout, Row, RowClass};
-use crate::widgets::{empty_state, menu_item, paint_icon};
+use crate::tree_layout::{self, Filter, FuzzySearch, Layout, Row, RowClass, SearchIndex};
+use crate::widgets::{DraftButton, DraftKind, empty_state, menu_item, paint_icon};
 
+/// Rows per page before the list has been measured.
+const DEFAULT_PAGE: usize = 12;
 /// Uniform row height (virtualization relies on it).
 pub const ROW_H: f32 = 38.0;
 const LANE_W: f32 = 18.0;
 const FULL_LANES: usize = 7;
 const PAD_L: f32 = 18.0;
-/// Right-hand column: the age, or the hover actions in its place.
-const ACTIONS_W: f32 = 176.0;
+/// Right-hand column: the age, or the hover actions in its place (label, fork, go here).
+const ACTIONS_W: f32 = 212.0;
+/// The same on an `ask` result: one more button (re-answer).
+const ACTIONS_W_ASK: f32 = 248.0;
+
+fn actions_w(ask: bool) -> f32 {
+    if ask { ACTIONS_W_ASK } else { ACTIONS_W }
+}
 
 pub enum TreeAction {
     Close,
@@ -47,6 +58,17 @@ pub enum TreeAction {
         entry: String,
         /// The target is a user prompt: omp moves to its parent and returns the text to the editor.
         user: bool,
+        /// What omp does with the branch being left.
+        summary: BranchSummary,
+    },
+    /// Set (`Some`) or remove (`None`) the label of `entry`.
+    SetLabel {
+        entry: String,
+        label: Option<String>,
+    },
+    /// Re-answer the `ask` result `entry`: omp asks the question again in the session's tab.
+    Reanswer {
+        entry: String,
     },
     Copy {
         text: String,
@@ -66,6 +88,14 @@ pub struct TreeInput<'a> {
     pub navigate: Result<(), &'a str>,
     /// `Ok` = Fork is available; `Err` = why it is not.
     pub fork: Result<(), &'a str>,
+    /// omp's `branchSummary.enabled`: Go here asks whether to summarize the branch it leaves.
+    pub summary_prompt: bool,
+    /// `Ok` = labels can be edited; `Err` = why not.
+    pub label: Result<(), &'a str>,
+    /// `Ok` = an `ask` result can be re-answered in the session's tab; `Err` = why not.
+    pub reanswer: Result<(), &'a str>,
+    /// What the session is busy with (shown as progress), if anything.
+    pub busy: Option<&'a str>,
     pub now: i64,
 }
 
@@ -107,7 +137,16 @@ pub struct TreeState {
     pinned: bool,
     last_offset: f32,
     settle: u8,
+    /// Rows the list shows at once (PgUp / PgDn / ← / → step); measured by the last frame.
+    page: usize,
+    /// Prepared search texts of the tree revision in `index_revision`.
+    index: SearchIndex,
+    index_revision: Option<u64>,
     focus_search: bool,
+    /// The label being edited.
+    label: Option<LabelEdit>,
+    /// The "Summarize branch?" question of a Go here.
+    summary: Option<SummaryDialog>,
     /// The search box had focus at the end of the previous frame: egui drops focus on Esc
     /// before the app sees the key, so this is what tells "Esc in the box" from "Esc".
     search_focused: bool,
@@ -130,7 +169,12 @@ impl TreeState {
             pinned: true,
             last_offset: 0.0,
             settle: 0,
+            page: DEFAULT_PAGE,
+            index: SearchIndex::default(),
+            index_revision: None,
             focus_search: false,
+            label: None,
+            summary: None,
             search_focused: false,
             search_id: Id::unique("tree-search"),
             galleys: GalleyCache::default(),
@@ -310,6 +354,7 @@ pub fn show(ctx: &egui::Context, st: &mut TreeState, input: &TreeInput<'_>) -> V
             });
         });
     st.search_focused = ctx.memory(|m| m.has_focus(st.search_id));
+    summary_dialog(ctx, st, &mut out);
     out
 }
 
@@ -344,19 +389,28 @@ fn sync(st: &mut TreeState, input: &TreeInput<'_>) {
         let Some(c) = &st.cache else {
             return;
         };
-        let keep = st
+        // A filter that hides the selection leaves it on the nearest listed ancestor.
+        let anchor = st
             .selected
             .as_ref()
-            .and_then(|id| tree.index.get(id.as_str()))
-            .is_some_and(|&i| c.layout.row_of_node(i).is_some());
-        if first || !keep {
-            // omp opens `/tree` on the leaf.
-            st.selected = c
-                .layout
-                .leaf_row
-                .map(|r| tree.nodes[c.layout.rows[r].node].id.clone());
-            if first {
-                st.want = Want::Leaf;
+            .and_then(|id| tree.index.get(id.as_str()).copied())
+            .and_then(|i| c.layout.nearest_listed(tree, i));
+        match anchor {
+            Some(i) if !first => {
+                let id = tree.nodes[i].id.as_str();
+                if st.selected.as_deref() != Some(id) {
+                    st.selected = Some(id.to_owned());
+                }
+            }
+            _ => {
+                // omp opens `/tree` on the leaf.
+                st.selected = c
+                    .layout
+                    .leaf_row
+                    .map(|r| tree.nodes[c.layout.rows[r].node].id.clone());
+                if first {
+                    st.want = Want::Leaf;
+                }
             }
         }
         if grown && st.pinned && !first {
@@ -375,11 +429,16 @@ fn sync(st: &mut TreeState, input: &TreeInput<'_>) {
         h.query == st.search && h.revision == c.revision && h.filter == c.filter && h.leaf == c.leaf
     });
     if !current {
+        if st.index_revision != Some(c.revision) {
+            st.index.clear();
+            st.index_revision = Some(c.revision);
+        }
         let tokens = tree_layout::search_tokens(&st.search);
-        let rows = if tokens.is_empty() {
+        let search = FuzzySearch::new(&st.search);
+        let rows = if search.is_empty() {
             Vec::new()
         } else {
-            tree_layout::search_matches(tree, &c.layout, &tokens)
+            tree_layout::search_matches(tree, &c.layout, &search, &mut st.index)
         };
         st.hits = Some(Hits {
             query: st.search.clone(),
@@ -389,6 +448,7 @@ fn sync(st: &mut TreeState, input: &TreeInput<'_>) {
             tokens,
             rows,
         });
+        follow_matches(st, tree);
     }
 }
 
@@ -412,24 +472,31 @@ fn keyboard(
         }
         return;
     };
+    // The summary question owns the keys while it is open.
+    if st.summary.is_some() {
+        return;
+    }
+    // The label field: Enter saves, Esc cancels; everything else is typing.
+    if st.label.is_some() {
+        let (esc, enter) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        });
+        if esc {
+            st.label = None;
+        } else if enter {
+            finish_label(st, input, out);
+        }
+        return;
+    }
     let searching = st.search_focused || ctx.memory(|m| m.has_focus(st.search_id));
     let menu_open = egui::Popup::is_any_open(ctx);
-    let (esc, up, down, pgup, pgdn, home, end, enter, fork, slash) = ctx.input_mut(|i| {
-        let n = Modifiers::NONE;
-        (
-            !menu_open && i.consume_key(n, Key::Escape),
-            i.consume_key(n, Key::ArrowUp),
-            i.consume_key(n, Key::ArrowDown),
-            i.consume_key(n, Key::PageUp),
-            i.consume_key(n, Key::PageDown),
-            !searching && i.consume_key(n, Key::Home),
-            !searching && i.consume_key(n, Key::End),
-            !menu_open && i.consume_key(n, Key::Enter),
-            !searching && !menu_open && i.consume_key(n, Key::F),
-            !searching && !menu_open && i.consume_key(Modifiers::NONE, Key::Slash)
-                || i.consume_key(Modifiers::COMMAND, Key::F),
-        )
-    });
+    // Like omp, the label key is a command only while no search is typed.
+    let label_ok = !searching && st.search.is_empty();
+    let keys = ctx.input_mut(|i| read_keys(i, searching, menu_open, label_ok));
+    let (esc, enter, fork, slash) = (keys.esc, keys.enter, keys.fork, keys.slash);
     if esc {
         if searching {
             // First Esc leaves the search box (clearing it); the next one closes the view.
@@ -444,25 +511,26 @@ fn keyboard(
     if slash {
         st.focus_search = true;
     }
+    let next_filter = keys
+        .filter
+        .or_else(|| keys.cycle.map(|d| st.filter.cycled(d)));
+    if let Some(f) = next_filter
+        && f != st.filter
+    {
+        st.filter = f;
+        st.want = Want::Selected;
+        ctx.request_repaint();
+    }
     let Some(c) = &st.cache else {
         return;
     };
-    let len = c.layout.rows.len();
     let cur = selected_row(st, tree);
-    let delta = match (up, down, pgup, pgdn) {
-        (true, ..) => Some(-1),
-        (_, true, ..) => Some(1),
-        (_, _, true, _) => Some(-12),
-        (.., true) => Some(12),
-        _ => None,
-    };
-    let target = if home {
-        step_row(Some(0), 0, len)
-    } else if end {
-        len.checked_sub(1)
-    } else {
-        delta.and_then(|d| step_row(cur, d, len))
-    };
+    // While a query has matches only they can be selected, like omp's filtered list.
+    let target = keys.mv.and_then(|mv| {
+        search_rows(st)
+            .and_then(|rows| match_target(rows, cur, mv, st.page))
+            .or_else(|| move_target(tree, &c.layout, cur, mv, st.page))
+    });
     if let Some(r) = target
         && Some(r) != cur
     {
@@ -470,11 +538,212 @@ fn keyboard(
         st.want = Want::Selected;
     }
     if enter && let Some(r) = selected_row(st, tree) {
-        go_here(st, tree, input, r, out);
+        go_here(st, tree, input, r, keys.summarize, out);
     }
     if fork && let Some(r) = selected_row(st, tree) {
         fork_here(st, tree, input, r, out);
     }
+    if keys.label
+        && let Some(r) = selected_row(st, tree)
+    {
+        label_here(st, tree, input, r, out);
+    }
+}
+
+/// One selection move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Move {
+    /// Up / down by `n` rows.
+    Step(isize),
+    /// A page up (-1) or down (+1).
+    Page(isize),
+    Home,
+    End,
+    /// Previous / next user or assistant message (Alt+Up / Alt+Down).
+    Turn {
+        forward: bool,
+    },
+    /// Previous / next branch (`[` / `]`).
+    Branch {
+        forward: bool,
+    },
+}
+
+/// The row `mv` selects from row `cur`; `page` is the number of rows the list shows.
+fn move_target(
+    tree: &SessionTree,
+    layout: &Layout,
+    cur: Option<usize>,
+    mv: Move,
+    page: usize,
+) -> Option<usize> {
+    let len = layout.rows.len();
+    match mv {
+        Move::Step(n) => step_row(cur, n, len),
+        Move::Page(n) => step_row(cur, n * page.max(1) as isize, len),
+        Move::Home => step_row(Some(0), 0, len),
+        Move::End => len.checked_sub(1),
+        Move::Turn { forward } => tree_layout::turn_jump(tree, layout, cur?, forward),
+        Move::Branch { forward } => tree_layout::branch_jump(tree, layout, cur?, forward),
+    }
+}
+
+/// The per-row match flags of an active query that matches something (`None` otherwise: no
+/// query, or nothing matches and the list is left as it is).
+fn search_rows(st: &TreeState) -> Option<&[bool]> {
+    st.hits
+        .as_ref()
+        .map(|h| &h.rows[..])
+        .filter(|rows| rows.contains(&true))
+}
+
+/// Whether a query is active and row `r` is not among its matches.
+fn excluded_by_search(st: &TreeState, r: usize) -> bool {
+    st.hits
+        .as_ref()
+        .is_some_and(|h| !h.rows.is_empty() && !h.rows.get(r).copied().unwrap_or(false))
+}
+
+/// The match to rest on from row `from`: itself, else the first one after it, else the first.
+fn nearest_match(rows: &[bool], from: Option<usize>) -> Option<usize> {
+    let start = from.unwrap_or(0).min(rows.len());
+    rows[start..]
+        .iter()
+        .position(|m| *m)
+        .map(|i| start + i)
+        .or_else(|| rows.iter().position(|m| *m))
+}
+
+/// `mv` among the matching rows only (they are the list while a query is typed); the moves that
+/// do not walk the list (message and branch jumps) are left to [`move_target`].
+fn match_target(rows: &[bool], cur: Option<usize>, mv: Move, page: usize) -> Option<usize> {
+    let matches: Vec<usize> = (0..rows.len()).filter(|&r| rows[r]).collect();
+    let last = matches.len().checked_sub(1)?;
+    let steps = match mv {
+        Move::Step(n) => n,
+        Move::Page(n) => n * page.max(1) as isize,
+        Move::Home => return matches.first().copied(),
+        Move::End => return matches.last().copied(),
+        Move::Turn { .. } | Move::Branch { .. } => return None,
+    };
+    // Matches before `cur`; a match at `cur` itself is where the walk starts.
+    let Some(cur) = cur else {
+        return Some(matches[if steps >= 0 { 0 } else { last }]);
+    };
+    let before = matches.partition_point(|&m| m < cur);
+    let on_match = matches.get(before) == Some(&cur);
+    // From a non-match the first step down lands on the next match, the first step up on the
+    // previous one.
+    let at = if on_match {
+        before as isize + steps
+    } else if steps > 0 {
+        before as isize + steps - 1
+    } else {
+        before as isize + steps
+    };
+    Some(matches[at.clamp(0, last as isize) as usize])
+}
+
+/// After the query (or what it runs over) changed: a selection the query excludes moves to the
+/// nearest match. Nothing moves when no row matches.
+fn follow_matches(st: &mut TreeState, tree: &SessionTree) {
+    let cur = selected_row(st, tree);
+    let Some(rows) = search_rows(st) else {
+        return;
+    };
+    if cur.is_some_and(|r| rows.get(r).copied().unwrap_or(false)) {
+        return;
+    }
+    let Some(r) = nearest_match(rows, cur) else {
+        return;
+    };
+    select_row(st, tree, r);
+    st.want = Want::Selected;
+}
+
+/// What the keyboard asked for this frame.
+#[derive(Default)]
+struct Keys {
+    esc: bool,
+    enter: bool,
+    /// Shift+Enter: go there with a summary of the branch left (omp pre-answers "Summarize").
+    summarize: bool,
+    fork: bool,
+    /// `L`: edit the selected entry's label.
+    label: bool,
+    slash: bool,
+    mv: Option<Move>,
+    /// Alt+C / D / T / U / L / A.
+    filter: Option<Filter>,
+    /// Ctrl+O (+1) / Ctrl+Shift+O (-1).
+    cycle: Option<isize>,
+}
+
+/// Consume the tree's keys. omp's chords go first because egui ignores extra Shift / Alt when it
+/// matches a key: a plain `ArrowUp` pattern would also take Alt+Up, Ctrl+O would take Ctrl+Shift+O.
+/// Letters and ← → belong to the search box while it has focus.
+fn read_keys(i: &mut egui::InputState, searching: bool, menu_open: bool, label_ok: bool) -> Keys {
+    let n = Modifiers::NONE;
+    let mut k = Keys::default();
+    let mut alt = false;
+    for (letter, key) in [
+        (Filter::Conversation, Key::C),
+        (Filter::Default, Key::D),
+        (Filter::NoTools, Key::T),
+        (Filter::UserOnly, Key::U),
+        (Filter::Labeled, Key::L),
+        (Filter::All, Key::A),
+    ] {
+        if !menu_open && i.consume_key(Modifiers::ALT, key) {
+            k.filter = Some(letter);
+            alt = true;
+        }
+    }
+    if !menu_open {
+        if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::O) {
+            k.cycle = Some(-1);
+        } else if i.consume_key(Modifiers::COMMAND, Key::O) {
+            k.cycle = Some(1);
+        }
+        for (key, forward) in [(Key::ArrowUp, false), (Key::ArrowDown, true)] {
+            if i.consume_key(Modifiers::ALT, key) {
+                k.mv = Some(Move::Turn { forward });
+                alt = true;
+            }
+        }
+    }
+    if alt {
+        // Linux delivers Alt+D as the text "d" as well; the search box must not type it.
+        i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+    }
+    k.esc = !menu_open && i.consume_key(n, Key::Escape);
+    // Shift+Enter first: a plain Enter pattern would take it too.
+    k.summarize = !menu_open && i.consume_key(Modifiers::SHIFT, Key::Enter);
+    k.enter = !menu_open && (k.summarize || i.consume_key(n, Key::Enter));
+    k.fork = !searching && !menu_open && i.consume_key(n, Key::F);
+    k.label = label_ok && !menu_open && i.consume_key(n, Key::L);
+    k.slash = !searching && !menu_open && i.consume_key(n, Key::Slash)
+        || i.consume_key(Modifiers::COMMAND, Key::F);
+    let mut plain = |key: Key, mv: Move| {
+        if i.consume_key(n, key) && k.mv.is_none() {
+            k.mv = Some(mv);
+        }
+    };
+    plain(Key::ArrowUp, Move::Step(-1));
+    plain(Key::ArrowDown, Move::Step(1));
+    plain(Key::PageUp, Move::Page(-1));
+    plain(Key::PageDown, Move::Page(1));
+    if !searching {
+        plain(Key::ArrowLeft, Move::Page(-1));
+        plain(Key::ArrowRight, Move::Page(1));
+        plain(Key::Home, Move::Home);
+        plain(Key::End, Move::End);
+        if !menu_open {
+            plain(Key::OpenBracket, Move::Branch { forward: false });
+            plain(Key::CloseBracket, Move::Branch { forward: true });
+        }
+    }
+    k
 }
 
 fn select_row(st: &mut TreeState, tree: &SessionTree, r: usize) {
@@ -490,18 +759,12 @@ fn select_row(st: &mut TreeState, tree: &SessionTree, r: usize) {
 }
 
 /// Why Go here is unavailable for row `r`, if it is.
-fn go_blocked<'a>(
-    tree: &SessionTree,
-    layout: &Layout,
-    input: &TreeInput<'a>,
-    r: usize,
-) -> Option<&'a str> {
+fn go_blocked<'a>(layout: &Layout, input: &TreeInput<'a>, r: usize) -> Option<&'a str> {
     if let Err(why) = input.navigate {
         return Some(why);
     }
     let row = &layout.rows[r];
-    (layout.leaf_node == Some(row.node) && !matches!(tree.nodes[row.node].kind, NodeKind::User))
-        .then_some("This is where the session already is")
+    (layout.leaf_node == Some(row.node)).then_some("Already at this point")
 }
 
 /// Why Fork is unavailable for row `r`, if it is.
@@ -522,7 +785,202 @@ fn fork_blocked<'a>(
     input.fork.err()
 }
 
-fn go_here(
+/// What "Go here" does about a branch summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GoPlan {
+    /// Ask "No summary / Summarize / Summarize with custom prompt".
+    Ask,
+    Now(BranchSummary),
+}
+
+/// omp: Shift+Enter pre-answers "Summarize" and skips the question; otherwise the question is
+/// asked only while `branchSummary.enabled`.
+fn go_plan(prompt_enabled: bool, shift: bool) -> GoPlan {
+    if shift {
+        GoPlan::Now(BranchSummary::Summarize)
+    } else if prompt_enabled {
+        GoPlan::Ask
+    } else {
+        GoPlan::Now(BranchSummary::None)
+    }
+}
+
+/// The three answers of omp's "Summarize branch?" selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryChoice {
+    None,
+    Summarize,
+    Custom,
+}
+
+impl SummaryChoice {
+    const ALL: [SummaryChoice; 3] = [
+        SummaryChoice::None,
+        SummaryChoice::Summarize,
+        SummaryChoice::Custom,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            SummaryChoice::None => "No summary",
+            SummaryChoice::Summarize => "Summarize",
+            SummaryChoice::Custom => "Summarize with custom prompt…",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            SummaryChoice::None => "Leave the branch behind as it is.",
+            SummaryChoice::Summarize => "omp writes a summary of the branch and carries it over.",
+            SummaryChoice::Custom => "Say what the summary should focus on.",
+        }
+    }
+
+    /// `delta` steps through the list, stopping at both ends.
+    fn step(self, delta: isize) -> SummaryChoice {
+        let at = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[at.saturating_add_signed(delta).min(Self::ALL.len() - 1)]
+    }
+}
+
+/// A Go here waiting for its answer to "Summarize branch?".
+struct SummaryDialog {
+    entry: String,
+    user: bool,
+    choice: SummaryChoice,
+    instructions: String,
+    /// The instructions field takes the caret the next time it is drawn.
+    focus_editor: bool,
+    /// The chosen answer takes the keyboard focus the next time it is drawn.
+    refocus: bool,
+    editor: Id,
+}
+
+impl SummaryDialog {
+    fn new(entry: String, user: bool) -> SummaryDialog {
+        SummaryDialog {
+            entry,
+            user,
+            choice: SummaryChoice::None,
+            instructions: String::new(),
+            focus_editor: false,
+            refocus: true,
+            editor: Id::unique("tree-summary-instructions"),
+        }
+    }
+
+    fn choose(&mut self, choice: SummaryChoice) {
+        self.focus_editor = choice == SummaryChoice::Custom && self.choice != choice;
+        self.refocus = true;
+        self.choice = choice;
+    }
+
+    /// What to send. Blank instructions are omp's default summary prompt.
+    fn summary(&self) -> BranchSummary {
+        match self.choice {
+            SummaryChoice::None => BranchSummary::None,
+            SummaryChoice::Summarize => BranchSummary::Summarize,
+            SummaryChoice::Custom => match self.instructions.trim() {
+                "" => BranchSummary::Summarize,
+                text => BranchSummary::Custom(text.to_owned()),
+            },
+        }
+    }
+}
+
+/// The label field's state.
+struct LabelEdit {
+    entry: String,
+    /// The label the entry has (blank = none).
+    original: String,
+    text: String,
+    /// The field takes the caret the next time it is drawn.
+    focus: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LabelEnd {
+    /// Nothing to send: the text is what the entry already has.
+    Unchanged,
+    /// The new label; `None` removes it.
+    Set(Option<String>),
+}
+
+impl LabelEdit {
+    fn new(entry: String, current: Option<&str>) -> LabelEdit {
+        let current = current.unwrap_or("").to_owned();
+        LabelEdit {
+            entry,
+            text: current.clone(),
+            original: current,
+            focus: true,
+        }
+    }
+
+    /// Enter: a blank field removes the label, like omp.
+    fn finish(&self) -> LabelEnd {
+        let new = self.text.trim();
+        if new == self.original.trim() {
+            return LabelEnd::Unchanged;
+        }
+        LabelEnd::Set((!new.is_empty()).then(|| new.to_owned()))
+    }
+}
+
+/// Enter in the label field (or Save): send the label, or just close when nothing changed.
+fn finish_label(st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<TreeAction>) {
+    let Some(edit) = st.label.take() else {
+        return;
+    };
+    let LabelEnd::Set(label) = edit.finish() else {
+        return;
+    };
+    match input.label {
+        Ok(()) => out.push(TreeAction::SetLabel {
+            entry: edit.entry,
+            label,
+        }),
+        Err(why) => {
+            out.push(TreeAction::Notice(why.to_owned()));
+            st.label = Some(edit);
+        }
+    }
+}
+
+/// Open the label field on row `r`.
+fn label_here(
+    st: &mut TreeState,
+    tree: &SessionTree,
+    input: &TreeInput<'_>,
+    r: usize,
+    out: &mut Vec<TreeAction>,
+) {
+    if let Err(why) = input.label {
+        out.push(TreeAction::Notice(why.to_owned()));
+        return;
+    }
+    let Some(row) = st.cache.as_ref().and_then(|c| c.layout.rows.get(r)) else {
+        return;
+    };
+    let id = tree.nodes[row.node].id.clone();
+    let current = tree.labels.get(&id).map(String::as_str);
+    st.label = Some(LabelEdit::new(id.clone(), current));
+}
+
+/// Why "Re-answer…" is unavailable for row `r`, if it is.
+fn reanswer_blocked<'a>(
+    tree: &SessionTree,
+    layout: &Layout,
+    input: &TreeInput<'a>,
+    r: usize,
+) -> Option<&'a str> {
+    if !tree_layout::is_ask_result(&tree.nodes[layout.rows[r].node]) {
+        return Some("Only the answer to an ask can be re-answered");
+    }
+    input.reanswer.err()
+}
+
+fn reanswer_here(
     st: &TreeState,
     tree: &SessionTree,
     input: &TreeInput<'_>,
@@ -532,15 +990,43 @@ fn go_here(
     let Some(c) = &st.cache else {
         return;
     };
-    match go_blocked(tree, &c.layout, input, r) {
+    match reanswer_blocked(tree, &c.layout, input, r) {
         Some(why) => out.push(TreeAction::Notice(why.to_owned())),
-        None => {
-            let n = &tree.nodes[c.layout.rows[r].node];
-            out.push(TreeAction::Navigate {
-                entry: n.id.clone(),
-                user: matches!(n.kind, NodeKind::User),
-            });
-        }
+        None => out.push(TreeAction::Reanswer {
+            entry: tree.nodes[c.layout.rows[r].node].id.clone(),
+        }),
+    }
+}
+
+/// Go to row `r`: now, or after asking about a branch summary (`shift` = Shift+Enter).
+fn go_here(
+    st: &mut TreeState,
+    tree: &SessionTree,
+    input: &TreeInput<'_>,
+    r: usize,
+    shift: bool,
+    out: &mut Vec<TreeAction>,
+) {
+    let Some(c) = &st.cache else {
+        return;
+    };
+    // The row is dimmed out by the query: not part of the list.
+    if excluded_by_search(st, r) {
+        return;
+    }
+    if let Some(why) = go_blocked(&c.layout, input, r) {
+        out.push(TreeAction::Notice(why.to_owned()));
+        return;
+    }
+    let n = &tree.nodes[c.layout.rows[r].node];
+    let (entry, user) = (n.id.clone(), matches!(n.kind, NodeKind::User));
+    match go_plan(input.summary_prompt, shift) {
+        GoPlan::Ask => st.summary = Some(SummaryDialog::new(entry, user)),
+        GoPlan::Now(summary) => out.push(TreeAction::Navigate {
+            entry,
+            user,
+            summary,
+        }),
     }
 }
 
@@ -576,6 +1062,7 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
     ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
 
     footer(ui, st, input);
+    label_bar(ui, st, input, out);
 
     Frame::NONE
         .inner_margin(Margin {
@@ -596,6 +1083,7 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
         y,
         Color32::TRANSPARENT,
     );
+    busy_banner(ui, input);
 
     let Some(tree) = input.tree else {
         centered_status(ui, input);
@@ -603,12 +1091,17 @@ fn body(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<Tr
     };
     let empty = st.cache.as_ref().is_none_or(|c| c.layout.rows.is_empty());
     if empty {
+        let entries = st.cache.as_ref().map_or(0, |c| c.layout.stats.entries);
         let (title, sub) = match st.filter {
+            _ if entries == 0 => ("Nothing to show", "This session has no entries yet."),
             Filter::Labeled => (
                 "No labeled entries",
                 "Labels you add with /label show up here.",
             ),
-            _ => ("Nothing to show", "This session has no entries yet."),
+            _ => (
+                "Nothing matches this filter",
+                "Alt+A shows every entry, Alt+D the default view.",
+            ),
         };
         empty_state(ui, ICON_LIST_TREE, pal.weak, title, sub);
         return;
@@ -667,7 +1160,7 @@ fn header(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<
         |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             for f in Filter::ALL {
-                if chip(ui, f.title(), f.hint(), filter == f).clicked() {
+                if chip(ui, f, filter == f).clicked() {
                     filter = f;
                 }
             }
@@ -723,13 +1216,15 @@ fn icon(i: Icon, size: f32, color: Color32) -> RichText {
     crate::widgets::icon_text(i, size, color)
 }
 
-/// Filter pill.
-fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
+/// Filter pill; the tooltip names the filter's Alt shortcut.
+fn chip(ui: &mut Ui, filter: Filter, on: bool) -> egui::Response {
     let pal = Palette::of_ui(ui);
-    let g = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), crate::theme::font(13.0), pal.text);
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, 28.0), Sense::click());
+    let g = ui.painter().layout_no_wrap(
+        filter.title().to_owned(),
+        crate::theme::font(13.0),
+        pal.text,
+    );
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 20.0, 28.0), Sense::click());
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
@@ -767,8 +1262,18 @@ fn chip(ui: &mut Ui, label: &str, tip: &str, on: bool) -> egui::Response {
         theme::mix(pal.weak, pal.text_strong, hov)
     };
     p.galley(rect.center() - g.size() / 2.0, g, color);
-    resp.on_hover_text(tip)
-        .on_hover_cursor(CursorIcon::PointingHand)
+    resp.on_hover_ui(|ui| {
+        ui.label(filter.hint());
+        ui.label(
+            RichText::new(format!(
+                "Alt+{} · Ctrl+O cycles, Ctrl+Shift+O cycles back",
+                filter.shortcut()
+            ))
+            .size(12.0)
+            .color(pal.weak),
+        );
+    })
+    .on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn search_box(ui: &mut Ui, search: &mut String, id: Id, focus: bool) {
@@ -794,27 +1299,49 @@ fn footer(ui: &mut Ui, st: &TreeState, input: &TreeInput<'_>) {
     let pal = Palette::of_ui(ui);
     egui::Panel::bottom("tree-footer")
         .show_separator_line(false)
-        .exact_size(40.0)
+        .exact_size(100.0)
         .frame(Frame::NONE.inner_margin(Margin::symmetric(22, 8)))
         .show(ui, |ui| {
+            // Below this the key labels would run past the window edge; the keycaps stay.
+            let wide = ui.available_width() >= 780.0;
             let y = ui.max_rect().top();
             ui.painter().hline(
                 ui.max_rect().left() - 22.0..=ui.max_rect().right() + 22.0,
                 y - 8.0,
                 Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
             );
+            key_row(
+                ui,
+                wide,
+                &[
+                    ("↑ ↓", "select"),
+                    ("PgUp PgDn ← →", "page"),
+                    ("Home End", "ends"),
+                    ("Alt+↑ Alt+↓", "message"),
+                    ("[ ]", "branch"),
+                ],
+            );
+            key_row(
+                ui,
+                wide,
+                &[
+                    ("Enter", "go here"),
+                    ("Shift+Enter", "summarize"),
+                    ("F", "fork"),
+                    ("L", "label"),
+                    ("Esc", "close"),
+                ],
+            );
             Sides::new().height(24.0).show(
                 ui,
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
                     for (key, what) in [
-                        ("↑ ↓", "select"),
-                        ("Enter", "go here"),
-                        ("F", "fork"),
+                        ("Ctrl+O", "filter"),
+                        ("Alt+C D T U L A", "pick filter"),
                         ("/", "search"),
-                        ("Esc", "close"),
                     ] {
-                        keycap(ui, key, what);
+                        keycap(ui, key, what, wide);
                     }
                 },
                 |ui| {
@@ -829,12 +1356,208 @@ fn footer(ui: &mut Ui, st: &TreeState, input: &TreeInput<'_>) {
                     ui.add(
                         egui::Label::new(RichText::new(text).size(12.0).color(color)).truncate(),
                     );
+                    ui.add_space(14.0);
                 },
             );
         });
 }
 
-fn keycap(ui: &mut Ui, key: &str, what: &str) {
+fn key_row(ui: &mut Ui, wide: bool, keys: &[(&str, &str)]) {
+    ui.horizontal(|ui| {
+        ui.set_height(24.0);
+        ui.spacing_mut().item_spacing.x = 14.0;
+        for (key, what) in keys {
+            keycap(ui, key, what, wide);
+        }
+    });
+}
+
+/// Progress of what the session is busy with (a summary can take a while).
+fn busy_banner(ui: &mut Ui, input: &TreeInput<'_>) {
+    let Some(text) = input.busy else {
+        return;
+    };
+    let pal = Palette::of_ui(ui);
+    Frame::NONE
+        .fill(pal.surface)
+        .inner_margin(Margin::symmetric(22, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.add(crate::widgets::Spin::new(16.0, pal.accent));
+                ui.label(RichText::new(text).size(13.0).color(pal.text));
+            });
+        });
+}
+
+/// The inline label editor above the footer.
+fn label_bar(ui: &mut Ui, st: &mut TreeState, input: &TreeInput<'_>, out: &mut Vec<TreeAction>) {
+    let Some(edit) = st.label.as_mut() else {
+        return;
+    };
+    let pal = Palette::of_ui(ui);
+    let mut save = false;
+    let mut cancel = false;
+    egui::Panel::bottom("tree-label")
+        .show_separator_line(false)
+        .exact_size(64.0)
+        .frame(Frame::NONE.inner_margin(Margin::symmetric(22, 8)))
+        .show(ui, |ui| {
+            let y = ui.max_rect().top();
+            ui.painter().hline(
+                ui.max_rect().left() - 22.0..=ui.max_rect().right() + 22.0,
+                y - 8.0,
+                Stroke::new(1.0, pal.stroke.gamma_multiply(0.9)),
+            );
+            ui.horizontal(|ui| {
+                ui.set_min_height(crate::widgets::draft_height());
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(icon(ICON_BOOKMARK, 16.0, pal.warn));
+                ui.label(RichText::new("Label").size(13.0).color(pal.text_strong));
+                let width = (ui.available_width() - 232.0).max(140.0);
+                let field = ui.add(
+                    TextEdit::singleline(&mut edit.text)
+                        .hint_text("Label for this entry — empty removes it")
+                        .desired_width(width)
+                        .margin(vec2(10.0, 6.0)),
+                );
+                if std::mem::take(&mut edit.focus) {
+                    field.request_focus();
+                }
+                let ready = input.label.is_ok();
+                if DraftButton::new("Save")
+                    .kind(DraftKind::Primary)
+                    .enabled(ready)
+                    .min_width(72.0)
+                    .show(ui)
+                    .clicked()
+                {
+                    save = true;
+                }
+                if DraftButton::new("Cancel")
+                    .min_width(72.0)
+                    .show(ui)
+                    .clicked()
+                {
+                    cancel = true;
+                }
+            });
+        });
+    if cancel {
+        st.label = None;
+    } else if save {
+        finish_label(st, input, out);
+    }
+}
+
+/// "Summarize branch?" before a Go here, as a Drafted dialog.
+fn summary_dialog(ctx: &egui::Context, st: &mut TreeState, out: &mut Vec<TreeAction>) {
+    let Some(d) = st.summary.as_mut() else {
+        return;
+    };
+    let editor = d.editor;
+    // The arrow keys move the choice, unless the instructions field has the caret.
+    if !ctx.memory(|m| m.has_focus(editor)) {
+        let delta = ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                1
+            } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if delta != 0 {
+            let next = d.choice.step(delta);
+            d.choose(next);
+        }
+    }
+    let custom = d.choice == SummaryChoice::Custom;
+    let reply = confirm::show_dialog_reply(
+        ctx,
+        &Dialog {
+            id: "tree-summary",
+            title: "Summarize branch?",
+            subtitle: Some("The branch you leave can be summarized and carried to the new point."),
+            width: 480.0,
+            confirm_label: "Go here",
+            confirm_enabled: true,
+            enter_confirms: !custom,
+            ctrl_enter_confirms: custom,
+            icon: Some(ICON_SCROLL_TEXT),
+            ..Dialog::default()
+        },
+        "Cancel",
+        |ui| summary_body(ui, d, editor),
+    );
+    match reply {
+        Some(Reply::Confirmed) => {
+            if let Some(d) = st.summary.take() {
+                out.push(TreeAction::Navigate {
+                    summary: d.summary(),
+                    entry: d.entry,
+                    user: d.user,
+                });
+            }
+        }
+        // The Cancel button, Esc or a click outside: back to the tree.
+        Some(_) => st.summary = None,
+        None => {}
+    }
+}
+
+fn summary_body(ui: &mut Ui, d: &mut SummaryDialog, editor: Id) {
+    let pal = Palette::of_ui(ui);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    for choice in SummaryChoice::ALL {
+        let on = d.choice == choice;
+        let title = RichText::new(choice.title()).size(13.5).color(if on {
+            pal.text_strong
+        } else {
+            pal.text
+        });
+        let radio = ui.radio(on, title);
+        if radio.has_focus() {
+            // The arrow keys belong to this list (they would move egui's focus otherwise).
+            ui.ctx().memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    radio.id,
+                    egui::EventFilter {
+                        vertical_arrows: true,
+                        ..egui::EventFilter::default()
+                    },
+                );
+            });
+        }
+        if on && std::mem::take(&mut d.refocus) && choice != SummaryChoice::Custom {
+            radio.request_focus();
+        }
+        if radio.clicked() && !on {
+            d.choose(choice);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            ui.label(RichText::new(choice.hint()).size(12.0).color(pal.weak));
+        });
+        ui.add_space(4.0);
+    }
+    if d.choice == SummaryChoice::Custom {
+        let field = ui.add(
+            TextEdit::multiline(&mut d.instructions)
+                .id(editor)
+                .desired_rows(5)
+                .desired_width(f32::INFINITY)
+                .hint_text("What should the summary focus on? Empty uses omp's default prompt."),
+        );
+        if std::mem::take(&mut d.focus_editor) {
+            field.request_focus();
+        }
+    }
+    ui.add_space(8.0);
+}
+
+fn keycap(ui: &mut Ui, key: &str, what: &str, with_label: bool) {
     let pal = Palette::of_ui(ui);
     let g = ui
         .painter()
@@ -845,7 +1568,9 @@ fn keycap(ui: &mut Ui, key: &str, what: &str) {
         .rect_stroke(rect, 6, Stroke::new(1.0, pal.stroke), StrokeKind::Inside);
     ui.painter()
         .galley(rect.center() - g.size() / 2.0, g, pal.text);
-    ui.label(RichText::new(what).size(12.0).color(pal.weak));
+    if with_label {
+        ui.label(RichText::new(what).size(12.0).color(pal.weak));
+    }
 }
 
 // ------------------------------------------------------------------ the list
@@ -960,8 +1685,10 @@ fn list(
                     let node = c.layout.rows[r].node;
                     row_menu(&resp, tree, &c.layout, input, r, node, &mut actions);
                     // The action buttons carry their own tooltip.
-                    let over_actions =
-                        hover_pos.is_some_and(|p| p.x >= rr.right() - 18.0 - ACTIONS_W);
+                    let actions_left = rr.right()
+                        - 18.0
+                        - actions_w(tree_layout::is_ask_result(&tree.nodes[node]));
+                    let over_actions = hover_pos.is_some_and(|p| p.x >= actions_left);
                     if hovered && !over_actions && !resp.context_menu_opened() {
                         row_tip(&resp, tree, &c.layout.rows[r], input.now);
                     }
@@ -1027,6 +1754,7 @@ fn list(
             }
         });
     let offset = area.state.clamped_offset().y;
+    st.page = ((area.inner_rect.height() / ROW_H).floor() as usize).max(1);
     if want != Want::None {
         st.settle = 2;
     } else if st.settle > 0 {
@@ -1047,7 +1775,15 @@ fn list(
             }
             RowCommand::Go => {
                 select_row(st, tree, r);
-                go_here(st, tree, input, r, out);
+                go_here(st, tree, input, r, false, out);
+            }
+            RowCommand::Label => {
+                select_row(st, tree, r);
+                label_here(st, tree, input, r, out);
+            }
+            RowCommand::Reanswer => {
+                select_row(st, tree, r);
+                reanswer_here(st, tree, input, r, out);
             }
             RowCommand::CopyText(text) => out.push(TreeAction::Copy {
                 text,
@@ -1127,6 +1863,8 @@ fn current_button(ui: &mut Ui, st: &mut TreeState, tree: &SessionTree, list: Rec
 enum RowCommand {
     Fork,
     Go,
+    Label,
+    Reanswer,
     CopyText(String),
     CopyId(String),
 }
@@ -1159,7 +1897,7 @@ fn row_menu(
             out.push((r, RowCommand::Fork));
             ui.close();
         }
-        let go_off = go_blocked(tree, layout, input, r);
+        let go_off = go_blocked(layout, input, r);
         let it = menu_item(
             ui,
             ICON_CORNER_DOWN_RIGHT,
@@ -1175,6 +1913,42 @@ fn row_menu(
         if it.clicked() {
             out.push((r, RowCommand::Go));
             ui.close();
+        }
+        let label_off = input.label.err();
+        let it = menu_item(
+            ui,
+            ICON_BOOKMARK,
+            "Edit label…",
+            Some("L"),
+            label_off.is_none(),
+            false,
+        );
+        let it = match label_off {
+            Some(why) => it.on_disabled_hover_text(why),
+            None => it,
+        };
+        if it.clicked() {
+            out.push((r, RowCommand::Label));
+            ui.close();
+        }
+        if tree_layout::is_ask_result(n) {
+            let off = reanswer_blocked(tree, layout, input, r);
+            let it = menu_item(
+                ui,
+                ICON_MESSAGES_SQUARE,
+                "Re-answer…",
+                None,
+                off.is_none(),
+                false,
+            );
+            let it = match off {
+                Some(why) => it.on_disabled_hover_text(why),
+                None => it,
+            };
+            if it.clicked() {
+                out.push((r, RowCommand::Reanswer));
+                ui.close();
+            }
         }
         ui.separator();
         if menu_item(ui, ICON_COPY, "Copy text", None, !n.text.is_empty(), false).clicked() {
@@ -1458,7 +2232,7 @@ fn paint_content(
 
     // Right column and pills.
     let right = u.rect.right() - 18.0;
-    let actions_left = right - ACTIONS_W;
+    let actions_left = right - actions_w(tree_layout::is_ask_result(node));
     let mut pill_right = actions_left - 6.0;
     let mut pills_w = 0.0;
     if row.is_leaf {
@@ -1671,7 +2445,7 @@ fn pill(
     w
 }
 
-/// Fork / Go here buttons of the active row.
+/// Label / re-answer / Fork / Go here buttons of the active row.
 fn actions(
     ui: &mut Ui,
     p: &Painter,
@@ -1684,36 +2458,71 @@ fn actions(
     let node = &cx.tree.nodes[row.node];
     let cy = u.rect.center().y;
     let fork_off = fork_blocked(cx.tree, cx.layout, cx.input, u.row);
-    let go_off = go_blocked(cx.tree, cx.layout, cx.input, u.row);
+    let go_off = go_blocked(cx.layout, cx.input, u.row);
     let go_tip = if matches!(node.kind, NodeKind::User) {
         "Go to just before this prompt; its text goes back to the editor"
     } else {
         "Continue from here in this tab"
     };
+    let label_tip = if cx.tree.labels.contains_key(&node.id) {
+        "Edit this entry's label (L)"
+    } else {
+        "Add a label to this entry (L)"
+    };
     let mut cmd = None;
-    let go_w = action_button(
+    let mut x = right;
+    x -= action_button(
         ui,
         p,
         pal,
-        (right, cy),
+        (x, cy),
         ("Go here", ICON_ARROW_RIGHT),
         (go_off, go_tip),
         u,
         "go",
         &mut cmd,
         RowCommand::Go,
-    );
-    action_button(
+    ) + 6.0;
+    x -= action_button(
         ui,
         p,
         pal,
-        (right - go_w - 6.0, cy),
+        (x, cy),
         ("Fork", ICON_GIT_FORK),
         (fork_off, tree_layout::fork_hint(&node.kind)),
         u,
         "fork",
         &mut cmd,
         RowCommand::Fork,
+    ) + 6.0;
+    if tree_layout::is_ask_result(node) {
+        x -= action_button(
+            ui,
+            p,
+            pal,
+            (x, cy),
+            ("", ICON_MESSAGES_SQUARE),
+            (
+                reanswer_blocked(cx.tree, cx.layout, cx.input, u.row),
+                "Re-answer: omp asks the question again in the tab and continues from your new answer",
+            ),
+            u,
+            "reanswer",
+            &mut cmd,
+            RowCommand::Reanswer,
+        ) + 6.0;
+    }
+    action_button(
+        ui,
+        p,
+        pal,
+        (x, cy),
+        ("", ICON_BOOKMARK),
+        (cx.input.label.err(), label_tip),
+        u,
+        "label",
+        &mut cmd,
+        RowCommand::Label,
     );
     cmd
 }
@@ -1733,7 +2542,11 @@ fn action_button(
 ) -> f32 {
     let enabled = off.is_none();
     let g = p.layout_no_wrap(label.to_owned(), crate::theme::font(12.5), pal.text_strong);
-    let w = g.size().x + 40.0;
+    let w = if label.is_empty() {
+        30.0
+    } else {
+        g.size().x + 40.0
+    };
     let rect = Rect::from_min_size(pos2(right - w, cy - 13.0), vec2(w, 26.0));
     let resp = ui.interact(
         rect,
@@ -1816,6 +2629,490 @@ mod tests {
         assert_eq!(step_row(None, 1, 5), Some(0));
         assert_eq!(step_row(None, -1, 5), Some(4));
         assert_eq!(step_row(Some(0), 1, 0), None);
+    }
+
+    /// A chain of `n` alternating user / assistant nodes.
+    fn chain(n: usize) -> SessionTree {
+        let nodes: Vec<Arc<deck_core::tree::TreeNode>> = (0..n)
+            .map(|i| {
+                Arc::new(deck_core::tree::TreeNode {
+                    id: format!("n{i}"),
+                    parent: i.checked_sub(1).map(|p| format!("n{p}")),
+                    kind: if i % 2 == 0 {
+                        NodeKind::User
+                    } else {
+                        NodeKind::Assistant
+                    },
+                    timestamp: None,
+                    text: String::new(),
+                    has_text: true,
+                    stop_reason: None,
+                    active_leaf: None,
+                    cost_before: Default::default(),
+                    search_text: String::new(),
+                    attribution: None,
+                    user_request: i % 2 == 0,
+                    tool_name: None,
+                })
+            })
+            .collect();
+        SessionTree {
+            index: nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (Arc::from(n.id.as_str()), i))
+                .collect(),
+            children: (0..n)
+                .map(|i| Arc::new(if i + 1 < n { vec![i + 1] } else { Vec::new() }))
+                .collect(),
+            roots: vec![0],
+            nodes,
+            ..SessionTree::default()
+        }
+    }
+
+    #[test]
+    fn page_keys_move_by_the_visible_row_count_and_clamp() {
+        let t = chain(30);
+        let l = tree_layout::build(&t, Some(29), Filter::Conversation);
+        let go = |cur, mv| move_target(&t, &l, Some(cur), mv, 7);
+        assert_eq!(go(10, Move::Page(1)), Some(17));
+        assert_eq!(go(10, Move::Page(-1)), Some(3));
+        assert_eq!(go(25, Move::Page(1)), Some(29));
+        assert_eq!(go(2, Move::Page(-1)), Some(0));
+        assert_eq!(go(10, Move::Step(1)), Some(11));
+        assert_eq!(go(10, Move::Home), Some(0));
+        assert_eq!(go(10, Move::End), Some(29));
+        // A list that has not been measured (page 0) still moves by one row.
+        assert_eq!(move_target(&t, &l, Some(10), Move::Page(1), 0), Some(11));
+        // Jumps need a selection.
+        assert_eq!(
+            move_target(&t, &l, None, Move::Turn { forward: true }, 7),
+            None
+        );
+        assert_eq!(go(10, Move::Turn { forward: true }), Some(11));
+        assert_eq!(go(10, Move::Branch { forward: true }), None);
+    }
+
+    #[test]
+    fn going_to_the_current_leaf_says_so_and_a_blocked_session_says_why() {
+        let t = chain(3);
+        let l = tree_layout::build(&t, Some(2), Filter::Conversation);
+        let input = |navigate| TreeInput {
+            navigate,
+            ..plain_input()
+        };
+        assert_eq!(
+            go_blocked(&l, &input(Ok(())), 2),
+            Some("Already at this point")
+        );
+        // The leaf here is a user prompt: omp still says "Already at this point" for it, and
+        // switches only for another entry.
+        assert!(matches!(t.nodes[l.rows[2].node].kind, NodeKind::User));
+        assert_eq!(go_blocked(&l, &input(Ok(())), 1), None);
+        assert_eq!(
+            go_blocked(&l, &input(Err("Busy")), 2),
+            Some("Busy"),
+            "the session's own reason wins"
+        );
+    }
+
+    fn plain_input<'a>() -> TreeInput<'a> {
+        TreeInput {
+            tree: None,
+            revision: 1,
+            error: None,
+            live_leaf: None,
+            navigate: Ok(()),
+            fork: Ok(()),
+            summary_prompt: false,
+            label: Ok(()),
+            reanswer: Ok(()),
+            busy: None,
+            now: 0,
+        }
+    }
+
+    /// The window over a tree, driven frame by frame.
+    struct Window {
+        ctx: egui::Context,
+        st: TreeState,
+        tree: Arc<SessionTree>,
+    }
+
+    impl Window {
+        fn new(tree: SessionTree) -> Window {
+            let ctx = egui::Context::default();
+            theme::apply(
+                &ctx,
+                deck_core::config::UiStyle::Neutral,
+                deck_core::config::Density::Compact,
+                UiFont::Auto,
+                true,
+            );
+            let mut w = Window {
+                ctx,
+                st: TreeState::new("t".to_owned()),
+                tree: Arc::new(tree),
+            };
+            w.frame(Vec::new(), |_| {});
+            w
+        }
+
+        fn frame(
+            &mut self,
+            events: Vec<egui::Event>,
+            tweak: impl FnOnce(&mut TreeInput<'_>),
+        ) -> Vec<TreeAction> {
+            let tree = Arc::clone(&self.tree);
+            let mut input = plain_input();
+            input.tree = Some(&tree);
+            tweak(&mut input);
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))),
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            let st = &mut self.st;
+            let mut full = self.ctx.run_ui(raw, |ui| {
+                out = show(ui.ctx(), st, &input);
+            });
+            full.textures_delta.clear();
+            out
+        }
+
+        fn key(
+            &mut self,
+            key: Key,
+            modifiers: Modifiers,
+            tweak: impl FnOnce(&mut TreeInput<'_>),
+        ) -> Vec<TreeAction> {
+            let event = egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            self.frame(vec![event], tweak)
+        }
+
+        /// Selects the first row (the tree has no leaf, so nothing is selected at first).
+        fn select_first(&mut self) {
+            self.key(Key::ArrowDown, Modifiers::NONE, |_| {});
+        }
+    }
+
+    #[test]
+    fn go_here_asks_about_a_summary_only_when_omp_does_and_shift_enter_skips_the_question() {
+        use BranchSummary::*;
+        assert_eq!(go_plan(false, false), GoPlan::Now(None));
+        assert_eq!(go_plan(true, false), GoPlan::Ask);
+        assert_eq!(go_plan(false, true), GoPlan::Now(Summarize));
+        assert_eq!(go_plan(true, true), GoPlan::Now(Summarize));
+    }
+
+    #[test]
+    fn the_summary_answer_maps_to_what_is_sent() {
+        let mut d = SummaryDialog::new("e".to_owned(), false);
+        assert_eq!(d.summary(), BranchSummary::None);
+        d.choose(SummaryChoice::Summarize);
+        assert_eq!(d.summary(), BranchSummary::Summarize);
+        d.choose(SummaryChoice::Custom);
+        assert!(
+            d.focus_editor,
+            "picking the custom prompt moves to its field"
+        );
+        // Blank instructions are omp's default prompt.
+        d.instructions = "  \n ".to_owned();
+        assert_eq!(d.summary(), BranchSummary::Summarize);
+        d.instructions = "  focus on the tests \n".to_owned();
+        assert_eq!(
+            d.summary(),
+            BranchSummary::Custom("focus on the tests".to_owned())
+        );
+        // The arrow keys stop at both ends.
+        assert_eq!(SummaryChoice::None.step(-1), SummaryChoice::None);
+        assert_eq!(SummaryChoice::None.step(1), SummaryChoice::Summarize);
+        assert_eq!(SummaryChoice::Custom.step(1), SummaryChoice::Custom);
+    }
+
+    #[test]
+    fn enter_goes_straight_away_and_the_summary_question_is_answered_in_its_dialog() {
+        let mut w = Window::new(chain(3));
+        w.select_first();
+        let a = w.key(Key::Enter, Modifiers::NONE, |_| {});
+        assert!(
+            matches!(&a[..], [TreeAction::Navigate { entry, user: true, summary: BranchSummary::None }] if entry == "n0"),
+            "{}",
+            a.len()
+        );
+
+        // omp asks (setting on): nothing is sent until the dialog is answered.
+        let on = |i: &mut TreeInput<'_>| i.summary_prompt = true;
+        assert!(w.key(Key::Enter, Modifiers::NONE, on).is_empty());
+        assert!(w.st.summary.is_some());
+        // Down picks "Summarize"; Enter confirms it.
+        assert!(w.key(Key::ArrowDown, Modifiers::NONE, on).is_empty());
+        let a = w.key(Key::Enter, Modifiers::NONE, on);
+        assert!(
+            matches!(&a[..], [TreeAction::Navigate { entry, summary: BranchSummary::Summarize, .. }] if entry == "n0")
+        );
+        assert!(w.st.summary.is_none());
+    }
+
+    #[test]
+    fn shift_enter_summarizes_without_asking_whatever_the_setting() {
+        let mut w = Window::new(chain(3));
+        w.select_first();
+        for on in [false, true] {
+            let a = w.key(Key::Enter, Modifiers::SHIFT, |i| i.summary_prompt = on);
+            assert!(
+                matches!(
+                    &a[..],
+                    [TreeAction::Navigate {
+                        summary: BranchSummary::Summarize,
+                        ..
+                    }]
+                ),
+                "setting {on}"
+            );
+            assert!(w.st.summary.is_none());
+        }
+    }
+
+    #[test]
+    fn esc_in_the_summary_dialog_cancels_the_dialog_not_the_tree() {
+        let mut w = Window::new(chain(3));
+        w.select_first();
+        let on = |i: &mut TreeInput<'_>| i.summary_prompt = true;
+        w.key(Key::Enter, Modifiers::NONE, on);
+        assert!(w.st.summary.is_some());
+        let a = w.key(Key::Escape, Modifiers::NONE, on);
+        assert!(a.is_empty(), "no Close, no Navigate");
+        assert!(w.st.summary.is_none());
+        // A second Esc is the tree's own: it closes.
+        let a = w.key(Key::Escape, Modifiers::NONE, on);
+        assert!(matches!(&a[..], [TreeAction::Close]));
+    }
+
+    #[test]
+    fn the_label_editor_saves_a_trimmed_label_removes_on_blank_and_cancels_on_esc() {
+        let mut t = chain(3);
+        t.labels.insert("n0".to_owned(), "old".to_owned());
+        let mut w = Window::new(t);
+        w.select_first();
+        let edit = |w: &mut Window, text: &str| {
+            assert!(w.key(Key::L, Modifiers::NONE, |_| {}).is_empty());
+            let e = w.st.label.as_mut().expect("the editor opens");
+            text.clone_into(&mut e.text);
+        };
+
+        // Opens prefilled with the current label.
+        assert!(w.key(Key::L, Modifiers::NONE, |_| {}).is_empty());
+        let e = w.st.label.as_ref().expect("the editor opens");
+        assert_eq!((e.entry.as_str(), e.text.as_str()), ("n0", "old"));
+        w.key(Key::Escape, Modifiers::NONE, |_| {});
+        assert!(w.st.label.is_none());
+
+        edit(&mut w, "  new  ");
+        let a = w.key(Key::Enter, Modifiers::NONE, |_| {});
+        assert!(
+            matches!(&a[..], [TreeAction::SetLabel { entry, label: Some(l) }] if entry == "n0" && l == "new")
+        );
+        assert!(w.st.label.is_none());
+
+        // Blank removes.
+        edit(&mut w, "   ");
+        let a = w.key(Key::Enter, Modifiers::NONE, |_| {});
+        assert!(matches!(&a[..], [TreeAction::SetLabel { entry, label: None }] if entry == "n0"));
+
+        // Esc discards the typing and is not the tree's Esc.
+        edit(&mut w, "discarded");
+        let a = w.key(Key::Escape, Modifiers::NONE, |_| {});
+        assert!(a.is_empty());
+        assert!(w.st.label.is_none());
+
+        // Saving what is already there sends nothing.
+        assert!(w.key(Key::L, Modifiers::NONE, |_| {}).is_empty());
+        assert!(w.key(Key::Enter, Modifiers::NONE, |_| {}).is_empty());
+        assert!(w.st.label.is_none());
+    }
+
+    #[test]
+    fn the_label_key_waits_for_an_empty_search_and_an_available_session() {
+        let mut w = Window::new(chain(3));
+        w.select_first();
+        // omp types into its search; here a typed query keeps `L` out of the way.
+        w.st.search = "n".to_owned();
+        assert!(w.key(Key::L, Modifiers::NONE, |_| {}).is_empty());
+        assert!(w.st.label.is_none());
+        w.st.search.clear();
+        // A refused gate says why instead of opening the editor.
+        let a = w.key(Key::L, Modifiers::NONE, |i| {
+            i.label = Err("Another tree action is still running");
+        });
+        assert!(
+            matches!(&a[..], [TreeAction::Notice(t)] if t == "Another tree action is still running")
+        );
+        assert!(w.st.label.is_none());
+    }
+
+    #[test]
+    fn label_edit_states() {
+        let mut e = LabelEdit::new("x".to_owned(), None);
+        assert_eq!(e.finish(), LabelEnd::Unchanged);
+        e.text = "  ".to_owned();
+        assert_eq!(
+            e.finish(),
+            LabelEnd::Unchanged,
+            "blank over nothing is nothing"
+        );
+        e.text = " tag ".to_owned();
+        assert_eq!(e.finish(), LabelEnd::Set(Some("tag".to_owned())));
+        let mut e = LabelEdit::new("x".to_owned(), Some("tag"));
+        e.text = "tag ".to_owned();
+        assert_eq!(e.finish(), LabelEnd::Unchanged);
+        e.text.clear();
+        assert_eq!(e.finish(), LabelEnd::Set(None));
+    }
+
+    #[test]
+    fn re_answer_is_offered_only_on_an_ask_result_and_needs_a_live_idle_tab() {
+        let mut t = chain(3);
+        {
+            let n = Arc::make_mut(&mut t.nodes[1]);
+            n.kind = NodeKind::ToolResult;
+            n.text = "[ask: {\"questions\":[…]}]".to_owned();
+            n.tool_name = Some("ask".to_owned());
+        }
+        let l = tree_layout::build(&t, Some(2), Filter::All);
+        let live = plain_input();
+        // Row 0 is a prompt, row 1 the ask result.
+        assert!(reanswer_blocked(&t, &l, &live, 0).is_some());
+        assert_eq!(reanswer_blocked(&t, &l, &live, 1), None);
+        let mut off = plain_input();
+        off.reanswer = Err("omp is busy — wait for it to finish");
+        assert_eq!(
+            reanswer_blocked(&t, &l, &off, 1),
+            Some("omp is busy — wait for it to finish")
+        );
+
+        // The action carries the entry id, or the reason.
+        let mut w = Window::new(t);
+        w.st.filter = Filter::All;
+        w.frame(Vec::new(), |_| {});
+        let tree = Arc::clone(&w.tree);
+        let mut out = Vec::new();
+        reanswer_here(&w.st, &tree, &live, 1, &mut out);
+        assert!(matches!(&out[..], [TreeAction::Reanswer { entry }] if entry == "n1"));
+        out.clear();
+        reanswer_here(&w.st, &tree, &off, 1, &mut out);
+        assert!(matches!(&out[..], [TreeAction::Notice(_)]));
+        // The whole list is shown: row 1 is the ask result, row 0 is not.
+        out.clear();
+        reanswer_here(&w.st, &tree, &live, 0, &mut out);
+        assert!(matches!(&out[..], [TreeAction::Notice(_)]));
+    }
+
+    #[test]
+    fn the_nearest_match_is_the_selection_itself_then_the_next_one_then_the_first() {
+        let rows = [false, true, false, true, false];
+        assert_eq!(nearest_match(&rows, Some(1)), Some(1));
+        assert_eq!(nearest_match(&rows, Some(2)), Some(3));
+        assert_eq!(
+            nearest_match(&rows, Some(4)),
+            Some(1),
+            "nothing after it: the first"
+        );
+        assert_eq!(nearest_match(&rows, None), Some(1));
+        assert_eq!(nearest_match(&[false, false], Some(0)), None);
+    }
+
+    #[test]
+    fn moves_skip_the_rows_a_query_excludes_and_stop_at_the_ends() {
+        let rows = [false, true, false, true, true, false];
+        let go = |cur, mv| match_target(&rows, cur, mv, 2);
+        assert_eq!(go(Some(1), Move::Step(1)), Some(3));
+        assert_eq!(go(Some(3), Move::Step(1)), Some(4));
+        assert_eq!(go(Some(4), Move::Step(1)), Some(4), "no match below");
+        assert_eq!(go(Some(3), Move::Step(-1)), Some(1));
+        assert_eq!(go(Some(1), Move::Step(-1)), Some(1), "no match above");
+        // From an excluded row the first step lands on the neighbouring match.
+        assert_eq!(go(Some(2), Move::Step(1)), Some(3));
+        assert_eq!(go(Some(2), Move::Step(-1)), Some(1));
+        assert_eq!(go(Some(0), Move::Step(-1)), Some(1));
+        // A page walks that many matches; the ends are the first and last match.
+        assert_eq!(go(Some(1), Move::Page(1)), Some(4));
+        assert_eq!(go(Some(4), Move::Page(-1)), Some(1));
+        assert_eq!(go(Some(3), Move::Home), Some(1));
+        assert_eq!(go(Some(3), Move::End), Some(4));
+        assert_eq!(go(None, Move::Step(1)), Some(1));
+        assert_eq!(go(None, Move::Step(-1)), Some(4));
+        // Jumps are not list walks; nothing matching means no move at all.
+        assert_eq!(go(Some(1), Move::Turn { forward: true }), None);
+        assert_eq!(
+            match_target(&[false, false], Some(0), Move::Step(1), 2),
+            None
+        );
+    }
+
+    #[test]
+    fn a_query_confines_selection_and_go_here_to_its_matches() {
+        let mut t = chain(6);
+        for (i, n) in t.nodes.iter_mut().enumerate() {
+            Arc::make_mut(n).search_text = if i % 2 == 1 { "alpha" } else { "zeta" }.to_owned();
+        }
+        let mut w = Window::new(t);
+        w.select_first();
+        assert_eq!(w.st.selected.as_deref(), Some("n0"));
+        let nothing = |_: &mut TreeInput<'_>| {};
+
+        // Typing a query that excludes the selection moves it to the first match after it.
+        w.st.search = "alpha".to_owned();
+        w.frame(Vec::new(), nothing);
+        assert_eq!(w.st.selected.as_deref(), Some("n1"));
+
+        // Up / Down only visit matches.
+        w.key(Key::ArrowDown, Modifiers::NONE, nothing);
+        assert_eq!(w.st.selected.as_deref(), Some("n3"));
+        w.key(Key::ArrowUp, Modifiers::NONE, nothing);
+        w.key(Key::ArrowUp, Modifiers::NONE, nothing);
+        assert_eq!(w.st.selected.as_deref(), Some("n1"));
+
+        // Enter acts on the match.
+        let a = w.key(Key::Enter, Modifiers::NONE, nothing);
+        assert!(matches!(&a[..], [TreeAction::Navigate { entry, .. }] if entry == "n1"));
+
+        // A row the query excludes (a click on a dimmed row) is not a place to go.
+        w.st.selected = Some("n2".to_owned());
+        assert!(w.key(Key::Enter, Modifiers::NONE, nothing).is_empty());
+        assert!(w.key(Key::Enter, Modifiers::SHIFT, nothing).is_empty());
+        assert_eq!(
+            w.st.selected.as_deref(),
+            Some("n2"),
+            "the click's selection stays"
+        );
+
+        // A new query that excludes the selection moves it on, forward first.
+        w.st.selected = Some("n3".to_owned());
+        w.st.search = "zeta".to_owned();
+        w.frame(Vec::new(), nothing);
+        assert_eq!(w.st.selected.as_deref(), Some("n4"));
+
+        // Nothing matches: the selection stays and Enter does nothing.
+        w.st.search = "qqqq".to_owned();
+        w.frame(Vec::new(), nothing);
+        assert_eq!(w.st.selected.as_deref(), Some("n4"));
+        assert!(w.key(Key::Enter, Modifiers::NONE, nothing).is_empty());
+        assert_eq!(w.st.selected.as_deref(), Some("n4"));
+
+        // Without a query every row is a place to go again.
+        w.st.search.clear();
+        w.frame(Vec::new(), nothing);
+        let a = w.key(Key::Enter, Modifiers::NONE, nothing);
+        assert!(matches!(&a[..], [TreeAction::Navigate { entry, .. }] if entry == "n4"));
     }
 
     #[test]

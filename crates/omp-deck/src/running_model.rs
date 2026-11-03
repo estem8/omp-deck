@@ -17,7 +17,7 @@ use crate::titlebar::strip_omp_prefix;
 use deck_service::backend::kind_label;
 use deck_service::statusfmt::Activity;
 
-/// The two views of the session manager hub.
+/// The views of the session manager hub.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HubMode {
     /// Every saved session (inventory).
@@ -25,6 +25,8 @@ pub enum HubMode {
     Sessions,
     /// Live sessions, their memory, kill.
     Running,
+    /// omp's `/resume` picker: pick a session (or a Claude Code / Codex one) to resume.
+    Resume,
 }
 
 /// One answer of the running-sessions worker.

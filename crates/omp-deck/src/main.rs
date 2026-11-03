@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod activate;
+mod advisor_page;
 mod agent_config;
 mod agent_ctl;
 mod agent_hub;
@@ -39,6 +40,8 @@ mod omp_settings;
 mod paint_cache;
 mod palette;
 mod panes;
+mod plugins_page;
+mod resume_model;
 mod review;
 mod running_model;
 mod running_view;
@@ -62,6 +65,7 @@ mod tree_view;
 mod ui_fonts;
 mod update;
 mod usage_fmt;
+mod usage_resets;
 mod usage_state;
 mod usage_view;
 mod widgets;

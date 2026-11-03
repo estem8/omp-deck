@@ -7,9 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::deferred::{ResumePlan, resume_plan};
 use super::sessions::{LaunchJob, Owner};
 use super::{Engine, Fin, JobState, Msg, Sched, lock};
-use crate::controller::{RequestKey, ServiceEpoch, Submission, Submitted};
+use crate::controller::{
+    Command, Rejected, RequestKey, ServiceEpoch, SessionTarget, Submission, Submitted,
+};
 use crate::gateway::desktop;
 use crate::gateway::jobs::{self, JobCtx};
 use crate::gateway::journal::Admission;
@@ -35,6 +38,8 @@ pub(super) enum Post {
     Accounts,
     /// The result is the app-update state after the job.
     AppView,
+    /// A plugin change succeeded: type `/reload-plugins` into this session once it is idle.
+    ReloadPlugins(SessionTarget),
 }
 
 /// Throttled progress reports of a worker job.
@@ -63,7 +68,7 @@ impl Reporter {
     }
 }
 
-fn send(tx: &std::sync::mpsc::Sender<Msg>, fin: Fin) {
+pub(super) fn send(tx: &std::sync::mpsc::Sender<Msg>, fin: Fin) {
     let _ = tx.send(Msg::Fin(Box::new(fin)));
 }
 
@@ -244,7 +249,8 @@ impl Engine {
                     None => refused("no such request"),
                     Some(r)
                         if r.key.client != key.client
-                            && self.worktree.owner(&r.key) != Some(key.client.as_str()) =>
+                            && self.worktree.owner(&r.key) != Some(key.client.as_str())
+                            && self.defer.owner(&r.key) != Some(key.client.as_str()) =>
                     {
                         refused("only the client that sent the command can answer it")
                     }
@@ -256,6 +262,23 @@ impl Engine {
             | Mutation::WorktreeFinish { .. }
             | Mutation::WorktreeRetire { .. }
             | Mutation::WorktreeContinue { .. } => self.worktree_precheck(op),
+            Mutation::ResumeHere {
+                target,
+                file,
+                force,
+            } => {
+                if !file.is_absolute() {
+                    return refused("a session file path must be absolute");
+                }
+                managed(target)
+                    .filter(|m| {
+                        resume_plan(m.ctl.activity(), m.ctl.is_busy(), *force) == ResumePlan::Refuse
+                    })
+                    .map(|_| GatewayError::Rejected(Rejected::Busy))
+            }
+            Mutation::SessionRename { title, .. } if title.trim().is_empty() => {
+                refused("a session needs a title")
+            }
             Mutation::Ctl { target, .. } => match managed(target) {
                 Some(m) if m.ctl_key.is_none() => refused("this session runs without live control"),
                 _ => None,
@@ -354,7 +377,9 @@ impl Engine {
             Mutation::RunTool(Tool::Update(_)) | Mutation::OmpUpdateCheck if self.omp.is_none() => {
                 refused("omp was not found")
             }
-            Mutation::UsageRefresh if self.omp.is_none() => refused("omp was not found"),
+            Mutation::UsageRefresh | Mutation::UsageResetSpend { .. } if self.omp.is_none() => {
+                refused("omp was not found")
+            }
             Mutation::AppUpdateDownload => self.sched.download_refusal(),
             Mutation::AppUpdateApply => self.sched.apply_refusal(),
             // Only the client's own jobs; another client's keys are refused before any lookup.
@@ -385,7 +410,7 @@ impl Engine {
     }
 
     /// Lists an accepted mutation as a running job (without a worker of its own).
-    fn track(&mut self, key: &RequestKey, label: &'static str, post: Post) {
+    pub(super) fn track(&mut self, key: &RequestKey, label: &'static str, post: Post) {
         self.jobs.insert(
             key.clone(),
             JobState {
@@ -400,7 +425,7 @@ impl Engine {
     }
 
     /// Runs `f` on a worker as the job of `key`.
-    fn job<F>(
+    pub(super) fn job<F>(
         &mut self,
         key: RequestKey,
         label: &'static str,
@@ -489,6 +514,11 @@ impl Engine {
                         **done = Done::AppUpdate(self.sched.app_view());
                     }
                     self.dirty.app = true;
+                }
+                Post::ReloadPlugins(target) => {
+                    if result.is_ok() {
+                        self.queue_reload(&target, &key.client);
+                    }
                 }
             }
         }
@@ -615,33 +645,7 @@ impl Engine {
                 let Some(i) = index else {
                     return self.vanished(conn, id, key);
                 };
-                let session = target.key.clone();
-                let submitted = self.sess.managed[i].ctl.submit(Submission {
-                    key: key.clone(),
-                    target,
-                    command,
-                });
-                self.dirty.controllers = true;
-                match submitted {
-                    Ok(s) => {
-                        self.sess.submits.insert(key.clone(), session);
-                        self.reply(
-                            conn,
-                            id,
-                            Ok(Answer::Accepted(Accepted {
-                                key,
-                                duplicate: false,
-                                submitted: Some(s),
-                            })),
-                        );
-                        // The first step runs now, not at the next tick.
-                        self.waker.now();
-                    }
-                    Err(r) => {
-                        self.journal.finish(&key, Outcome::Rejected(r.clone()));
-                        self.reply(conn, id, Err(GatewayError::Rejected(r)));
-                    }
-                }
+                self.submit_now(conn, id, key, i, target, command);
             }
             Mutation::Answer {
                 target,
@@ -1512,6 +1516,16 @@ impl Engine {
                 self.accepted(conn, id, &key);
                 self.finish_journal(&key, Outcome::Done(Box::new(Done::Unit)));
             }
+            op @ (Mutation::PluginEnable { .. }
+            | Mutation::PluginFeatures { .. }
+            | Mutation::PluginConfigSet { .. }
+            | Mutation::UsageResetSpend { .. }
+            | Mutation::SessionPin { .. }
+            | Mutation::SessionRename { .. }
+            | Mutation::SessionLabel { .. }
+            | Mutation::ForeignImport { .. }
+            | Mutation::AdvisorSave { .. }
+            | Mutation::ResumeHere { .. }) => self.execute_session_ops(conn, id, key, op),
             op @ (Mutation::WorktreeNew { .. }
             | Mutation::WorktreeMoveSession { .. }
             | Mutation::WorktreeFinish { .. }
@@ -1530,6 +1544,46 @@ impl Engine {
         self.finish_journal(&key, outcome);
     }
 
+    /// Hands `command` to controller `i` as the accepted mutation `key` (answered like
+    /// [`Mutation::Submit`]): its journal record ends with the command's final delivery.
+    pub(super) fn submit_now(
+        &mut self,
+        conn: u64,
+        id: u64,
+        key: RequestKey,
+        i: usize,
+        target: SessionTarget,
+        command: Command,
+    ) {
+        let session = target.key.clone();
+        let submitted = self.sess.managed[i].ctl.submit(Submission {
+            key: key.clone(),
+            target,
+            command,
+        });
+        self.dirty.controllers = true;
+        match submitted {
+            Ok(s) => {
+                self.sess.submits.insert(key.clone(), session);
+                self.reply(
+                    conn,
+                    id,
+                    Ok(Answer::Accepted(Accepted {
+                        key,
+                        duplicate: false,
+                        submitted: Some(s),
+                    })),
+                );
+                // The first step runs now, not at the next tick.
+                self.waker.now();
+            }
+            Err(r) => {
+                self.journal.finish(&key, Outcome::Rejected(r.clone()));
+                self.reply(conn, id, Err(GatewayError::Rejected(r)));
+            }
+        }
+    }
+
     /// The admitted mutation's subject disappeared between validation and execution (cannot
     /// happen on this thread; kept total so no admitted key stays Running).
     pub(super) fn vanished(&mut self, conn: u64, id: u64, key: RequestKey) {
@@ -1540,7 +1594,7 @@ impl Engine {
 
     /// The live-control key of a running session holding `file`, for a fork through its
     /// socket.
-    fn ctl_holder(&self, file: &std::path::Path) -> Option<String> {
+    pub(super) fn ctl_holder(&self, file: &std::path::Path) -> Option<String> {
         if let Some(m) = self
             .sess
             .managed

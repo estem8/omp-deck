@@ -17,7 +17,10 @@ use deck_core::backup::{self, Destination, PreparedProjectRestore, PreparedResto
 use deck_core::changes::{self, ChangedFile};
 use deck_core::ctl::{CtlClient, CtlCommand, CtlReply};
 use deck_core::inventory::{InventoryEntry, SessionStats, StatsCache};
-use deck_core::omp::{Omp, SECRET_PLACEHOLDER, SettingsCatalog};
+use deck_core::omp::{
+    AdvisorDoc, AdvisorScope, ForeignSource, Omp, PluginScope, SECRET_PLACEHOLDER, SessError,
+    SettingsCatalog,
+};
 use deck_core::sessions::{SessionsRoot, find_copy, find_fork, sessions_under};
 use deck_core::worktree::{self, Removal, Removed, Worktree};
 
@@ -38,6 +41,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn failed(e: impl std::fmt::Display) -> GatewayError {
     GatewayError::Failed(e.to_string())
+}
+
+/// A headless-helper failure. A session lease held by an omp this gateway cannot ask to act is
+/// explained, not reported as omp's bare "busy".
+fn sess_failed(e: SessError) -> GatewayError {
+    match e {
+        SessError::Busy => GatewayError::Refused(
+            "That session is open in a running omp that OmpDeck does not control: close it there first"
+                .to_owned(),
+        ),
+        other => failed(other),
+    }
 }
 
 /// Server-side objects a client refers to by number: OAuth flows and prepared restores never
@@ -293,6 +308,31 @@ pub fn query(ctx: &JobCtx, q: &Query) -> Option<Result<Answer, GatewayError>> {
             &ctx.root.path,
         ))),
         Query::AgentDefs { projects } => Ok(Answer::AgentDefs(agent_catalog(ctx, projects))),
+        Query::PluginList => ctx
+            .omp()
+            .and_then(|o| o.plugins().map_err(failed))
+            .map(Answer::PluginList),
+        Query::PluginConfig { pkg } => ctx
+            .omp()
+            .and_then(|o| o.plugin_config(pkg).map_err(failed))
+            .map(Answer::PluginConfig),
+        Query::UsageResets { provider } => ctx
+            .omp()
+            .and_then(|o| o.usage_resets(provider.as_deref()).map_err(failed))
+            .map(Answer::UsageResets),
+        Query::ForeignSessions { source } => ctx
+            .omp()
+            .and_then(|o| o.foreign_sessions(*source).map_err(sess_failed))
+            .map(Answer::ForeignSessions),
+        Query::AdvisorConfig { cwd, scope } => ctx
+            .omp()
+            .and_then(|o| o.advisor_config(cwd, *scope).map_err(sess_failed))
+            .map(Answer::AdvisorConfig),
+        Query::SessionPins => Ok(Answer::SessionPins(
+            deck_core::pins::read(&ctx.root.agent_dir())
+                .into_iter()
+                .collect(),
+        )),
         Query::Topic(_)
         | Query::Screen(_)
         | Query::WorktreeSessions(_)
@@ -591,6 +631,145 @@ pub fn account_policies(
         .set_account_policies(provider, policies)
         .map(Done::Setting)
         .map_err(failed)
+}
+
+/// `omp plugin enable|disable`; `cwd` is the project a project-scope change belongs to.
+pub fn plugin_enable(
+    ctx: &JobCtx,
+    name: &str,
+    enabled: bool,
+    scope: PluginScope,
+    cwd: Option<&Path>,
+) -> Result<Done, GatewayError> {
+    let omp = ctx.omp()?;
+    match cwd {
+        Some(cwd) => omp.plugin_set_enabled_in(name, enabled, scope, cwd),
+        None => omp.plugin_set_enabled(name, enabled, scope),
+    }
+    .map(|()| Done::Unit)
+    .map_err(failed)
+}
+
+pub fn plugin_features(ctx: &JobCtx, pkg: &str, features: &[String]) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .plugin_features(pkg, features)
+        .map(Done::PluginFeatures)
+        .map_err(failed)
+}
+
+/// Sets (`Some`) or deletes (`None`) one plugin setting. Nothing here logs or echoes the value.
+pub fn plugin_config_set(
+    ctx: &JobCtx,
+    pkg: &str,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Done, GatewayError> {
+    let omp = ctx.omp()?;
+    match value {
+        Some(v) => omp.plugin_config_set(pkg, key, v),
+        None => omp.plugin_config_delete(pkg, key),
+    }
+    .map(|()| Done::Unit)
+    .map_err(failed)
+}
+
+/// Spends one saved reset: omp's confirmation line. Not idempotent: never retried.
+pub fn usage_reset_spend(
+    ctx: &JobCtx,
+    provider: &str,
+    credential: &str,
+) -> Result<String, GatewayError> {
+    ctx.omp()?
+        .usage_reset_spend(provider, credential)
+        .map_err(failed)
+}
+
+pub fn session_pin(ctx: &JobCtx, id: &str, pinned: bool) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .set_pinned(id, pinned)
+        .map(|()| Done::Unit)
+        .map_err(sess_failed)
+}
+
+/// Renames a session no controller of this gateway runs, through omp's lease-checked helper.
+pub fn session_rename(ctx: &JobCtx, file: &Path, title: &str) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .rename_session(file, title)
+        .map(Done::Message)
+        .map_err(sess_failed)
+}
+
+/// Sets a label in a session no running omp holds, through omp's lease-checked helper.
+pub fn session_label(
+    ctx: &JobCtx,
+    file: &Path,
+    entry_id: &str,
+    label: Option<&str>,
+) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .set_label(file, entry_id, label)
+        .map(|()| Done::Unit)
+        .map_err(sess_failed)
+}
+
+/// Sets a label through the control socket of the running session `name` (one this gateway has
+/// no controller for).
+pub fn session_label_live(
+    ctx: &JobCtx,
+    name: &str,
+    file: &Path,
+    entry_id: &str,
+    label: Option<&str>,
+) -> Result<Done, GatewayError> {
+    let client = CtlClient::spawn(deck_core::ctl::ctl_dir(&ctx.ctl_ns, name), || {});
+    let reply = ctl_roundtrip(
+        &client,
+        CtlCommand::SetLabel {
+            root: file.to_path_buf(),
+            entry_id: entry_id.to_owned(),
+            label: label.map(str::to_owned),
+        },
+    )?;
+    ctl_ok(reply, "omp did not set the label")
+}
+
+/// A control reply that must have succeeded: its error text otherwise.
+pub fn ctl_ok(reply: CtlReply, fallback: &str) -> Result<Done, GatewayError> {
+    if reply.ok {
+        Ok(Done::Ctl(reply))
+    } else {
+        Err(GatewayError::Failed(
+            reply.error.unwrap_or_else(|| fallback.to_owned()),
+        ))
+    }
+}
+
+/// Imports a Claude Code / Codex session as a new omp session: its file.
+pub fn foreign_import(
+    ctx: &JobCtx,
+    source: ForeignSource,
+    id: &str,
+    cwd: &Path,
+) -> Result<Done, GatewayError> {
+    ctx.omp()?
+        .import_foreign(source, id, cwd)
+        .map(Done::Path)
+        .map_err(sess_failed)
+}
+
+/// Saves an advisor document headless (no running omp applies it).
+pub fn advisor_save(
+    ctx: &JobCtx,
+    cwd: &Path,
+    scope: AdvisorScope,
+    doc: &AdvisorDoc,
+) -> Result<Done, GatewayError> {
+    let saved = ctx
+        .omp()?
+        .save_advisor_config(cwd, scope, doc)
+        .map_err(sess_failed)?;
+    let verb = if saved.removed { "Removed" } else { "Saved" };
+    Ok(Done::Message(format!("{verb} {}", saved.path.display())))
 }
 
 /// The definition directories (file reads), omp's agent settings (`omp config get`) and its

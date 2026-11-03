@@ -177,6 +177,13 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   the OmpDeck session host (not tmux), which keeps the conversation while no window shows it and restores it when you
   reopen the tab.
 
+  In the chat view, omp's own screens for settings (`/settings`, `/advisor configure`), the session model picker
+  (Alt+P, `/switch`), usage (`/usage`, `/usage reset`), resuming (`/resume`, `/resume @claude`/`@codex`) and the
+  session tree (`/tree`) open OmpDeck's versions instead, which cover everything omp's do: plugins (enable, features,
+  settings), advisors (WATCHDOG.yml), model roles and the task-agent model, saved rate-limit resets, resume in place,
+  pins, renames, Claude Code / Codex imports, branch summaries, labels and re-answering an ask. The terminal view keeps
+  omp's own screens.
+
   </details>
 
 - **Session tree**: Browse conversation branches, fork and navigate with recorded cost context.

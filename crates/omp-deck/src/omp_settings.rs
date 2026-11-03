@@ -29,6 +29,8 @@ pub struct Row {
     sent: Option<Value>,
     /// Last laid-out height, used to skip off-screen rows.
     pub height: f32,
+    /// What supplies the effective value instead of omp's saved one (`project`), shown as a badge.
+    pub overridden_by: Option<String>,
 }
 
 impl Row {
@@ -46,6 +48,7 @@ impl Row {
             buf: None,
             sent: None,
             height: ROW_HEIGHT_GUESS,
+            overridden_by: None,
         }
     }
 
@@ -59,6 +62,13 @@ impl Row {
 
     pub fn matches(&self, terms: &[String]) -> bool {
         terms.iter().all(|t| self.haystack.contains(t.as_str()))
+    }
+
+    /// omp hides the editors of these settings while the project supplies them: the saved value
+    /// is not what its sessions use, and the project file is where it is changed.
+    pub fn hidden(&self) -> bool {
+        self.overridden_by.as_deref() == Some(PROJECT_LAYER)
+            && HIDDEN_WHEN_PROJECT.contains(&self.setting.key.as_str())
     }
 
     /// Marks a write as started. `sent` is only kept for non-secret settings (a secret must not
@@ -113,6 +123,13 @@ pub struct TabModel {
     pub sections: Vec<Section>,
 }
 
+impl TabModel {
+    /// Rows shown: all but the editors omp hides while the project supplies them.
+    pub fn visible(&self) -> usize {
+        self.rows.iter().filter(|r| !r.hidden()).count()
+    }
+}
+
 pub struct Model {
     pub tabs: Vec<TabModel>,
     /// Where omp keeps its config, `~`-abbreviated, for the note banner.
@@ -162,6 +179,23 @@ impl Model {
             .find(|r| r.setting.key == key)
     }
 
+    /// The row of setting `key`.
+    pub fn find(&self, key: &str) -> Option<&Row> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.rows.iter())
+            .find(|r| r.setting.key == key)
+    }
+
+    /// Marks the rows the project's own settings file (`layer`, its parsed JSON; `None` = no file)
+    /// supplies, and clears the marks of the others.
+    pub fn set_project_layer(&mut self, layer: Option<&Value>) {
+        for row in self.tabs.iter_mut().flat_map(|t| t.rows.iter_mut()) {
+            let supplied = layer.is_some_and(|l| layer_sets(l, &row.setting.key));
+            row.overridden_by = supplied.then(|| PROJECT_LAYER.to_owned());
+        }
+    }
+
     /// Rows of every tab matching all whitespace-separated terms of `query`, grouped by tab.
     pub fn search(&self, query: &str) -> Vec<TabHits> {
         let terms = query_terms(query);
@@ -176,7 +210,7 @@ impl Model {
                     .rows
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| r.matches(&terms))
+                    .filter(|(_, r)| !r.hidden() && r.matches(&terms))
                     .map(|(i, _)| i)
                     .collect();
                 (!rows.is_empty()).then_some(TabHits { tab, rows })
@@ -188,6 +222,55 @@ impl Model {
 /// Lowercased whitespace-separated terms.
 pub fn query_terms(query: &str) -> Vec<String> {
     query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// `overriddenBy` omp reports for a value the project's settings file supplies.
+pub const PROJECT_LAYER: &str = "project";
+
+/// Settings whose editors omp hides while the project supplies them (its `…NotProject`
+/// conditions: `contextFiles.extra`, `tools.restrictedFolders`, `task.perCallModelAllow`).
+pub const HIDDEN_WHEN_PROJECT: [&str; 3] = [
+    "contextFiles.extra",
+    "tools.restrictedFolders",
+    "task.perCallModelAllow",
+];
+
+/// The project's settings file, relative to the project folder (omp reads it from the working
+/// directory only, not from parents).
+pub const PROJECT_SETTINGS: [&str; 2] = [".omp", "settings.json"];
+
+/// Largest project settings file read: a bigger one is not a settings file.
+const PROJECT_SETTINGS_MAX: u64 = 1 << 20;
+
+/// The project's settings file as JSON; `None` when there is none, it is unreadable or not an
+/// object. Blocking file read: run on a worker.
+pub fn read_project_layer(project: &Path) -> Option<Value> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(project.join(PROJECT_SETTINGS[0]).join(PROJECT_SETTINGS[1])).ok()?;
+    let mut text = String::new();
+    file.take(PROJECT_SETTINGS_MAX)
+        .read_to_string(&mut text)
+        .ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// Whether the settings file `layer` sets `key`: nested by the key's dotted segments (how omp
+/// writes it), or under the dotted key itself.
+pub fn layer_sets(layer: &Value, key: &str) -> bool {
+    if layer.get(key).is_some_and(|v| !v.is_null()) {
+        return true;
+    }
+    let mut at = layer;
+    for seg in key.split('.') {
+        match at.get(seg) {
+            Some(next) => at = next,
+            None => return false,
+        }
+    }
+    !at.is_null()
 }
 
 /// `statusLine.preset` → "Status line › Preset"; "" → "General".
@@ -347,6 +430,30 @@ pub fn usage_reserve_from_catalog(catalog: &SettingsCatalog) -> Option<u32> {
         .and_then(Value::as_f64)
         .filter(|v| (0.0..=100.0).contains(v))
         .map(|v| v.round() as u32)
+}
+
+/// The settings key whose change also moves the open session's thinking level.
+pub const THINKING_KEY: &str = "defaultThinkingLevel";
+
+/// The thinking level of the session in the active tab, as far as the app knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionLevel<'a> {
+    /// omp is running in the tab (not exited).
+    pub live: bool,
+    /// The level omp is using (`None`: not known yet, or the model has none).
+    pub level: Option<&'a str>,
+    /// The level as configured (`auto` while omp picks it).
+    pub configured: Option<&'a str>,
+}
+
+/// What omp's `/settings` does when `defaultThinkingLevel` changes: the live session switches to
+/// the new level too. Returns the level to send as `/effort` — only to a live session whose
+/// level is known and differs; `None` for no session tab, an exited one, an unknown level, or a
+/// session already there.
+pub fn thinking_to_apply(new_level: &str, session: Option<SessionLevel<'_>>) -> Option<String> {
+    let s = session.filter(|s| s.live)?;
+    let current = s.configured.or(s.level)?;
+    (current != new_level && !new_level.is_empty()).then(|| new_level.to_owned())
 }
 
 #[cfg(test)]
@@ -601,5 +708,135 @@ mod tests {
         assert_eq!(value_text(Some(&json!("s"))), "s");
         assert_eq!(pretty_json(&SettingKind::Record, None), "{}");
         assert_eq!(pretty_json(&SettingKind::Array, None), "[]");
+    }
+
+    fn model_with_hidden_candidates() -> Model {
+        let catalog = SettingsCatalog {
+            tabs: vec![SettingsTab {
+                id: "context".into(),
+                label: "Context".into(),
+                settings: vec![
+                    setting("theme.dark", SettingKind::String, None, None),
+                    setting("contextFiles.extra", SettingKind::Array, None, None),
+                    setting("tools.restrictedFolders", SettingKind::Array, None, None),
+                    setting("task.perCallModelAllow", SettingKind::Array, None, None),
+                    setting("showHints", SettingKind::Bool, None, None),
+                ],
+            }],
+        };
+        Model::from_catalog(catalog, String::new())
+    }
+
+    #[test]
+    fn the_project_file_marks_the_rows_it_supplies() {
+        let mut m = model_with_hidden_candidates();
+        let layer = json!({"theme": {"dark": "nord"}, "showHints": null});
+        m.set_project_layer(Some(&layer));
+        let by = |m: &Model, key: &str| m.find(key).and_then(|r| r.overridden_by.clone());
+        assert_eq!(by(&m, "theme.dark").as_deref(), Some("project"));
+        // A null is not a value; a key the file lacks is untouched.
+        assert_eq!(by(&m, "showHints"), None);
+        assert_eq!(by(&m, "contextFiles.extra"), None);
+        // The marks follow the file: gone with it.
+        m.set_project_layer(None);
+        assert_eq!(by(&m, "theme.dark"), None);
+    }
+
+    #[test]
+    fn a_key_is_found_nested_or_under_its_dotted_name() {
+        let nested = json!({"a": {"b": {"c": 1}}});
+        assert!(layer_sets(&nested, "a.b.c"));
+        assert!(!layer_sets(&nested, "a.b.d"));
+        assert!(!layer_sets(&nested, "a.x.c"));
+        let flat = json!({"a.b": 2});
+        assert!(layer_sets(&flat, "a.b"));
+        assert!(!layer_sets(&json!({}), "a"));
+    }
+
+    #[test]
+    fn the_three_editors_omp_hides_disappear_only_while_the_project_supplies_them() {
+        let mut m = model_with_hidden_candidates();
+        let layer = json!({
+            "theme": {"dark": "nord"},
+            "contextFiles": {"extra": ["AGENTS.local.md"]},
+            "tools": {"restrictedFolders": ["/secret"]},
+            "task": {"perCallModelAllow": []},
+        });
+        m.set_project_layer(Some(&layer));
+        let hidden: Vec<&str> = m.tabs[0]
+            .rows
+            .iter()
+            .filter(|r| r.hidden())
+            .map(|r| r.setting.key.as_str())
+            .collect();
+        assert_eq!(
+            hidden,
+            [
+                "contextFiles.extra",
+                "tools.restrictedFolders",
+                "task.perCallModelAllow"
+            ]
+        );
+        // Search skips them too; an overridden row that omp keeps visible stays.
+        assert!(m.search("restricted").is_empty());
+        assert_eq!(m.search("theme.dark").len(), 1);
+        m.set_project_layer(None);
+        assert!(m.tabs[0].rows.iter().all(|r| !r.hidden()));
+        assert_eq!(m.search("restricted").len(), 1);
+    }
+
+    #[test]
+    fn the_project_file_is_read_bounded_and_only_when_it_is_an_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_project_layer(dir.path()), None);
+        std::fs::create_dir(dir.path().join(".omp")).expect("mkdir");
+        let file = dir.path().join(".omp").join("settings.json");
+        std::fs::write(&file, r#"{"theme":{"dark":"nord"}}"#).expect("write");
+        assert_eq!(
+            read_project_layer(dir.path()),
+            Some(json!({"theme": {"dark": "nord"}}))
+        );
+        std::fs::write(&file, "[1,2]").expect("write");
+        assert_eq!(read_project_layer(dir.path()), None);
+        std::fs::write(&file, "not json").expect("write");
+        assert_eq!(read_project_layer(dir.path()), None);
+    }
+
+    #[test]
+    fn the_session_follows_a_changed_default_thinking_level_only_when_it_differs() {
+        let live = |level, configured| {
+            Some(SessionLevel {
+                live: true,
+                level,
+                configured,
+            })
+        };
+        // Differs → /effort <new>.
+        assert_eq!(
+            thinking_to_apply("high", live(Some("low"), Some("low"))).as_deref(),
+            Some("high")
+        );
+        // `auto` is a configured level of its own: omp picking `low` is still not `high`.
+        assert_eq!(
+            thinking_to_apply("high", live(Some("low"), Some("auto"))).as_deref(),
+            Some("high")
+        );
+        // Same level → nothing to send; the configured one wins over the one in use.
+        assert_eq!(thinking_to_apply("high", live(Some("high"), None)), None);
+        assert_eq!(
+            thinking_to_apply("auto", live(Some("low"), Some("auto"))),
+            None
+        );
+        // No tab, an exited one, or a level not known yet → nothing.
+        assert_eq!(thinking_to_apply("high", None), None);
+        let exited = SessionLevel {
+            live: false,
+            level: Some("low"),
+            configured: Some("low"),
+        };
+        assert_eq!(thinking_to_apply("high", Some(exited)), None);
+        assert_eq!(thinking_to_apply("high", live(None, None)), None);
+        // A cleared value is not a level.
+        assert_eq!(thinking_to_apply("", live(Some("low"), None)), None);
     }
 }

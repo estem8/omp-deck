@@ -8,12 +8,14 @@
 //! workers talk to it only through [`Msg`]; nothing that blocks on the network, git, omp or a
 //! backend runs here (workers report back with [`Fin`]).
 
+mod deferred;
 mod device;
 mod interest;
 mod mutate;
 mod notify;
 mod remote;
 mod schedules;
+mod session_ops;
 mod sessions;
 mod spelling;
 pub(super) mod worktree;
@@ -439,6 +441,8 @@ pub(crate) struct Engine {
     devices: device::Devices,
     /// The worktree flows ([`worktree`]).
     worktree: worktree::Worktrees,
+    /// Commands typed into sessions later ([`deferred`]).
+    defer: deferred::Deferred,
 
     barrier: Option<MaintenanceMarker>,
     exit_requested: bool,
@@ -573,6 +577,7 @@ impl Engine {
             mobile,
             devices: device::Devices::default(),
             worktree: worktree::Worktrees::default(),
+            defer: deferred::Deferred::default(),
             barrier: None,
             exit_requested: false,
             stopping: false,
@@ -658,6 +663,7 @@ impl Engine {
         self.soon = None;
         self.refresh_settings();
         self.step_sessions(now);
+        self.step_deferred(now);
         self.step_interest(now);
         self.step_worktrees(now);
         self.step_notifications(now);

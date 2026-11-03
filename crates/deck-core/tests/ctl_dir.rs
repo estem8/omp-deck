@@ -270,7 +270,8 @@ fn install_extension_enforces_file_properties_even_when_content_matches() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(names.len(), 2, "{names:?}");
+    // The symlink's target, the extension, and the advisor module it imports; nothing else.
+    assert_eq!(names.len(), 3, "{names:?}");
 
     // A directory in the way is an error, not silently ignored.
     fs::remove_file(&path).unwrap();

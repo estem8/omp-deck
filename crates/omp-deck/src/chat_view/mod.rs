@@ -25,6 +25,7 @@ mod md;
 mod menu;
 mod page;
 mod paint;
+mod redirect;
 mod render;
 mod select;
 mod snap;
@@ -43,6 +44,7 @@ use egui::{Event, EventFilter, Rect, Sense, Ui, pos2, vec2};
 
 use ctx::{Cx, Local};
 pub(crate) use paint::{hairline, pop};
+pub use redirect::Redirect;
 use snap::Snap;
 pub(crate) use style::Ink;
 
@@ -71,6 +73,9 @@ pub struct ChatResponse {
     pub open_url: Option<String>,
     /// An event the terminal refused this frame.
     pub refused: Option<TspRefused>,
+    /// An omp screen that OmpDeck answers with its own (see [`Redirect`]): the view already
+    /// kept omp from opening it, or closed it again before drawing it.
+    pub redirect: Option<Redirect>,
 }
 
 /// Per-view state kept in egui memory.
@@ -80,6 +85,8 @@ struct ChatState {
     loc: Local,
     /// The page omp shows in the session's place while one of its fullscreen overlays is open.
     page: Page,
+    /// The omp surface being closed after it was redirected.
+    latch: redirect::Latch,
 }
 
 /// The copy and the local state of the page surface (its node ids are its own: `main` of the page
@@ -226,6 +233,7 @@ impl<'a> ChatView<'a> {
             snap: session_snap,
             loc: session_loc,
             page,
+            latch,
         } = &mut *guard;
         if !session_snap.is_current(rev, epoch) || !page.snap.is_current(rev, epoch) {
             handle.with_stamp(|doc, rev, epoch| {
@@ -249,7 +257,24 @@ impl<'a> ChatView<'a> {
         // While omp shows a page (a fullscreen overlay: `/git`, the agents hub, …) it owns the
         // keyboard and the session surface is frozen: the page is what the view draws and what
         // the pointer and keys address. A dead session keeps the session surface (and its banner).
-        let paged = exit.is_none() && page.snap.is_open();
+        // An omp screen with an OmpDeck counterpart is closed again before it is drawn.
+        let page_open = exit.is_none() && page.snap.is_open();
+        let page_caught = page_open
+            .then(|| redirect::catch_page(&page.snap))
+            .flatten();
+        let paged = page_open && page_caught.is_none();
+        let caught = match page_caught {
+            _ if exit.is_some() => None,
+            Some(c) => Some(c),
+            None if paged => None,
+            None => redirect::catch_layer(session_snap),
+        };
+        let mut verdict = latch.judge(caught, now);
+        let mut redirected = verdict.redirect.take();
+        let hidden = match &verdict.hide {
+            Some(redirect::Surface::Node(id)) => Some(id.as_str()),
+            _ => None,
+        };
         let (snap, loc) = if paged {
             (&page.snap, &mut page.loc)
         } else {
@@ -311,6 +336,14 @@ impl<'a> ChatView<'a> {
                     select::swallow(&mut loc.swallowed, egui::Key::Escape);
                 }
             }
+            if plan.send.is_empty()
+                && let Some((r, clear)) = redirect::intercept(snap, &mut keys, &mut loc.swallowed)
+            {
+                if let Some(Err(e)) = clear.as_ref().map(|c| term.send_tsp(c)) {
+                    refused.get_or_insert(e);
+                }
+                redirected = redirected.or(Some(r));
+            }
             term.route_keyboard(&keys, modifiers);
             if plan.paste {
                 term.paste_clipboard();
@@ -365,11 +398,13 @@ impl<'a> ChatView<'a> {
                 response,
                 open_url: None,
                 refused,
+                redirect: redirected,
             };
         }
 
         let mut cx = Cx::new(snap, &ink, loc, now, focused, snap.can_edit);
         cx.hide_duplicates = hide_duplicates && !paged;
+        cx.hidden = hidden;
         if paged {
             page::show(&cx, ui, rect, id);
         } else {
@@ -395,7 +430,7 @@ impl<'a> ChatView<'a> {
         if out.release {
             term.hold_input_until(Instant::now());
         }
-        if out.dismiss && exit.is_none() {
+        if (out.dismiss || verdict.esc) && exit.is_none() {
             // Leaving a page is a deliberate click: it reaches omp whatever else holds the input.
             term.hold_input_until(Instant::now());
             let esc = |pressed| Event::Key {
@@ -422,6 +457,7 @@ impl<'a> ChatView<'a> {
             response,
             open_url: out.open_url,
             refused,
+            redirect: redirected.or(out.redirect),
         }
     }
 }
@@ -607,6 +643,8 @@ mod tests {
         modifiers: Modifiers,
         hide_duplicates: bool,
         width: f32,
+        /// The redirects the view reported, in order.
+        redirects: Vec<Redirect>,
     }
 
     impl Harness {
@@ -648,19 +686,8 @@ mod tests {
         }
 
         fn spawn(name: &str, frames: &[serde_json::Value], after: &[u8], gated: bool) -> Harness {
-            let dir =
-                std::env::temp_dir().join(format!("omp-deck-chat-{name}-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
             // The recording starts after omp's `hello`: say it again (edit-capable, as 18.15.0).
-            let hello = serde_json::json!({
-                "q": "hello", "v": [1], "app": "omp", "ver": "18.15.0",
-                "features": ["edit", "undo", "send"],
-            });
-            let mut wire = deck_tsp::stream::encode_message(
-                deck_tsp::stream::Verb::Query,
-                &[],
-                &serde_json::to_vec(&hello).expect("hello JSON"),
-            );
+            let mut wire = hello_wire();
             wire.extend(snap::tests::fixture_wire(0..usize::MAX).concat());
             for (i, ops) in frames.iter().enumerate() {
                 let body = serde_json::json!({"sf": "s:1", "s": 64 + i, "ops": ops});
@@ -670,6 +697,61 @@ mod tests {
                     &serde_json::to_vec(&body).expect("frame JSON"),
                 ));
             }
+            Harness::spawn_wire(name, wire, after, gated)
+        }
+
+        /// A session in the state omp 18.16.0 was recorded in for `case` of
+        /// `redirect-fixtures.json` (its surfaces, each in one frame), then `frames` (ops of
+        /// surface `s:1`) on top, all present when this returns.
+        fn redirect_case(name: &str, case: &str, frames: &[serde_json::Value]) -> Harness {
+            Harness::redirect_case_on(name, case, "s:1", frames)
+        }
+
+        /// [`Harness::redirect_case`] with `frames` addressed to surface `on` (e.g. the page).
+        fn redirect_case_on(
+            name: &str,
+            case: &str,
+            on: &str,
+            frames: &[serde_json::Value],
+        ) -> Harness {
+            use deck_tsp::stream::{Verb, encode_message};
+            let msg = |verb, body: &serde_json::Value| {
+                encode_message(verb, &[], &serde_json::to_vec(body).expect("JSON"))
+            };
+            let fixtures: serde_json::Value =
+                serde_json::from_str(include_str!("redirect-fixtures.json"))
+                    .expect("redirect fixture");
+            let case = &fixtures["cases"][case];
+            let mut wire = hello_wire();
+            let mut last = Vec::new();
+            for surface in case["surfaces"].as_array().expect("surfaces") {
+                let sf = surface["open"]["id"].as_str().expect("surface id");
+                wire.extend(msg(Verb::Open, &surface["open"]));
+                wire.extend(msg(
+                    Verb::Frame,
+                    &serde_json::json!({"sf": sf, "s": 1, "ops": surface["ops"]}),
+                ));
+                last.push((sf.to_owned(), 1 + if sf == on { frames.len() } else { 0 }));
+            }
+            for (i, ops) in frames.iter().enumerate() {
+                wire.extend(msg(
+                    Verb::Frame,
+                    &serde_json::json!({"sf": on, "s": 2 + i, "ops": ops}),
+                ));
+            }
+            let mut h = Harness::spawn_wire(name, wire, &[], false);
+            let want = last;
+            h.wait_for("every recorded frame arrived", |d| {
+                want.iter()
+                    .all(|(sf, seq)| d.surface(sf).and_then(|s| s.last_seq()) == Some(*seq as u64))
+            });
+            h
+        }
+
+        fn spawn_wire(name: &str, wire: Vec<u8>, after: &[u8], gated: bool) -> Harness {
+            let dir =
+                std::env::temp_dir().join(format!("omp-deck-chat-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
             std::fs::write(dir.join("frames"), wire).expect("frames file");
             std::fs::write(dir.join("later"), after).expect("later file");
             let script = if !gated {
@@ -707,6 +789,7 @@ mod tests {
                 modifiers: Modifiers::NONE,
                 hide_duplicates: false,
                 width: 900.0,
+                redirects: Vec::new(),
             };
             let until = Instant::now() + Duration::from_secs(10);
             while !(h.term.tsp().live() && h.term.tsp().revision() > 0) {
@@ -732,6 +815,7 @@ mod tests {
             self.time += 0.05;
             let term = &mut self.term;
             let opened = &mut self.opened;
+            let redirects = &mut self.redirects;
             let hide_duplicates = self.hide_duplicates;
             let mut id = egui::Id::NULL;
             // As in the app: clicks on the chat's own widgets do not take its keyboard focus away.
@@ -745,6 +829,7 @@ mod tests {
                     .show(ui);
                 id = shown.response.id;
                 opened.extend(shown.open_url);
+                redirects.extend(shown.redirect);
             });
             out.textures_delta.clear();
             self.id = id;
@@ -2497,5 +2582,367 @@ mod tests {
             got[0]
         );
         assert!(got[0].contains("1. one\n2. two"), "{:?}", got[0]);
+    }
+
+    // ---- redirects -------------------------------------------------------------------------
+
+    /// omp's `hello` (the recordings start after it): edit-capable, like 18.15.0 and later.
+    fn hello_wire() -> Vec<u8> {
+        let hello = serde_json::json!({
+            "q": "hello", "v": [1], "app": "omp", "ver": "18.15.0",
+            "features": ["edit", "undo", "send"],
+        });
+        deck_tsp::stream::encode_message(
+            deck_tsp::stream::Verb::Query,
+            &[],
+            &serde_json::to_vec(&hello).expect("hello JSON"),
+        )
+    }
+
+    fn enter(pressed: bool, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key: Key::Enter,
+            physical_key: Some(Key::Enter),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// A plain Enter, press and release in one frame.
+    fn submit() -> Vec<Event> {
+        vec![enter(true, Modifiers::NONE), enter(false, Modifiers::NONE)]
+    }
+
+    /// omp's next frame: the composer holds `text` and no menu is open.
+    fn composer_text(text: &str) -> serde_json::Value {
+        serde_json::json!([
+            ["set", "j.line/input", {"text": text, "cursor": text.chars().count()}],
+            ["del", "j.^complete"]
+        ])
+    }
+
+    /// Types `z` and waits for it to reach omp: everything sent before it is in the child's
+    /// input by then. Returns the `edit`s and the plain input.
+    fn barrier(h: &mut Harness) -> (Vec<serde_json::Value>, String) {
+        h.frame(vec![
+            Event::Key {
+                key: Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Text("z".into()),
+        ]);
+        let typed = h.typed(b"z");
+        (edits(&typed), plain_input(&typed))
+    }
+
+    fn ready(name: &str, case: &str, frames: &[serde_json::Value]) -> Harness {
+        let mut h = Harness::redirect_case(name, case, frames);
+        h.focus();
+        h.settle();
+        h
+    }
+
+    /// What a plain Enter does to the case's composer: the redirects it reports and what reaches omp.
+    fn press_enter(h: &mut Harness) -> (Vec<serde_json::Value>, String) {
+        h.redirects.clear();
+        h.frame(submit());
+        barrier(h)
+    }
+
+    #[test]
+    fn a_typed_redirecting_command_opens_the_ompdeck_screen_and_omp_never_sees_it() {
+        let cases = [
+            (
+                "typed-settings",
+                "/settings",
+                Redirect::OmpSettings { page: None },
+            ),
+            // Enter takes what the slash menu has selected, not what is typed.
+            ("typed-set", "/set", Redirect::OmpSettings { page: None }),
+            ("typed-switch", "/switch", Redirect::ModelPicker),
+            ("typed-usage", "/usage", Redirect::Usage { reset: false }),
+            (
+                "typed-resume",
+                "/resume",
+                Redirect::Resume { foreign: None },
+            ),
+            ("typed-tree", "/tree", Redirect::Tree),
+            // omp's menu of `/advisor`'s arguments is open with `configure` selected.
+            (
+                "typed-advisor",
+                "/advisor configure",
+                Redirect::OmpSettings {
+                    page: Some("advisor".into()),
+                },
+            ),
+        ];
+        for (case, text, want) in cases {
+            let mut h = ready(&format!("rd-{case}"), case, &[]);
+            let (edits, plain) = press_enter(&mut h);
+            assert_eq!(h.redirects, [want], "{case}");
+            // The composer is cleared by exactly one edit (typing the barrier is no edit).
+            assert_eq!(edits.len(), 1, "{case}: {edits:?}");
+            assert_eq!(
+                (
+                    edits[0]["from"].as_u64(),
+                    edits[0]["to"].as_u64(),
+                    edits[0]["text"].as_str()
+                ),
+                (Some(0), Some(text.len() as u64), Some("")),
+                "{case}"
+            );
+            assert!(
+                !plain.contains('\r'),
+                "{case}: omp got the Enter: {plain:?}"
+            );
+            // The release that comes in a later frame is not omp's either.
+            h.frame(vec![]);
+            assert!(!plain_input(&h.typed(b"z")).contains('\r'), "{case}");
+        }
+    }
+
+    #[test]
+    fn arguments_that_make_omp_act_directly_pass_through_and_the_rest_resolves_by_its_argument() {
+        let usage = |reset| Some(Redirect::Usage { reset });
+        let advisor = || {
+            Some(Redirect::OmpSettings {
+                page: Some("advisor".into()),
+            })
+        };
+        let cases = [
+            ("/usage show", usage(false)),
+            ("/usage reset", usage(true)),
+            (
+                "/resume @claude",
+                Some(Redirect::Resume {
+                    foreign: Some(deck_core::omp::ForeignSource::Claude),
+                }),
+            ),
+            (
+                "/resume @codex",
+                Some(Redirect::Resume {
+                    foreign: Some(deck_core::omp::ForeignSource::Codex),
+                }),
+            ),
+            ("/usage reset fake/x", None),
+            ("/resume 01a1712d", None),
+            ("/switch fake/fake-1", None),
+            ("/model", None),
+            ("hello /tree", None),
+            ("/advisor configure", advisor()),
+            ("/advisor on", None),
+            ("/advisor configure now", None),
+        ];
+        for (i, (text, want)) in cases.into_iter().enumerate() {
+            let mut h = ready(&format!("rd-arg{i}"), "typed-usage", &[composer_text(text)]);
+            let (edits, plain) = press_enter(&mut h);
+            assert_eq!(
+                h.redirects,
+                want.clone().into_iter().collect::<Vec<_>>(),
+                "{text}"
+            );
+            assert_eq!(plain.contains('\r'), want.is_none(), "{text}: {plain:?}");
+            // Redirected: the composer is cleared by one edit. Not: omp's composer is untouched.
+            assert_eq!(
+                edits.len(),
+                usize::from(want.is_some()),
+                "{text}: {edits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_in_a_menu_of_arguments_and_shift_enter_are_omps() {
+        // `/switch ` with its model menu open: Enter picks the selected model.
+        let mut h = ready("rd-args-menu", "typed-switch-args", &[]);
+        let (_, plain) = press_enter(&mut h);
+        assert!(h.redirects.is_empty() && plain.contains('\r'), "{plain:?}");
+
+        let mut h = ready("rd-shift", "typed-settings", &[]);
+        h.modifiers = Modifiers::SHIFT;
+        h.frame(vec![
+            enter(true, Modifiers::SHIFT),
+            enter(false, Modifiers::SHIFT),
+        ]);
+        h.modifiers = Modifiers::NONE;
+        let (_, plain) = barrier(&mut h);
+        assert!(h.redirects.is_empty() && plain.contains('\r'), "{plain:?}");
+    }
+
+    #[test]
+    fn typing_is_applied_at_omps_caret_so_only_an_append_at_the_end_resolves_a_command() {
+        // omp's composer holds `/setting`; the frame types `s` and submits.
+        let at = |cursor: usize, anchor: Option<usize>| {
+            let mut props = serde_json::json!({"text": "/setting", "cursor": cursor});
+            if let Some(anchor) = anchor {
+                props["anchor"] = anchor.into();
+            }
+            serde_json::json!([["set", "j.line/input", props], ["del", "j.^complete"]])
+        };
+        let key_s = |pressed| Event::Key {
+            key: Key::S,
+            physical_key: Some(Key::S),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // (caret, anchor, whether the typed `s` extends the text to `/settings`)
+        let cases = [
+            (8, None, true),
+            (8, Some(8), true),
+            (0, None, false),
+            (4, None, false),
+            (8, Some(3), false),
+            (3, Some(8), false),
+        ];
+        for (i, (cursor, anchor, redirects)) in cases.into_iter().enumerate() {
+            let mut h = ready(
+                &format!("rd-caret{i}"),
+                "typed-settings",
+                &[at(cursor, anchor)],
+            );
+            h.frame(vec![
+                key_s(true),
+                Event::Text("s".into()),
+                key_s(false),
+                enter(true, Modifiers::NONE),
+                enter(false, Modifiers::NONE),
+            ]);
+            let want: Vec<Redirect> = redirects
+                .then_some(Redirect::OmpSettings { page: None })
+                .into_iter()
+                .collect();
+            assert_eq!(h.redirects, want, "caret {cursor}, anchor {anchor:?}");
+            let (_, plain) = barrier(&mut h);
+            assert_eq!(
+                plain.contains("s\r"),
+                !redirects,
+                "caret {cursor}, anchor {anchor:?}: omp's input {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_typed_and_submitted_in_one_frame_never_reaches_omp() {
+        let mut h = ready("rd-fast", "idle", &[]);
+        h.frame(vec![
+            Event::Text("/usage".into()),
+            enter(true, Modifiers::NONE),
+            enter(false, Modifiers::NONE),
+        ]);
+        assert_eq!(h.redirects, [Redirect::Usage { reset: false }]);
+        let (edits, plain) = barrier(&mut h);
+        assert!(
+            edits.is_empty(),
+            "omp's composer was empty: nothing to clear"
+        );
+        assert_eq!(plain, "z", "neither the text nor the Enter reached omp");
+    }
+
+    #[test]
+    fn an_omp_screen_opened_any_other_way_is_redirected_closed_and_never_drawn() {
+        let page = Redirect::OmpSettings {
+            page: Some("appearance".into()),
+        };
+        // (case, redirect, a text omp's own screen paints and the redirect must not show)
+        let cases = [
+            ("alt-p", Redirect::ModelPicker, Some("Switch model")),
+            ("settings-page", page, Some("omp settings")),
+            (
+                "usage-overlay",
+                Redirect::Usage { reset: false },
+                Some("Usage"),
+            ),
+            ("resume-picker", Redirect::Resume { foreign: None }, None),
+            ("tree-picker", Redirect::Tree, Some("Session tree")),
+        ];
+        for (case, want, title) in cases {
+            let mut h = Harness::redirect_case(&format!("rd-caught-{case}"), case, &[]);
+            h.focus();
+            let out = h.settle();
+            assert_eq!(h.redirects, [want], "{case}");
+            if let Some(title) = title {
+                assert!(text_at(&out, title).is_empty(), "{case}: {title} was drawn");
+            }
+            assert!(
+                escapes(&mut h, 1) >= 1,
+                "{case}: omp was not asked to close it"
+            );
+            // omp still shows it a frame later: still not drawn, not redirected again.
+            for _ in 0..3 {
+                let out = h.frame(vec![]);
+                if let Some(title) = title {
+                    assert!(text_at(&out, title).is_empty(), "{case}");
+                }
+            }
+            assert_eq!(h.redirects.len(), 1, "{case}: redirected again");
+        }
+    }
+
+    #[test]
+    fn omps_advisor_editor_and_its_installed_tab_land_on_ompdecks_pages() {
+        let advisor = Redirect::OmpSettings {
+            page: Some("advisor".into()),
+        };
+        // Opened by anything but the typed command (a menu click, an omp action).
+        let mut h = Harness::redirect_case("rd-advisor-page", "advisor-page", &[]);
+        h.focus();
+        let out = h.settle();
+        assert_eq!(h.redirects, [advisor]);
+        assert!(
+            text_at(&out, "Back to chat").is_empty(),
+            "the page is not drawn"
+        );
+        assert!(escapes(&mut h, 1) >= 1, "omp was asked to close it");
+        h.frame(vec![]);
+        assert_eq!(h.redirects.len(), 1, "redirected again");
+
+        // omp's settings sheet on its Installed tab: OmpDeck's page of that id.
+        let tab = serde_json::json!([["set", "13", {"page": "plugins"}]]);
+        let mut h = Harness::redirect_case_on("rd-installed", "settings-page", "s:2", &[tab]);
+        h.focus();
+        h.settle();
+        let plugins = Redirect::OmpSettings {
+            page: Some("plugins".into()),
+        };
+        assert_eq!(h.redirects, [plugins]);
+    }
+
+    #[test]
+    fn omps_own_model_hub_and_other_overlays_stay_omps() {
+        let mut h = ready("rd-hub", "alt-m", &[]);
+        h.frame(vec![]);
+        assert!(
+            h.redirects.is_empty(),
+            "the Alt+M hub is not the Alt+P picker"
+        );
+
+        let jobs: serde_json::Value =
+            serde_json::from_str(include_str!("jobs-overlay.json")).expect("jobs fixture");
+        let mut h = ready("rd-jobs", "idle", &[jobs]);
+        let out = h.settle();
+        assert!(h.redirects.is_empty(), "/jobs is omp's own overlay");
+        assert!(!text_at(&out, "Background jobs").is_empty());
+    }
+
+    #[test]
+    fn the_composers_model_and_cost_facts_open_ompdecks_own() {
+        let frames = [serde_json::json!([["set", "j.bar/usage", {"text": "$0.42"}]])];
+        let mut h = Harness::redirect_case("rd-facts", "idle", &frames);
+        h.hide_duplicates = false;
+        let out = h.settle();
+        for (text, want) in [
+            ("$0.42", Redirect::Usage { reset: false }),
+            ("Fake One", Redirect::ModelPicker),
+        ] {
+            h.redirects.clear();
+            let at = centre_of(&out, text).unwrap_or_else(|| panic!("{text} is painted"));
+            click_at(&mut h, at);
+            assert_eq!(h.redirects, [want], "{text}");
+        }
     }
 }

@@ -31,7 +31,9 @@ use crate::usage_view;
 use crate::{card, tips};
 use deck_core::usage::LimitStatus;
 
-use crate::model_picker::{self, ModelsCache, PickerAction, PickerInput, PickerState};
+use crate::model_picker::{
+    self, ModelsCache, PickerAction, PickerInput, PickerState, SessionExtras,
+};
 use crate::theme::{self, Palette};
 use crate::widgets::{icon_text, menu_item, paint_icon};
 use deck_service::gateway::protocol::SwitchInfo;
@@ -480,6 +482,9 @@ fn context_tooltip(tokens: Option<u64>, window: Option<u64>, pct: Option<f64>) -
 #[derive(Debug, PartialEq, Eq)]
 pub enum BarAction {
     Picker(PickerAction),
+    /// Task mode of the model picker: set (`Some(provider/id)`) or clear (`None`) the session's
+    /// task-agent model override.
+    TaskModel(Option<String>),
     Run(Action),
     AskHandoff,
     AskCompactFocus,
@@ -503,6 +508,8 @@ pub struct BarInput<'a> {
     pub assumed: Option<&'a SwitchInfo>,
     pub actions: ActionCtx,
     pub agents: AgentsChip,
+    /// What the model picker needs of the active tab beyond its model (task agents, roles).
+    pub session: SessionExtras<'a>,
 }
 
 /// What the status bar's "Agents" chip shows.
@@ -1246,7 +1253,8 @@ fn model_chip(
                             .get(s)
                             .map_or_else(|| s.clone(), |m| m.name.clone()),
                         (None, Some(l)) => format!("thinking {l}"),
-                        (None, None) => String::new(),
+                        // A role alias (`@smol`): omp resolves it, the deck cannot name the model.
+                        (None, None) => "model".to_owned(),
                     }
                 ),
                 TEXT_PX,
@@ -1355,7 +1363,7 @@ fn model_chip(
     } else {
         model_hover(&resp, &v.model_tip);
     }
-    let acts = model_picker::show(
+    let acts = model_picker::show_session(
         &resp,
         picker,
         &PickerInput {
@@ -1366,8 +1374,10 @@ fn model_chip(
             provider: input.provider,
             unset: "Current model unknown yet",
         },
+        &input.session,
     );
-    out.extend(acts.into_iter().map(BarAction::Picker));
+    out.extend(acts.actions.into_iter().map(BarAction::Picker));
+    out.extend(acts.task_model.map(BarAction::TaskModel));
 }
 
 /// Thinking glyph: ring + pie sector (clockwise from 12 o'clock); `None` = off (slashed ring).
@@ -2273,6 +2283,10 @@ mod centering_tests {
             assumed: None,
             actions: ActionCtx::default(),
             agents: AgentsChip::default(),
+            session: SessionExtras {
+                tab: 0,
+                task_unavailable: None,
+            },
         };
         let screen_h = 700.0;
         let raw = egui::RawInput {
@@ -2347,6 +2361,10 @@ mod centering_tests {
             assumed: None,
             actions: ActionCtx::default(),
             agents: AgentsChip::default(),
+            session: SessionExtras {
+                tab: 0,
+                task_unavailable: None,
+            },
         };
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 700.0))),
