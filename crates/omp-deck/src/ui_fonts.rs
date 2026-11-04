@@ -118,6 +118,7 @@ static FACES: [(UiFont, &str, &[u8]); 18] = [
 /// Font-data key of the face of the flat styles' default UI font.
 const NEUTRAL_FACE_KEY: &str = "ui-font-jetbrains-mono";
 static LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
+static NERD_SYMBOLS: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 /// Name of the UI text family of `FACES[i]`: that face, then the whole Proportional chain.
 fn text_family_name(i: usize) -> String {
@@ -239,10 +240,9 @@ fn neutral_family() -> FontFamily {
     FontFamily::Name(NEUTRAL_FAMILY.into())
 }
 
-/// Installs every bundled UI face (heading its preview family and its UI text family, so both
-/// exist from the first frame; JetBrains Mono also heads the Neutral family), the icon font and
-/// the preloaded system UI faces (no I/O). The first system face becomes the primary
-/// Proportional face; the rest are appended as extra glyph fallbacks.
+/// Installs bundled UI and icon faces, plus available system UI faces. Nerd Font Symbols supplies
+/// private-use glyphs commonly present in session titles; Lucide supplies OmpDeck's app icons.
+/// The first system face is the primary Proportional face; all later faces become glyph fallbacks.
 pub fn install(ctx: &Context, fonts: UiFonts) {
     for (i, (_, key, bytes)) in FACES.iter().enumerate() {
         let mut families = vec![
@@ -295,6 +295,14 @@ pub fn install(ctx: &Context, fonts: UiFonts) {
             },
         ],
     ));
+    ctx.add_font(FontInsert::new(
+        "nerd-font-symbols",
+        FontData::from_static(NERD_SYMBOLS),
+        vec![InsertFontFamily {
+            family: FontFamily::Proportional,
+            priority: FontPriority::Lowest,
+        }],
+    ));
 }
 
 /// `first` followed by every other face of the Proportional chain `prop`, in order.
@@ -304,12 +312,10 @@ fn chain(first: &str, prop: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Makes the Neutral family and every bundled face's UI text family that face followed by every
-/// Proportional face in order (system UI faces, egui's emoji faces, deck-term's symbol / CJK /
-/// color-emoji fallbacks, Lucide), so none covers fewer glyphs than Neon. Call once from the
-/// first frame, when the final definitions (after every queued `add_font`) are readable.
-/// Every UI font choice is prepared here, so switching fonts later only selects another family:
-/// a runtime `set_fonts` would rebuild the glyph atlas under every cached galley.
+/// Makes the Neutral family and every bundled face's UI text family that face followed by the full
+/// Proportional chain (system UI faces, deck-term symbols, emoji, Lucide, Nerd Font Symbols), so no
+/// bundled choice covers fewer glyphs than the default. Call once after queued font inserts settle.
+/// Font choices are prepared once; runtime `set_fonts` would rebuild glyph atlases under cached galleys.
 pub fn finalize(ctx: &Context) {
     let mut defs: FontDefinitions = ctx.fonts(|f| f.definitions().clone());
     let prop = defs
@@ -379,5 +385,24 @@ mod tests {
             assert_eq!(chain[0], *key);
             assert_eq!(&chain[1..], prop.as_slice(), "{font:?}");
         }
+    }
+    #[test]
+    fn nerd_font_private_use_glyphs_resolve_through_proportional_fallback() {
+        let ctx = Context::default();
+        install(&ctx, UiFonts::none());
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        finalize(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        let width = ctx.fonts_mut(|fonts| {
+            fonts.glyph_width(
+                &egui::FontId::new(14.0, FontFamily::Proportional),
+                '\u{f082b}',
+            )
+        });
+        assert!(width > 0.0, "Nerd Font U+F082B must resolve to a glyph");
     }
 }
