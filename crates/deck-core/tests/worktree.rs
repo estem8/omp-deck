@@ -853,7 +853,8 @@ fn branch_state_reports_existence_checkout_and_squash_merge() {
 #[cfg(unix)]
 #[test]
 fn add_existing_runs_omp_worktree_add_without_dash_b_and_checks_the_branch_out() {
-    use std::os::unix::fs::PermissionsExt;
+    // The script reaches its executed inode through `install` (another process), so no
+    // sibling test's fork can inherit a write fd to it (exec would fail with ETXTBSY).
     let f = fixture();
     let parked = linked(&f, "pa", "wt/parked");
     commit(&parked.path, "pa.txt", "work");
@@ -864,15 +865,22 @@ fn add_existing_runs_omp_worktree_add_without_dash_b_and_checks_the_branch_out()
 
     let log = f.root.join("args.log");
     let fake = f.root.join("omp");
+    let stage = f.root.join("omp.src");
     fs::write(
-        &fake,
+        &stage,
         format!(
             "#!/bin/sh\necho \"$@\" > '{log}'\necho \"$PI_CONFIG_FILES\" >> '{log}'\nexec git -C \"$5\" worktree add -q \"$6\" \"$7\"\n",
             log = log.display()
         ),
     )
     .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let installed = Command::new("install")
+        .args(["-m", "755"])
+        .arg(&stage)
+        .arg(&fake)
+        .status()
+        .unwrap();
+    assert!(installed.success());
     let omp = Omp::at(&fake).with_env("XDG_DATA_HOME", f.root.join("data"));
 
     let dest = f.root.join("again");

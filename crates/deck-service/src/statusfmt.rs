@@ -1,9 +1,6 @@
 //! Pure formatting/decision helpers for the status bar, mirroring omp's own status line
 //! (docs/notes/omp-status.md §1.3, §2c): token formatter, context thresholds, title glyph.
 
-use std::path::Path;
-
-use deck_core::sessions::abbreviate_home;
 use deck_term::{RunPhase, RunState, Terminal, TspFacts};
 
 /// omp's token formatter: `999`, `1.2K`, `23K`, `1M`, `1.5M`, `120M`, `2.5B`.
@@ -205,11 +202,6 @@ pub fn thinking_short(level: &str) -> &str {
         "medium" => "med",
         other => other,
     }
-}
-
-/// `~`-abbreviated directory, left-ellipsized to `max_chars` (omp truncates the left side).
-pub fn display_path(cwd: &Path, max_chars: usize) -> String {
-    ellipsize_left(&abbreviate_home(cwd), max_chars)
 }
 
 pub fn ellipsize_left(s: &str, max_chars: usize) -> String {

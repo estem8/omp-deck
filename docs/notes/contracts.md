@@ -986,8 +986,8 @@ tuned for contrast on white (zinc/tailwind-600 family). OSC 10/11/4 replies foll
 - Icons: lucide icon font (ISC; license shipped) replaces Material Symbols everywhere (both styles);
   `egui_material_icons` dependency removed.
 - Density Compact: tighter sidebar rows/headers, tab row, title row, menus, tree/picker rows, paddings.
-  The status bar keeps its user-tuned size (41 px bar, model chip 1.3 × 213 px in every session, at most 52 % of
-  the bar; it does not follow the path chip, so a long worktree path cannot push usage out).
+  The status bar keeps its user-tuned size (bar height and model chip width in `statusbar.rs`; since 0.26.1 the model
+  chip yields toward `MODEL_CHIP_MIN` so Ctx + Usage fit, and the path chip is elastic, so a long path cannot push usage out).
 - Settings → Appearance: Theme (Dark/Light), Style (Neutral/Midnight neon), Density (Compact/Comfortable);
   live switch, persisted.
 - Sidebar expansion: open(group) = filtering || override(group) ?? (group == active tab's project group).
@@ -1071,8 +1071,10 @@ shape, stats.db schema, extension imports, timings).
 - Usage state owned by the app: background worker runs `fetch_usage` ~3 s after startup, every 5 min,
   when the Usage view opens and data is > 60 s old, and on manual refresh (`Mutation::UsageRefresh`, no fields); and
   `activity` when the view opens (≥ 10 min apart). UI thread never blocks.
-- Status bar **usage chip** (gauge icon + tightest `NN% left`, coloured by status; dropped first when
-  narrow; hidden when there are no reports). Hover: compact per-provider cards (bars = remaining,
+- Status bar **usage chip** (gauge icon + one pill per window of the model's provider, 5 h / weekly; fallback tightest
+  `NN% left`; coloured by status). Since 0.26.1 segment priority is Ctx, Usage, Git, Cost, Tokens, Path (path elided from
+  the front as `…/last/folders` into the leftover width, dropped below its last folder); hidden when there are no reports.
+  Hover: compact per-provider cards (bars = remaining,
   `resets in …`). Click, ⋯ menu "Usage…", app menu, Ctrl+Shift+U → **Usage view**. A multi-account provider shows
   one account in the chip and in the hover, both from `usage_view::shown_page`: the page whose report matches the
   focused tab's `LiveSnapshot.account` (`CardView::in_use`, same provider only; labelled `email · in use`, or

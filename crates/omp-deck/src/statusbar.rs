@@ -16,6 +16,7 @@ use crate::icons::{
 };
 use deck_core::ctl::{ContextBreakdown, LiveAccount, LiveModel};
 use deck_core::omp::ModelInfo;
+use deck_core::sessions::abbreviate_home;
 use deck_core::status::{GitInfo, SessionStats, SessionStatus};
 use egui::{
     Align, Align2, Color32, CursorIcon, Frame, Layout, Margin, Painter, Pos2, Rect, Response,
@@ -50,7 +51,11 @@ use deck_service::statusfmt::{
 /// inside 26 px pills (was 29) on a 40 px strip (was 41).
 pub const BAR_H: f32 = 40.0;
 const CHIP_H: f32 = 26.0;
-const PATH_CHARS: usize = 44;
+/// The path chip never shrinks below its last component, ellipsized to this many characters.
+const PATH_MIN_CHARS: usize = 20;
+/// The path's available width is rounded down to a multiple of this (px) before it is elided, so
+/// dragging the sidebar does not re-measure the path every pixel.
+const PATH_STEP: f32 = 8.0;
 const CHIP_PAD: f32 = 8.0;
 /// Horizontal space a chip adds around its content: both pads plus the one item gap measured
 /// on screen (so a chip asked to be N px wide really is N px wide).
@@ -148,6 +153,7 @@ pub struct BarView {
     pub configured: Option<String>,
     pub model_tip: ModelTip,
 
+    /// The working directory, `~`-abbreviated and whole: the chip elides it to the room it gets.
     pub path_text: String,
     pub path_full: String,
 
@@ -346,7 +352,7 @@ impl BarView {
         );
 
         self.path_full = s.cwd.to_string_lossy().into_owned();
-        self.path_text = statusfmt::display_path(&s.cwd, PATH_CHARS);
+        self.path_text = abbreviate_home(&s.cwd);
 
         self.git = s.git.as_ref().map(git_view);
 
@@ -606,38 +612,47 @@ fn paint_strip(p: &Painter, rect: Rect, ink: &Ink) {
     );
 }
 
-/// The droppable segments of the info row, most important first.
+/// The droppable segments of the info row in priority order (the discriminant is the index into
+/// [`SEGS`] and [`SegWidths::w`]): the least important goes first when the bar narrows. Path comes
+/// last: it keeps only its last folder when nothing else is dropped, and grows into the room the
+/// rest leaves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Seg {
     Ctx,
+    Usage,
     Git,
-    Path,
     Cost,
     Tokens,
-    Usage,
+    Path,
 }
 
 const SEGS: [Seg; 6] = [
     Seg::Ctx,
+    Seg::Usage,
     Seg::Git,
-    Seg::Path,
     Seg::Cost,
     Seg::Tokens,
-    Seg::Usage,
+    Seg::Path,
 ];
+
+type SegKey = (
+    u64,
+    Option<usize>,
+    u32,
+    deck_core::config::UiFont,
+    &'static str,
+);
 
 /// Real widths (the chip, without the spacing before it) of every segment for one view
 /// revision, usage chip page and pixel density.
 #[derive(Clone, Copy)]
 struct SegWidths {
-    key: (
-        u64,
-        Option<usize>,
-        u32,
-        deck_core::config::UiFont,
-        &'static str,
-    ),
+    key: SegKey,
+    /// The path's entry is its smallest chip (last folder only).
     w: [f32; 6],
+    /// What the path chip adds around its text, and the width of the whole path as text.
+    path_chrome: f32,
+    path_text_w: f32,
 }
 
 /// Lays `f` out once in an invisible child and returns the width it took.
@@ -654,7 +669,19 @@ fn measure(ui: &mut Ui, f: impl FnOnce(&mut Ui)) -> f32 {
     child.min_rect().width()
 }
 
-fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> [f32; 6] {
+/// Width of `s` as chip text.
+fn text_width(ui: &Ui, s: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            s.to_owned(),
+            theme::label_font(TEXT_PX),
+            Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+}
+
+fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> SegWidths {
     let key = (
         v.rev,
         // The pager's pick lives in egui memory, outside `rev`.
@@ -668,15 +695,88 @@ fn seg_widths(ui: &mut Ui, ink: &Ink, v: &BarView) -> [f32; 6] {
     if let Some(c) = ui.data(|d| d.get_temp::<SegWidths>(id))
         && c.key == key
     {
-        return c.w;
+        return c;
     }
     let mut w = [0.0; 6];
     let mut sink = Vec::new();
     for (i, s) in SEGS.into_iter().enumerate() {
-        w[i] = measure(ui, |ui| segment(ui, ink, v, s, &mut sink));
+        w[i] = if s == Seg::Path {
+            let min = elide_path(&v.path_text, |_| false);
+            measure(ui, |ui| segment(ui, ink, v, s, &min, &mut sink))
+        } else {
+            measure(ui, |ui| segment(ui, ink, v, s, "", &mut sink))
+        };
     }
-    ui.data_mut(|d| d.insert_temp(id, SegWidths { key, w }));
-    w
+    let path_text_w = text_width(ui, &v.path_text);
+    let path_full = measure(ui, |ui| {
+        segment(ui, ink, v, Seg::Path, &v.path_text, &mut sink);
+    });
+    let c = SegWidths {
+        key,
+        w,
+        path_chrome: path_full - path_text_w,
+        path_text_w,
+    };
+    ui.data_mut(|d| d.insert_temp(id, c));
+    c
+}
+
+/// `path` shortened from the front until `fits`: the whole path, then `…/` and fewer and fewer
+/// of its trailing folders, down to the last one (itself ellipsized to [`PATH_MIN_CHARS`]), which
+/// is returned when nothing fits.
+fn elide_path(path: &str, mut fits: impl FnMut(&str) -> bool) -> String {
+    if fits(path) {
+        return path.to_owned();
+    }
+    // A separator that starts a component (not the leading or the trailing one) is a cut point.
+    let cuts = path.char_indices().filter_map(|(i, c)| {
+        (i > 0 && matches!(c, '/' | '\\') && i + c.len_utf8() < path.len()).then_some(i)
+    });
+    let mut last = String::new();
+    for i in cuts {
+        last = format!("…{}", &path[i..]);
+        if fits(&last) {
+            return last;
+        }
+    }
+    if last.is_empty() {
+        last = path.to_owned();
+    }
+    statusfmt::ellipsize_left(&last, PATH_MIN_CHARS)
+}
+
+type PathKey = (u64, u32, u32, deck_core::config::UiFont, &'static str);
+
+/// The path chip's text for a chip `chip_w` wide, elided once per view revision and width step
+/// (the cache holds a shared string, so a frame that hits it allocates nothing).
+fn path_text(ui: &Ui, v: &BarView, w: &SegWidths, chip_w: f32) -> Arc<str> {
+    let room = chip_w - w.path_chrome;
+    let step = if room >= w.path_text_w {
+        u32::MAX
+    } else {
+        (room.max(0.0) / PATH_STEP) as u32
+    };
+    let key: PathKey = (
+        v.rev,
+        step,
+        ui.ctx().pixels_per_point().to_bits(),
+        theme::ui_font(),
+        theme::style().key(),
+    );
+    let id = ui.scope_id().with("path-text");
+    if let Some((k, text)) = ui.data(|d| d.get_temp::<(PathKey, Arc<str>)>(id))
+        && k == key
+    {
+        return text;
+    }
+    let limit = if step == u32::MAX {
+        f32::INFINITY
+    } else {
+        step as f32 * PATH_STEP
+    };
+    let text: Arc<str> = elide_path(&v.path_text, |t| text_width(ui, t) <= limit).into();
+    ui.data_mut(|d| d.insert_temp(id, (key, text.clone())));
+    text
 }
 
 fn info_row(
@@ -691,13 +791,8 @@ fn info_row(
 
     activity_dot(ui, input.activity);
     ui.add_space(2.0);
-    // The model chip has one width in every session, but never takes over the bar.
     let widths = seg_widths(ui, ink, v);
     let gap = ui.spacing().item_spacing.x;
-    let (chip_w, cap) = model_chip_width(ui.available_width());
-    model_chip(ui, ink, v, picker, input, (chip_w, cap), out);
-
-    // Priority-based fit on measured widths: drop the least important segments first.
     let present = SEGS.map(|s| match s {
         Seg::Git => v.git.is_some(),
         Seg::Cost => v.show_cost,
@@ -705,7 +800,23 @@ fn info_row(
         Seg::Usage => v.usage.as_ref().is_some_and(|u| u.chip.is_some()),
         Seg::Ctx | Seg::Path => true,
     });
-    let shown = fit_segments(&widths, &present, ui.available_width() - gap, gap);
+    // The model chip has one width in every session, but never takes over the bar: it yields
+    // down to its minimum for the context meter and the usage chip.
+    let keep: f32 = [Seg::Ctx, Seg::Usage]
+        .into_iter()
+        .filter(|s| present[*s as usize])
+        .map(|s| widths.w[s as usize] + gap)
+        .sum();
+    let (chip_w, cap) = model_chip_width(ui.available_width(), keep + gap);
+    model_chip(ui, ink, v, picker, input, (chip_w, cap), out);
+
+    // Priority-based fit on measured widths: drop the least important segments first.
+    let budget = ui.available_width() - gap;
+    let shown = fit_segments(&widths.w, &present, budget, gap);
+    // The path chip grows into what the others leave.
+    let spare = budget - spent(&widths.w, &shown, gap);
+    let path = shown[Seg::Path as usize]
+        .then(|| path_text(ui, v, &widths, widths.w[Seg::Path as usize] + spare));
     // Drawn in reading order: path, git, ctx, tokens, cost, usage.
     for s in [
         Seg::Path,
@@ -715,17 +826,21 @@ fn info_row(
         Seg::Cost,
         Seg::Usage,
     ] {
-        if shown[SEGS.iter().position(|x| *x == s).unwrap_or(0)] {
-            segment(ui, ink, v, s, out);
+        if shown[s as usize] {
+            segment(ui, ink, v, s, path.as_deref().unwrap_or_default(), out);
         }
     }
 }
 
 /// Model chip `(width, cap)`: [`MODEL_CHIP_W`], capped at [`MODEL_CHIP_SHARE`] of the bar (never
-/// below [`MODEL_CHIP_MIN`]) so it never takes over a narrow bar.
-fn model_chip_width(bar_w: f32) -> (f32, f32) {
+/// below [`MODEL_CHIP_MIN`]) so it never takes over a narrow bar. `reserved` is the width the
+/// segments that must stay (and their gaps) need: the chip gives way to them down to
+/// [`MODEL_CHIP_MIN`].
+fn model_chip_width(bar_w: f32, reserved: f32) -> (f32, f32) {
     let cap = (bar_w * MODEL_CHIP_SHARE).max(MODEL_CHIP_MIN);
-    (MODEL_CHIP_W.min(cap), cap)
+    // A pixel of slack: layout rounds, and a segment must never miss its room by a hair.
+    let room = (bar_w - reserved - 1.0).max(MODEL_CHIP_MIN);
+    (MODEL_CHIP_W.min(cap).min(room), cap.min(room))
 }
 
 /// Which segments fit `budget`, in priority order: the first present one that does not fit ends
@@ -751,14 +866,25 @@ fn fit_segments<const N: usize>(
     shown
 }
 
-/// One segment: a pill (the pills are separated by the row's gap alone).
-fn segment(ui: &mut Ui, ink: &Ink, v: &BarView, seg: Seg, out: &mut Vec<BarAction>) {
+/// What the `shown` segments take, each with its gap.
+fn spent<const N: usize>(widths: &[f32; N], shown: &[bool; N], gap: f32) -> f32 {
+    widths
+        .iter()
+        .zip(shown)
+        .filter(|(_, s)| **s)
+        .map(|(w, _)| w + gap)
+        .sum()
+}
+
+/// One segment: a pill (the pills are separated by the row's gap alone). `path` is the path
+/// chip's text.
+fn segment(ui: &mut Ui, ink: &Ink, v: &BarView, seg: Seg, path: &str, out: &mut Vec<BarAction>) {
     let pal = ink.p;
     match seg {
         Seg::Path => {
             let r = chip(ui, ink, "path", Sense::click(), Tone::Plain, |ui| {
                 ui.label(icon_text(ICON_FOLDER, ICON_PX, pal.weak));
-                ui.add(text(&v.path_text, TEXT_PX, pal.text));
+                ui.add(text(path, TEXT_PX, pal.text));
             });
             let r = r.on_hover_cursor(CursorIcon::PointingHand);
             path_hover(&r, &v.path_full);
@@ -2166,19 +2292,19 @@ mod tests {
 
     #[test]
     fn segments_drop_monotonically_as_the_bar_narrows() {
-        // ctx is narrow, path wide: greedy skipping would show ctx but not path at some width,
-        // and path but not ctx at another.
-        let widths = [60.0, 90.0, 300.0, 70.0, 80.0];
-        let all = [true; 5];
-        let mut prev = [true; 5];
-        let mut w = 800.0;
+        // In priority order: ctx, usage, git, cost, tokens, path (smallest chip). Greedy skipping
+        // would show a narrow low-priority segment while a wider higher one is gone.
+        let widths = [60.0, 90.0, 300.0, 70.0, 80.0, 130.0];
+        let all = [true; 6];
+        let mut prev = [true; 6];
+        let mut w = 900.0;
         while w >= 0.0 {
             let now = fit_segments(&widths, &all, w, 6.0);
-            for i in 0..5 {
+            for i in 0..6 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {w}px");
             }
             // Never a lower-priority segment without every higher-priority one.
-            for i in 1..5 {
+            for i in 1..6 {
                 assert!(
                     !now[i] || now[i - 1],
                     "segment {i} shown without {} at {w}",
@@ -2191,21 +2317,42 @@ mod tests {
     }
 
     #[test]
-    fn model_chip_is_as_wide_in_every_session_and_segments_still_fit_monotonically() {
-        assert_eq!(model_chip_width(1400.0).0, MODEL_CHIP_W);
-        assert_eq!(model_chip_width(400.0).0, MODEL_CHIP_MIN);
-        // A worktree's long path chip leaves the model chip alone, so every segment still fits
-        // a 1100 px bar (sized from the path, the chip took 546 px and usage was dropped).
-        let widths = [60.0, 90.0, 420.0, 70.0, 80.0];
-        let all = [true; 5];
-        let (chip, _) = model_chip_width(1100.0);
-        assert_eq!(fit_segments(&widths, &all, 1100.0 - chip - 6.0, 6.0), all);
-        let mut prev = [true; 5];
+    fn model_chip_is_as_wide_in_every_session_and_yields_to_ctx_and_usage_down_to_its_minimum() {
+        assert_eq!(model_chip_width(1400.0, 0.0).0, MODEL_CHIP_W);
+        assert_eq!(model_chip_width(400.0, 0.0).0, MODEL_CHIP_MIN);
+        // Ctx (150) and usage (250) with their gaps need 418 px.
+        let reserved = 150.0 + 6.0 + 250.0 + 6.0 + 6.0;
+        assert_eq!(model_chip_width(1100.0, reserved).0, MODEL_CHIP_W);
+        let (chip, cap) = model_chip_width(600.0, reserved);
+        assert!(chip < MODEL_CHIP_W && chip > MODEL_CHIP_MIN, "{chip}");
+        assert!(
+            cap <= chip + 0.01,
+            "the chip may not grow past what is left: {cap} vs {chip}"
+        );
+        assert_eq!(model_chip_width(300.0, reserved).0, MODEL_CHIP_MIN);
+
+        // Usage (index 1) is dropped only once the chip is at its minimum and still leaves no
+        // room; every segment still drops monotonically.
+        let widths = [150.0, 250.0, 420.0, 70.0, 80.0, 130.0];
+        let all = [true; 6];
+        let fit = |bar: f32| {
+            let (chip, _) = model_chip_width(bar, reserved);
+            fit_segments(&widths, &all, bar - chip - 6.0, 6.0)
+        };
+        let least = MODEL_CHIP_MIN + reserved + 1.0;
+        assert!(
+            fit(least)[..2].iter().all(|s| *s),
+            "ctx and usage at {least}px"
+        );
+        assert!(
+            !fit(least - 20.0)[1],
+            "usage goes once the chip cannot yield more"
+        );
+        let mut prev = [true; 6];
         let mut bar = 1400.0;
         while bar >= 0.0 {
-            let (chip, _) = model_chip_width(bar);
-            let now = fit_segments(&widths, &all, bar - chip - 6.0, 6.0);
-            for i in 0..5 {
+            let now = fit(bar);
+            for i in 0..6 {
                 assert!(prev[i] || !now[i], "segment {i} came back at {bar}px");
             }
             prev = now;
@@ -2221,11 +2368,55 @@ mod tests {
             fit_segments(&widths, &present, 400.0, 6.0),
             [true, false, true, false, true]
         );
-        // Path no longer fits: tokens (lower priority) goes too.
+        // The last one no longer fits: nothing after it comes back either.
         assert_eq!(
             fit_segments(&widths, &present, 150.0, 6.0),
             [true, false, false, false, false]
         );
+    }
+
+    /// Width of a path as characters: the elision's `fits` stand-in.
+    fn elide(path: &str, chars: usize) -> String {
+        elide_path(path, |t| t.chars().count() <= chars)
+    }
+
+    #[test]
+    fn path_keeps_its_last_folders_behind_an_ellipsis() {
+        let p = "~/a/PersProject/OmpDeck";
+        assert_eq!(elide(p, 40), p, "room for all of it");
+        assert_eq!(elide(p, 23), p);
+        assert_eq!(elide(p, 22), "…/PersProject/OmpDeck");
+        assert_eq!(
+            elide(p, 20),
+            "…/OmpDeck",
+            "drops the folders from the front"
+        );
+        assert_eq!(elide(p, 9), "…/OmpDeck");
+        assert_eq!(
+            elide(p, 3),
+            "…/OmpDeck",
+            "the last folder stays whatever the room"
+        );
+        let w = "/work/OmpDeck-worktrees/bar-usage-fix";
+        assert_eq!(elide(w, 34), "…/OmpDeck-worktrees/bar-usage-fix");
+        assert_eq!(elide(w, 10), "…/bar-usage-fix");
+    }
+
+    #[test]
+    fn path_elision_handles_roots_windows_separators_and_unicode() {
+        assert_eq!(elide("~", 0), "~");
+        assert_eq!(elide("/", 0), "/");
+        assert_eq!(
+            elide("/proj", 0),
+            "/proj",
+            "a root folder has no parent to cut"
+        );
+        assert_eq!(elide("C:\\Users\\me\\proj", 10), "…\\me\\proj");
+        assert_eq!(elide("~/café/ünï", 8), "…/ünï");
+        // A folder name longer than the minimum is ellipsized itself, never split mid-character.
+        let long = elide("/a/b/ÀÉÎÕÜÀÉÎÕÜÀÉÎÕÜÀÉÎÕÜÀÉÎÕÜ", 0);
+        assert_eq!(long.chars().count(), PATH_MIN_CHARS);
+        assert!(long.starts_with('…') && long.ends_with('Ü'));
     }
 }
 
@@ -2396,5 +2587,258 @@ mod centering_tests {
         );
         assert_eq!(after.top(), before.top());
         assert_eq!(before.bottom() - after.bottom(), BAR_H);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use deck_core::config::{Density, UiFont, UiStyle};
+    use deck_core::status::PrInfo;
+
+    /// An Anthropic account with a 5 h and a weekly window.
+    const USAGE: &str = r#"{"generatedAt":1000,"reports":[{"provider":"anthropic","fetchedAt":1000,
+      "limits":[
+       {"id":"a:5h","label":"Claude 5 Hour","scope":{"windowId":"5h"},"window":{"id":"5h","label":"5 Hour","resetsAt":8040000},
+        "amount":{"usedFraction":0.37,"unit":"percent"},"status":"ok"},
+       {"id":"a:7d","label":"Claude 7 Day","scope":{"windowId":"7d"},"window":{"id":"7d","label":"7 Day","resetsAt":277200000},
+        "amount":{"usedFraction":0.815,"unit":"percent"},"status":"ok"}],
+      "metadata":{"email":"me@example.test","planType":"pro"}}],
+      "accountsWithoutUsage":[],"disabledCredentials":[]}"#;
+
+    const FOLDER: &str = "bar-usage-fix";
+    const WORKTREE: &str = "/work/OmpDeck-worktrees/bar-usage-fix";
+    const BRANCH: &str = "feat/statusbar-usage";
+
+    /// What of the bar's droppable segments a render painted.
+    #[derive(Debug, Default, PartialEq)]
+    struct Shown {
+        ctx: bool,
+        usage: bool,
+        git: bool,
+        cost: bool,
+        tokens: bool,
+        /// The path chip's text.
+        path: Option<String>,
+    }
+
+    impl Shown {
+        /// `[ctx, usage, git, cost, tokens, path]` in priority order.
+        fn flags(&self) -> [bool; 6] {
+            [
+                self.ctx,
+                self.usage,
+                self.git,
+                self.cost,
+                self.tokens,
+                self.path.is_some(),
+            ]
+        }
+    }
+
+    /// The bar of a session with everything to show, rendered in the user's setup (Lexend UI
+    /// font, Neutral style, Compact density).
+    struct Rig {
+        ctx: egui::Context,
+        view: BarView,
+        cat: ModelsCache,
+        picker: PickerState,
+    }
+
+    impl Rig {
+        fn new(cwd: &str) -> Rig {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::install(&ctx, crate::ui_fonts::UiFonts::none());
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+            crate::ui_fonts::finalize(&ctx);
+            theme::apply(
+                &ctx,
+                UiStyle::Neutral,
+                Density::Compact,
+                UiFont::Lexend,
+                true,
+            );
+            let mut cat = ModelsCache::default();
+            cat.finish(Ok(vec![ModelInfo {
+                selector: "anthropic/claude-opus-5-5".to_owned(),
+                provider: "anthropic".to_owned(),
+                id: "claude-opus-5-5".to_owned(),
+                name: "Claude Opus 5.5".to_owned(),
+                context_window: Some(1_000_000),
+                thinking: vec!["low".into(), "high".into()],
+                ..Default::default()
+            }]));
+            let st = SessionStatus {
+                cwd: cwd.into(),
+                stats: SessionStats {
+                    model: Some("anthropic/claude-opus-5-5".into()),
+                    thinking: Some("high".into()),
+                    input_tokens: 50_000,
+                    output_tokens: 200,
+                    cost: 7.0,
+                    context_tokens: Some(173_000),
+                    ..SessionStats::default()
+                },
+                git: Some(GitInfo {
+                    branch: BRANCH.into(),
+                    ahead: 2,
+                    behind: 1,
+                    staged: 1,
+                    unstaged: 3,
+                    untracked: 2,
+                    pr: Some(PrInfo {
+                        number: 12,
+                        url: "u".into(),
+                    }),
+                    ..GitInfo::default()
+                }),
+                ..SessionStatus::default()
+            };
+            let mut view = BarView::default();
+            view.update(Some(&Arc::new(st)), Path::new("/x"), &cat);
+            let usage = deck_core::usage::UsageSnapshot::parse(USAGE).expect("fixture parses");
+            view.set_usage(Some(&Arc::new(Summary::build(&usage, 0))));
+            Rig {
+                ctx,
+                view,
+                cat,
+                picker: PickerState::default(),
+            }
+        }
+
+        /// Renders the bar at `width` and reports which segments it painted.
+        fn shown(&mut self, width: f32) -> Shown {
+            let input = BarInput {
+                catalog: &self.cat,
+                favorites: &[],
+                provider: None,
+                activity: Activity::Idle,
+                pending: None,
+                assumed: None,
+                actions: ActionCtx::default(),
+                agents: AgentsChip::default(),
+                session: SessionExtras {
+                    tab: 0,
+                    task_unavailable: None,
+                },
+            };
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 700.0))),
+                ..Default::default()
+            };
+            let mut texts = Vec::new();
+            for i in 0..3 {
+                let mut out = self.ctx.run_ui(raw.clone(), |ui| {
+                    show(ui, &self.view, &mut self.picker, &input);
+                });
+                out.textures_delta.clear();
+                if i == 2 {
+                    for cs in &out.shapes {
+                        if let Shape::Text(t) = &cs.shape {
+                            let r = t.galley.rect.translate(t.pos.to_vec2());
+                            texts.push((t.galley.text().to_owned(), r));
+                        }
+                    }
+                }
+            }
+            // The info row is what lies left of the actions row (it starts at "Agents").
+            let actions = texts
+                .iter()
+                .find(|(t, _)| t == "Agents")
+                .map_or(width, |(_, r)| r.left());
+            let info: Vec<&str> = texts
+                .iter()
+                .filter(|(_, r)| r.right() <= actions)
+                .map(|(t, _)| t.as_str())
+                .collect();
+            let has = |s: &str| info.contains(&s);
+            Shown {
+                ctx: has("17.3%/1M"),
+                usage: has("5h") && has("wk"),
+                git: has(BRANCH),
+                cost: has("$7.00"),
+                tokens: has("50K"),
+                path: info
+                    .iter()
+                    .find(|t| t.ends_with(FOLDER))
+                    .map(|t| (*t).to_owned()),
+            }
+        }
+    }
+
+    #[test]
+    fn usage_chip_shows_with_ctx_and_git_at_the_users_bar_width() {
+        // 1920 px window, 425 px sidebar: the bar is about 1470 px.
+        let mut rig = Rig::new(WORKTREE);
+        let at_user = rig.shown(1470.0);
+        assert!(
+            at_user.ctx && at_user.usage && at_user.git,
+            "1470 px shows ctx, usage and git: {at_user:?}"
+        );
+        let narrow = rig.shown(1100.0);
+        assert!(
+            narrow.ctx && narrow.usage,
+            "1100 px keeps ctx and usage: {narrow:?}"
+        );
+        // The usage chip carries both windows.
+        assert!(rig.view.usage.as_ref().is_some_and(|u| u.chip.is_some()));
+    }
+
+    #[test]
+    fn path_elides_instead_of_pushing_usage_out() {
+        let mut rig = Rig::new(WORKTREE);
+        // A bar wide enough for everything shows the path whole.
+        let wide = rig.shown(3200.0);
+        assert_eq!(wide.path.as_deref(), Some(WORKTREE), "{wide:?}");
+        assert!(wide.flags().iter().all(|s| *s), "{wide:?}");
+
+        // Narrowing keeps usage and elides the path from the front until it goes.
+        let mut elided = None;
+        let mut width = 3200.0;
+        let mut last_len = usize::MAX;
+        while width >= 1100.0 {
+            let s = rig.shown(width);
+            assert!(s.usage, "usage dropped at {width}px for the path: {s:?}");
+            if let Some(p) = &s.path {
+                let len = p.chars().count();
+                assert!(len <= last_len, "the path grew at {width}px: {p}");
+                last_len = len;
+                if p.starts_with('…') {
+                    assert!(p.ends_with(FOLDER), "{p}");
+                    elided.get_or_insert(p.clone());
+                }
+            }
+            width -= 5.0;
+        }
+        assert!(
+            elided.is_some(),
+            "the path never elided between 3200 and 1100 px"
+        );
+        // The hover and click-to-copy keep the whole path.
+        assert_eq!(rig.view.path_full, WORKTREE);
+        assert_eq!(rig.view.path_text, WORKTREE);
+    }
+
+    #[test]
+    fn segments_drop_in_priority_order_and_never_come_back_on_a_narrower_bar() {
+        let mut rig = Rig::new(WORKTREE);
+        let mut prev = [true; 6];
+        let mut width = 3200.0;
+        while width >= 500.0 {
+            let now = rig.shown(width).flags();
+            for i in 0..6 {
+                assert!(prev[i] || !now[i], "segment {i} came back at {width}px");
+                // ctx, usage, git, cost, tokens, path: never one without all before it.
+                assert!(
+                    i == 0 || !now[i] || now[i - 1],
+                    "segment {i} shown without {} at {width}px",
+                    i - 1
+                );
+            }
+            prev = now;
+            width -= 5.0;
+        }
     }
 }

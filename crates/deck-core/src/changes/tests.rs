@@ -701,7 +701,8 @@ fn untracked_directory_diff_shares_one_byte_budget_across_files() {
 #[cfg(unix)]
 #[test]
 fn repository_fsmonitor_hook_never_runs() {
-    use std::os::unix::fs::PermissionsExt;
+    // The hook reaches its executed inode through `install` (another process), so no sibling
+    // test's fork can inherit a write fd to it (git's exec would fail with ETXTBSY).
 
     if Command::new("git").arg("--version").output().is_err() {
         return;
@@ -712,12 +713,19 @@ fn repository_fsmonitor_hook_never_runs() {
     commit_all(d);
     let marker = d.join(".git/fsmonitor-ran");
     let hook = d.join(".git/fsmonitor-hook");
+    let stage = d.join(".git/fsmonitor-hook.src");
     fs::write(
-        &hook,
+        &stage,
         format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
     )
     .expect("write hook");
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let installed = Command::new("install")
+        .args(["-m", "755"])
+        .arg(&stage)
+        .arg(&hook)
+        .status()
+        .expect("install hook");
+    assert!(installed.success());
     git(d, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
     write(d, "f.txt", "two\n");
 

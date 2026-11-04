@@ -30,16 +30,12 @@ fn sandboxed(agent: &Path) -> Option<Omp> {
 #[cfg(unix)]
 #[test]
 fn an_rpc_omp_that_closes_its_pipes_but_stays_alive_is_killed_after_a_bounded_wait() {
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let fake = tmp.path().join("omp");
-    fs::write(
+    install_exec(
         &fake,
         "#!/bin/sh\necho boom >&2\nexec 0<&- 1>&-\nexec sleep 120\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let started = std::time::Instant::now();
     let err = Omp::at(&fake)
         .copy_session(&tmp.path().join("src.jsonl"), tmp.path())
