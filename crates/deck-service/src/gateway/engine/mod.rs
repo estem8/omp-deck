@@ -11,6 +11,7 @@
 mod deferred;
 mod device;
 mod interest;
+mod model_route;
 mod mutate;
 mod notify;
 mod remote;

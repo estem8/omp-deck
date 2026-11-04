@@ -106,6 +106,9 @@ Sessions, chat, terminal and agents on your phone — see [Mobile companion](#mo
   Hovering the
   context meter shows omp's `/context` breakdown (system prompt, tools, skills, messages, free space,
   auto-compact buffer, per-tool schema sizes) for tabs running with live control.
+  Changing the model or thinking effort from the picker, the palette or the phone leaves a half-typed message in omp's
+  composer untouched (no "discard draft?" question) for tabs running with live control; only a switch that first needs
+  compaction still goes through omp's `/switch`.
   The model picker shows IQ, output tokens/sec, context size and token rates where available.
   Hover a model for output limits, cache-read pricing, input modalities, reasoning support and
   speed measurement details. Locally measured speed takes precedence over catalog estimates (`~`).

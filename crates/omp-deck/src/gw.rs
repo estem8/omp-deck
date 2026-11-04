@@ -11,7 +11,8 @@
 //!   not accepted (offline, stale epoch, refused) fails at once; an accepted one whose link breaks
 //!   is looked up again after the reconnect and is never sent twice.
 //! - [`Gw::submit`] additionally reports the controller's [`Submitted`] id once the gateway has
-//!   accepted the command: until then the request is only locally pending.
+//!   accepted the command (`None`: it handled the command without typing it into omp); until then
+//!   the request is only locally pending.
 //! - Closing the window drops these closures; accepted work belongs to the gateway.
 
 use std::cell::RefCell;
@@ -44,7 +45,7 @@ pub type Job = Box<dyn FnOnce(&mut App)>;
 type Poll = Box<dyn FnMut() -> Option<Option<Job>>>;
 type DoneFn = Box<dyn FnOnce(&mut App, Result<Done, String>)>;
 type ProgressFn = Rc<RefCell<dyn FnMut(&mut App, &Progress)>>;
-type AcceptedFn = Box<dyn FnOnce(&mut App, RequestKey, Result<Submitted, GatewayError>)>;
+type AcceptedFn = Box<dyn FnOnce(&mut App, RequestKey, Result<Option<Submitted>, GatewayError>)>;
 
 /// What the gateway answered to opening a pairing window. The invite itself is dropped (and
 /// wiped) on arrival: only the link the QR code carries is kept.
@@ -330,13 +331,15 @@ impl Gw {
     }
 
     /// Sends a command to a session's controller. `accepted` runs when the gateway accepted it
-    /// (with the controller's request id) or refused it; `done` when it reached its final result.
-    /// Between the call and `accepted` the request is only locally pending.
+    /// (with the controller's request id, or `None` when the gateway handled it without typing
+    /// anything into omp: a model change over live control, whose final [`Done`] arrives in `done`)
+    /// or refused it; `done` when it reached its final result. Between the call and `accepted` the
+    /// request is only locally pending.
     pub fn submit(
         &mut self,
         target: SessionTarget,
         command: Command,
-        accepted: impl FnOnce(&mut App, RequestKey, Result<Submitted, GatewayError>) + 'static,
+        accepted: impl FnOnce(&mut App, RequestKey, Result<Option<Submitted>, GatewayError>) + 'static,
         done: impl FnOnce(&mut App, Result<Done, String>) + 'static,
     ) -> RequestKey {
         let m = self.client.submit(target, command);
@@ -406,10 +409,8 @@ impl Gw {
                         t.accepted = true;
                     }
                     if let Some(cb) = a.on_accepted {
-                        let id = acc.submitted.ok_or_else(|| {
-                            GatewayError::Failed("the gateway returned no request id".to_owned())
-                        });
                         let key = a.key.clone();
+                        let id = Ok(acc.submitted);
                         jobs.push(Box::new(move |app: &mut App| cb(app, key, id)));
                     }
                 }
@@ -723,11 +724,12 @@ impl Gw {
         let refusal = Rc::new(std::cell::Cell::new(None));
         let seen = Rc::clone(&refusal);
         // The acceptance callback runs before the completion for the same request.
-        let on_accepted = move |_: &mut App, _: RequestKey, r: Result<Submitted, GatewayError>| {
-            if let Err(GatewayError::Rejected(why)) = r {
-                seen.set(Some(why));
-            }
-        };
+        let on_accepted =
+            move |_: &mut App, _: RequestKey, r: Result<Option<Submitted>, GatewayError>| {
+                if let Err(GatewayError::Rejected(why)) = r {
+                    seen.set(Some(why));
+                }
+            };
         self.track(
             m.key,
             m.accepted,

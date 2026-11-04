@@ -141,6 +141,11 @@ pub(super) struct Managed {
 }
 
 impl Managed {
+    /// The launch created the session with the control extension.
+    pub(super) fn ctl_expect(&self) -> bool {
+        self.ctl_expect
+    }
+
     pub(super) fn is_direct(&self) -> bool {
         self.mux.is_none()
     }
@@ -1238,7 +1243,7 @@ impl Engine {
                     finished.push((
                         rk,
                         Err(GatewayError::Failed(
-                            "could not reach the session's control socket".to_owned(),
+                            super::model_route::NO_SOCKET.to_owned(),
                         )),
                     ));
                 }
@@ -1279,6 +1284,10 @@ impl Engine {
             }
         }
         for (key, result) in finished {
+            if let Some(change) = self.defer.model_changes.remove(&key) {
+                self.model_change_finished(key, change, result);
+                continue;
+            }
             let label = self.jobs.get(&key).map(|j| j.label);
             let result = match label {
                 Some("answer-ui") => answer_ui_result(result),

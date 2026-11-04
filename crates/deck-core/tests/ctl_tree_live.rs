@@ -78,11 +78,12 @@ fn navigate_summarises_the_branch_left_and_redraws_the_tab() {
     let rows = live.entries();
     let (assistants, users) = (message_ids(&rows, "assistant"), message_ids(&rows, "user"));
     assert_eq!((assistants.len(), users.len()), (2, 2));
-    let tab = live.peek().to_string();
-    assert!(
-        tab.contains("Reply to two"),
-        "the tab shows the second answer before the move"
-    );
+    wait_for("the tab to show the second answer", TURN, || {
+        live.peek()
+            .to_string()
+            .contains("Reply to two")
+            .then_some(())
+    });
 
     // Plain move: no summary, the tab is redrawn by omp's own command context.
     let plain = nav(&live, &assistants[0], BranchSummary::None);
@@ -476,4 +477,212 @@ fn reanswering_an_ask_opens_omps_dialog_and_resumes_the_turn() {
         .find(|e| e["type"] == "message" && e["message"]["role"] == "assistant")
         .unwrap();
     assert!(last["message"]["content"].to_string().contains("alpha"));
+}
+
+/// Two more models next to `fake-1`: a thinking-capable one and one with a tiny context window.
+fn two_more_models(live: &Live) {
+    let yml = live.model.models_yml().replace(
+        "        input: [text, image]\n",
+        "        input: [text, image]\n      - id: fake-think\n        name: Fake Think\n        reasoning: true\n        \
+         contextWindow: 200000\n        maxTokens: 4096\n        input: [text]\n      - id: fake-small\n        \
+         name: Fake Small\n        contextWindow: 8\n        maxTokens: 4\n        input: [text]\n",
+    );
+    std::fs::write(live.agent.join("models.yml"), yml).unwrap();
+    let config = live.agent.join("config.yml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(config, text + "  slow: fake/fake-think\n").unwrap();
+}
+
+/// `(role, model)` of every `model_change` and the level of every `thinking_level_change`.
+fn model_and_thinking_entries(rows: &[Value]) -> (Vec<(String, String)>, Vec<String>) {
+    let models = rows
+        .iter()
+        .filter(|e| e["type"] == "model_change")
+        .map(|e| {
+            (
+                e["role"].as_str().unwrap_or("").to_owned(),
+                e["model"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    let levels = rows
+        .iter()
+        .filter(|e| e["type"] == "thinking_level_change")
+        .map(|e| e["thinkingLevel"].as_str().unwrap_or("").to_owned())
+        .collect();
+    (models, levels)
+}
+
+fn snapshot_model(live: &Live) -> (String, String) {
+    let m = live
+        .client()
+        .latest()
+        .and_then(|s| s.model.clone())
+        .expect("a model in the snapshot");
+    (m.selector, m.thinking)
+}
+
+/// Before the first reply omp may report no context usage; its TUI `/switch` counts that as 0 tokens
+/// (`getContextUsage()?.tokens ?? 0`), so a fresh session switches directly instead of falling back.
+#[test]
+fn switch_model_before_the_first_reply_switches_directly() {
+    let Some(live) = Live::start("sw0", script, two_more_models, |_| None) else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    let r = live.ctl(
+        CtlCommand::SwitchModel {
+            selector: "fake/fake-think".to_owned(),
+        },
+        TURN,
+    );
+    assert!(r.ok, "{r:?}");
+    wait_for("the snapshot to show the model", TURN, || {
+        (snapshot_model(&live).0 == "fake/fake-think").then_some(())
+    });
+}
+
+#[test]
+fn switch_model_and_set_effort_match_the_typed_commands() {
+    let Some(live) = Live::start("sw", script, two_more_models, |_| None) else {
+        eprintln!("skipping: OMPDECK_TEST_OMP is not set");
+        return;
+    };
+    turn(&live, "one");
+    // An omp upgrade that breaks a route internal answers "unsupported" (the gateway then falls back to the typed
+    // commands): a current omp must never do so, in any case below.
+    let supported = |r: deck_core::ctl::CtlReply| {
+        assert_ne!(
+            r.error.as_deref(),
+            Some("unsupported"),
+            "omp's internals drifted: {r:?}"
+        );
+        r
+    };
+    let switch = |sel: &str| {
+        supported(live.ctl(
+            CtlCommand::SwitchModel {
+                selector: sel.to_owned(),
+            },
+            TURN,
+        ))
+    };
+    let effort = |lvl: &str| {
+        supported(live.ctl(
+            CtlCommand::SetEffort {
+                level: lvl.to_owned(),
+            },
+            TURN,
+        ))
+    };
+    let in_snapshot = |want: &str| {
+        wait_for("the snapshot to show the model", TURN, || {
+            (snapshot_model(&live).0 == want).then_some(())
+        });
+    };
+
+    // By provider/id, by @role, with a :level suffix.
+    let by_id = switch("fake/fake-think");
+    assert!(by_id.ok, "{by_id:?}");
+    assert_eq!(by_id.value.as_ref().unwrap()["model"], "fake/fake-think");
+    assert_eq!(
+        by_id.message.as_deref(),
+        Some("Session-only model: fake/fake-think")
+    );
+    in_snapshot("fake/fake-think");
+    let back = switch("fake/fake-1");
+    assert!(back.ok, "{back:?}");
+    in_snapshot("fake/fake-1");
+    let by_role = switch("@slow");
+    assert!(by_role.ok, "{by_role:?}");
+    in_snapshot("fake/fake-think");
+    let with_level = switch("fake/fake-think:high");
+    assert!(with_level.ok, "{with_level:?}");
+    assert_eq!(
+        snapshot_model(&live),
+        ("fake/fake-think".to_owned(), "high".to_owned())
+    );
+    let (models, levels) = model_and_thinking_entries(&live.entries());
+    assert!(
+        models.len() >= 4 && models.iter().skip(1).all(|(role, _)| role == "temporary"),
+        "{models:?}"
+    );
+    assert_eq!(levels.last().map(String::as_str), Some("high"));
+
+    // Unknown selector.
+    let unknown = switch("nope/none");
+    assert_eq!(
+        (unknown.ok, unknown.error.as_deref()),
+        (false, Some("Unknown model: nope/none"))
+    );
+
+    // Effort: a valid level is written, a bad one is omp's text.
+    let ok = effort("low");
+    assert!(ok.ok, "{ok:?}");
+    assert_eq!(ok.message.as_deref(), Some("Thinking set to low."));
+    assert_eq!(snapshot_model(&live).1, "low");
+    assert_eq!(
+        model_and_thinking_entries(&live.entries())
+            .1
+            .last()
+            .map(String::as_str),
+        Some("low")
+    );
+    let bad = effort("bogus");
+    let err = bad.error.unwrap_or_default();
+    assert!(
+        !bad.ok && err.starts_with("Unknown thinking level: bogus. Available:"),
+        "{err}"
+    );
+
+    // Identity with the typed commands: the same entries (roles, models, levels).
+    let before = model_and_thinking_entries(&live.entries());
+    live.send("/switch fake/fake-1");
+    wait_for("the typed /switch", TURN, || {
+        (model_and_thinking_entries(&live.entries()).0.len() > before.0.len()).then_some(())
+    });
+    let typed = model_and_thinking_entries(&live.entries());
+    assert_eq!(
+        typed.0.last().unwrap(),
+        &("temporary".to_owned(), "fake/fake-1".to_owned())
+    );
+    live.send("/switch fake/fake-think");
+    wait_for("the typed /switch back", TURN, || {
+        (snapshot_model(&live).0 == "fake/fake-think").then_some(())
+    });
+    let n = model_and_thinking_entries(&live.entries()).1.len();
+    live.send("/effort medium");
+    wait_for("the typed /effort", TURN, || {
+        (model_and_thinking_entries(&live.entries()).1.len() > n).then_some(())
+    });
+    let typed_levels = model_and_thinking_entries(&live.entries()).1;
+    assert_eq!(typed_levels.last().map(String::as_str), Some("medium"));
+    let ctl_medium = effort("high");
+    assert!(ctl_medium.ok);
+    let after = model_and_thinking_entries(&live.entries()).1;
+    assert_eq!(
+        after.last().map(String::as_str),
+        Some("high"),
+        "same entry kind as the typed /effort"
+    );
+
+    // Over context: the target's window is smaller than the transcript -> nothing changes.
+    turn(&live, "fill the window");
+    let before = (
+        snapshot_model(&live),
+        model_and_thinking_entries(&live.entries()),
+    );
+    let over = switch("fake/fake-small");
+    assert_eq!(
+        (over.ok, over.error.as_deref()),
+        (false, Some("needs_compact")),
+        "{over:?}"
+    );
+    assert_eq!(
+        (
+            snapshot_model(&live),
+            model_and_thinking_entries(&live.entries())
+        ),
+        before
+    );
 }

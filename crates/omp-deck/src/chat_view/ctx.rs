@@ -112,6 +112,10 @@ pub struct CtxMenu {
 #[derive(Default)]
 pub struct Local {
     pub folds: HashMap<String, FoldOverride>,
+    /// The model name each assistant block was first drawn under (by node id): omp tells the
+    /// composer's model only, so a block keeps the name it had when it appeared and a later
+    /// switch does not relabel replies the earlier model wrote.
+    pub bylines: HashMap<String, String>,
     pub heights: HashMap<String, (u64, i32, f32)>,
     /// Estimated heights of items not measured yet, by the same key.
     pub estimates: HashMap<String, (u64, i32, f32)>,

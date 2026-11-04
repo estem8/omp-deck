@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::composer::TspComposer;
 use crate::inject::{ComposeMode, End, Env, HOLD_TAIL, Injector, Job, JobId, Requires, Write};
-use crate::model_switch::{FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
+use crate::model_switch::{Change, FRESH_TIMEOUT, Pending, SWITCH_TIMEOUT, plan_switch};
 use crate::session_actions::{self, Action, ActionCtx};
 use crate::status::TabStatus;
 use crate::statusfmt::Activity;
@@ -929,19 +929,29 @@ impl SessionController {
         })
     }
 
+    /// What a model or effort command changes, with the gating the typed path has (a no-op
+    /// switch, an effort on a session whose model is unknown); `None`: not a model command.
+    pub fn model_change(&self, command: &Command) -> Option<Result<Change, Rejected>> {
+        match command {
+            Command::SwitchModel { selector, level } => {
+                let current = self.current_model();
+                Some(
+                    plan_switch(current.as_deref(), selector, level.as_deref())
+                        .ok_or(Rejected::NoChange),
+                )
+            }
+            Command::SetEffort { level } => Some(
+                self.current_model()
+                    .ok_or(Rejected::ModelUnknown)
+                    .and_then(|current| {
+                        plan_switch(Some(&current), &current, Some(level)).ok_or(Rejected::NoChange)
+                    }),
+            ),
+            _ => None,
+        }
+    }
+
     fn job_for(&self, command: &Command) -> Result<(Job, Option<Pending>), Rejected> {
-        let switch = |current: Option<&str>, selector: &str, level: Option<&str>| {
-            let change = plan_switch(current, selector, level).ok_or(Rejected::NoChange)?;
-            let job = Job::slash(MODEL_SWITCH_LABEL, &change.command, Requires::Any);
-            Ok((
-                job,
-                Some(Pending {
-                    selector: change.selector,
-                    level: change.level,
-                    since: Instant::now(),
-                }),
-            ))
-        };
         match command {
             Command::Action(action) => match session_actions::job(action) {
                 Some(job) => Ok((job, None)),
@@ -950,13 +960,17 @@ impl SessionController {
                 }
                 None => Err(Rejected::Empty),
             },
-            Command::SwitchModel { selector, level } => {
-                let current = self.current_model();
-                switch(current.as_deref(), selector, level.as_deref())
-            }
-            Command::SetEffort { level } => {
-                let current = self.current_model().ok_or(Rejected::ModelUnknown)?;
-                switch(Some(&current), &current, Some(level))
+            Command::SwitchModel { .. } | Command::SetEffort { .. } => {
+                let change = self.model_change(command).ok_or(Rejected::Empty)??;
+                let job = Job::slash(MODEL_SWITCH_LABEL, &change.command, Requires::Any);
+                Ok((
+                    job,
+                    Some(Pending {
+                        selector: change.selector,
+                        level: change.level,
+                        since: Instant::now(),
+                    }),
+                ))
             }
             Command::Review { text, send } => {
                 if self.terminal.paste_bytes("x").is_none() {

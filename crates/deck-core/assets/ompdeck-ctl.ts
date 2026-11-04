@@ -375,6 +375,72 @@ export default async function ompdeckCtl(api: any) {
         return { ok: true, value: Array.isArray(now) ? now[0] ?? null : now ?? null };
       }
 
+      // omp never forwards model_changed / thinking_level_changed to extensions: after a change, refresh the cached context
+      // breakdown (it is keyed by model) and push a snapshot ourselves.
+      const refreshNow = () => { try { recompute(); } catch {} try { push(snapshot()); } catch {} };
+      // == TUI `/switch <selector>` (builtin-modes.ts + selector-controller.ts switchSessionModel/#applySessionModel), minus the UI
+      // notice. Not gated on idle, like the slash command. The compact-first branch is the caller's: over context -> needs_compact.
+      // Both routes lean on omp internals: anything missing or unexpected answers "unsupported" before changing anything,
+      // so the gateway falls back to the typed /switch / /effort.
+      const UNSUPPORTED = { ok: false, error: "unsupported" };
+      async function switchModel(cmd: any): Promise<any> {
+        const sess = mainSession();
+        const selector = typeof cmd.selector === "string" ? cmd.selector.trim() : "";
+        if (!sess || !selector) return { ok: false, error: "no model selector" };
+        let resolver: any;
+        try { resolver = await import("@oh-my-pi/pi-coding-agent/config/model-resolver"); } catch (e) { log("model-resolver import failed: " + e); return UNSUPPORTED; }
+        const fn = (o: any, k: string) => typeof o?.[k] === "function";
+        if (!fn(resolver, "resolveCliModel") || !fn(resolver, "getModelMatchPreferences") || !fn(sess, "setModelTemporary")
+          || !fn(sess, "resolveTemporaryModelThinkingLevel") || !fn(sess, "getContextUsage") || !sess.modelRegistry || !sess.settings) {
+          log("switch_model: an omp internal is missing");
+          return UNSUPPORTED;
+        }
+        let resolved: any;
+        try {
+          const scoped = (Array.isArray(sess.scopedModels) ? sess.scopedModels : []).map((s: any) => s.model ?? s).filter(Boolean);
+          resolved = resolver.resolveCliModel({
+            cliModel: selector, modelRegistry: sess.modelRegistry, availableModels: scoped.length > 0 ? scoped : undefined,
+            settings: sess.settings, preferences: resolver.getModelMatchPreferences(sess.settings),
+          });
+        } catch (e) { log("resolveCliModel failed: " + e); return UNSUPPORTED; }
+        if (!resolved || typeof resolved !== "object" || !("model" in resolved)) return UNSUPPORTED;
+        const model = resolved.model;
+        if (!model) return { ok: false, error: `Unknown model: ${selector}` };
+        if (typeof model.provider !== "string" || typeof model.id !== "string") return UNSUPPORTED;
+        // Exactly selector-controller.ts switchSessionModel: `contextWindow ?? 0`, `getContextUsage()?.tokens ?? 0` (unknown
+        // usage, e.g. before the first reply, counts as 0); only a present non-number value is drift.
+        const window = model.contextWindow ?? 0;
+        if (typeof window !== "number" || Number.isNaN(window)) return UNSUPPORTED;
+        if (window > 0) {
+          let tokens: unknown;
+          try { tokens = sess.getContextUsage()?.tokens ?? 0; } catch (e) { log("getContextUsage failed: " + e); return UNSUPPORTED; }
+          if (typeof tokens !== "number" || Number.isNaN(tokens)) return UNSUPPORTED;
+          if (tokens > window) return { ok: false, error: "needs_compact" };
+        }
+        let level: any;
+        try { level = resolved.thinkingLevel ?? sess.resolveTemporaryModelThinkingLevel(model); } catch (e) { log("thinking level lookup failed: " + e); return UNSUPPORTED; }
+        try { await sess.setModelTemporary(model, level); } catch (e: any) { return { ok: false, error: String(e?.message ?? e) }; }
+        refreshNow();
+        const key = `${model.provider}/${model.id}`;
+        const note = `Session-only model: ${key}`;
+        return { ok: true, value: { model: key, thinking: typeof sess.thinkingLevel === "string" ? sess.thinkingLevel : null }, message: resolved.warning ? `${note} (${resolved.warning})` : note };
+      }
+      // == TUI `/effort <level>`: resolveThinkingArgument + session.setThinkingLevel (not persisted).
+      async function setEffort(cmd: any): Promise<any> {
+        const sess = mainSession();
+        if (!sess) return { ok: false, error: "no session" };
+        let helper: any;
+        try { helper = await import("@oh-my-pi/pi-coding-agent/slash-commands/helpers/effort"); } catch (e) { log("effort import failed: " + e); return UNSUPPORTED; }
+        if (typeof helper?.resolveThinkingArgument !== "function" || typeof sess.setThinkingLevel !== "function") return UNSUPPORTED;
+        let r: any;
+        try { r = helper.resolveThinkingArgument(sess, String(cmd.level ?? "")); } catch (e) { log("resolveThinkingArgument failed: " + e); return UNSUPPORTED; }
+        if (r && typeof r === "object" && r.error) return { ok: false, error: String(r.error) };
+        if (!r || typeof r !== "object" || typeof r.level !== "string") return UNSUPPORTED;
+        try { sess.setThinkingLevel(r.level); } catch (e: any) { return { ok: false, error: String(e?.message ?? e) }; }
+        refreshNow();
+        return { ok: true, value: { thinking: typeof sess.thinkingLevel === "string" ? sess.thinkingLevel : null }, message: `Thinking set to ${r.level}.` };
+      }
+
       async function handle(cmd: any): Promise<any> {
         if (cmd.t === "list") return { ok: true, snapshot: snapshot() };
         if (cmd.t === "fork_at" || cmd.t === "navigate") {
@@ -465,6 +531,8 @@ export default async function ompdeckCtl(api: any) {
         if (cmd.t === "reanswer_ask") return reanswerAsk(cmd);
         if (cmd.t === "advisor_config") return advisorConfig(cmd);
         if (cmd.t === "task_model_override") return taskModelOverride(cmd);
+        if (cmd.t === "switch_model") return switchModel(cmd);
+        if (cmd.t === "set_effort") return setEffort(cmd);
         if (cmd.t !== "kill" && cmd.t !== "revive" && cmd.t !== "chat") return { ok: false, error: "unknown cmd" };
         // The tab may have moved to another root session (/new, /resume) since the command was composed.
         const want = rootFile();

@@ -3767,3 +3767,46 @@ Go here is inert on an excluded row. Advisor banner shows its own save/validatio
   `Namespace::list` + `kill`, then the root) — host sessions used to survive with their sockets deleted.
 - Not covered: mobile `Op`s for the new mutations (desktop only); spending a saved reset was not exercised live (no
   accounts in the sandbox).
+
+## 0.26.2: model / thinking changes without touching the composer (user, 2026-11-03)
+
+User decision: an **explicit, scoped exception** to the "runtime commands migrate to ctl only all together" rule, for
+`/switch` and `/effort` only (every other runtime command stays typed). Facts: `agent://SwitchParity` /
+`agent://DraftStash` (omp 18.16.0). Goal: changing model or thinking from OmpDeck never asks to discard the composer
+draft and never touches it (text, caret, pasted blocks, images stay).
+
+- **ctl** (`deck_core::ctl`, `assets/ompdeck-ctl.ts`), on the main session, same root check as other commands:
+  - `CtlCommand::SwitchModel { selector: String }` — exactly omp's TUI `/switch <selector>` minus the UI notice:
+    `resolveCliModel({cliModel, modelRegistry: sess.modelRegistry, availableModels: scoped models or undefined,
+    settings: sess.settings, preferences: getModelMatchPreferences(sess.settings)})`; no model → error
+    `Unknown model: <selector>` (resolver `warning` → `CtlReply.message`); **over context** (`contextWindow > 0 &&
+    getContextUsage().tokens > contextWindow`) → `ok:false, error:"needs_compact"` without changing anything;
+    else `level = resolved.thinkingLevel ?? sess.resolveTemporaryModelThinkingLevel(model)`,
+    `await sess.setModelTemporary(model, level)` (thrown error → error text). Reply `value`: `{model:"provider/id",
+    thinking}`; `message`: `Session-only model: provider/id` (+ warning).
+  - `CtlCommand::SetEffort { level: String }` — `resolveThinkingArgument(sess, level)` (error → its text), then
+    `sess.setThinkingLevel(r.level)`; reply `message` `Thinking set to <level>.`, `value` `{thinking}`.
+  - Both push a fresh snapshot (model / thinking) after the change; never gated on idle (omp's slash commands are not).
+- **Gateway** (`model_switch.rs` / controller): a picker/palette/PWA model or effort change on a session whose live
+  control is connected and matches the target goes through these ctl commands first; it never raises the draft
+  confirm. `needs_compact`, no/mismatched live control, or a transport failure before the command was delivered →
+  the existing typed `/switch` / `/effort` path (with its draft confirm) — never both. omp's errors surface as they
+  do today for the typed path (toast); the success `message` becomes a quiet toast. Pending-model tracking is
+  satisfied by the reply/snapshot. Existing gating for model changes stays as it is.
+
+### As built (0.26.2)
+- Gateway: `engine/model_route.rs` from the `Mutation::Submit` arm (GUI, palette, PWA all benefit); `Controller::model_change`
+  gives the gating + `CtlCommand` mapping (`:level` stays in the selector; same model + level → `SetEffort`). Success
+  → `Accepted { submitted: None }` then `Done::Message(<omp text>)`; `needs_compact` / not delivered → typed path via the
+  shared deferred `hand_over`; delivered-but-unknown → `Failed("omp may not have changed the model …")`, never retyped.
+- GUI: `Gw::submit`'s accepted callback takes `Option<Submitted>`; `None` = handled without injection (quiet toast from
+  `Done::Message`, error toast on failure). The bar's model prefers the live-control model; `deck_core::status` follows
+  the newest `model_change` by file order (an old model's reply after a mid-turn switch no longer reverts it). Chat
+  reply headers keep the model name they were first drawn under (`chat_view/ctx.rs` `Local.bylines`).
+- **omp version drift**: both routes use omp internals (`config/model-resolver`, `slash-commands/helpers/effort`,
+  `AgentSession.setModelTemporary` / `resolveTemporaryModelThinkingLevel` / `getContextUsage` / `setThinkingLevel`),
+  never patched or overridden. Any missing/unexpected piece answers `unsupported` before changing anything and the
+  gateway falls back to the typed command (also for the older `… unavailable` / `unknown cmd` replies). The
+  over-context check mirrors `selector-controller.ts` exactly (`contextWindow ?? 0`, `tokens ?? 0`). Live tests
+  (`ctl_tree_live`) assert a current omp never answers `unsupported`; CI's Windows job installs the latest omp but runs
+  only `ctl_live`, so drift is caught by local live runs.

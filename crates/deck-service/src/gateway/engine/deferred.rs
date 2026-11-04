@@ -111,6 +111,8 @@ pub(super) struct Deferred {
     /// Forced resumes handed to a controller: the internal key it runs under -> the journaled
     /// mutation it finishes.
     resumes: HashMap<RequestKey, RequestKey>,
+    /// Model and effort changes sent over live control, whose typed twin is the fallback.
+    pub(super) model_changes: HashMap<RequestKey, super::model_route::ModelChange>,
     seq: u64,
 }
 
@@ -252,6 +254,27 @@ impl Engine {
         Ok(key)
     }
 
+    /// Hands `command` to controller `i` for the tracked job `key`: it is typed under a fresh
+    /// internal key (the client's own sequence number may be behind the controller's watermark
+    /// by now), its draft confirmations go to `owner`, and its end finishes `key`'s journal
+    /// record. `Err`: the controller turned it away and nothing was queued.
+    pub(super) fn hand_over(
+        &mut self,
+        i: usize,
+        key: RequestKey,
+        owner: &str,
+        target: SessionTarget,
+        command: Command,
+    ) -> Result<(), Rejected> {
+        let session = target.key.clone();
+        let internal = self.internal_submit(i, owner, target, command)?;
+        self.jobs.remove(&key);
+        self.dirty.gateway = true;
+        self.sess.submits.insert(internal.clone(), session);
+        self.defer.resumes.insert(internal, key);
+        Ok(())
+    }
+
     /// One step of the waiting commands.
     pub(super) fn step_deferred(&mut self, _now: Instant) {
         if self.defer.items.is_empty() {
@@ -389,21 +412,14 @@ impl Engine {
                     && m.ctl.activity() == Activity::Idle
                     && !m.ctl.is_busy()
                 {
-                    // A fresh internal key: the client's own sequence number may be behind the
-                    // controller's watermark by now. Its end finishes the journaled mutation.
-                    match self.internal_submit(
+                    match self.hand_over(
                         i,
+                        key.clone(),
                         &item.owner,
                         target.clone(),
                         Command::Resume { file: file.clone() },
                     ) {
-                        Ok(internal) => {
-                            self.jobs.remove(&key);
-                            self.dirty.gateway = true;
-                            self.sess.submits.insert(internal.clone(), item.session);
-                            self.defer.resumes.insert(internal, key);
-                            return None;
-                        }
+                        Ok(()) => return None,
                         Err(Rejected::Busy | Rejected::NoBracketedPaste | Rejected::InputHeld) => {}
                         Err(r) => {
                             self.job_failed(key, GatewayError::Rejected(r));

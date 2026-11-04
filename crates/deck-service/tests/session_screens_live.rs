@@ -499,3 +499,185 @@ fn the_screens_mutations_reach_a_running_session() {
     });
     let _ = (prompt.outcome.wait(TURN), rename.outcome.wait(TURN));
 }
+
+/// What the composer holds, per the document.
+fn draft(doc: &Value) -> Option<String> {
+    Some(editor(doc)?["p"]["text"].as_str()?.to_owned())
+}
+
+/// The `model_change` and `thinking_level_change` entries of a session file, in order.
+fn changes(file: &Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "model_change" || v["type"] == "thinking_level_change")
+        .collect()
+}
+
+/// A model and an effort change from the picker, with a draft in omp's composer, go over live
+/// control: no confirmation, nothing typed, the draft untouched, and omp's own entries in the
+/// session file. An unknown model is omp's error, not typed text.
+#[test]
+fn model_and_effort_changes_leave_the_composer_draft_alone() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if which(if cfg!(windows) { "omp.exe" } else { "omp" }).is_none() {
+        eprintln!("skipped: omp is not installed");
+        return;
+    }
+    let config = format!("{OMP_CONFIG}modelRoles:\n  default: {}\n", fm::MODEL);
+    let sb = Sandbox::new("scrm", &config);
+    sb.report_failures();
+    ensure_host_exe();
+    let model = FakeModel::start(script());
+    // A second model that can think, to switch to.
+    let models = model.models_yml()
+        + "      - id: fake-2\n        name: Fake Two\n        reasoning: true\n        \
+           contextWindow: 200000\n        maxTokens: 4096\n        input: [text, image]\n";
+    std::fs::write(sb.agent().join("models.yml"), models).expect("models.yml");
+    let ns = Namespace::new(&sb.ns).expect("namespace");
+    let _cleanup = Cleanup(Namespace::new(&sb.ns).expect("namespace"));
+
+    let client = sb.client();
+    wait_for("the gateway link", Duration::from_secs(30), || {
+        matches!(client.link(), Link::Up(_)).then_some(())
+    });
+    let Ok(Outcome::Done(done)) = run(
+        &client,
+        Mutation::Launch(LaunchSpec {
+            mux_name: Some("omp-modelsw".to_owned()),
+            cwd: sb.proj(),
+            session_path: None,
+            label: "Chat".into(),
+            argv: vec!["omp".into()],
+            role: SessionRole::Session,
+            copy_of: None,
+            view: SessionView::Chat,
+        }),
+    ) else {
+        panic!("launch")
+    };
+    let Done::Session(target, _) = *done else {
+        panic!("launch result")
+    };
+    let name = wait_for("the host session", TURN, || ns.list().into_iter().next());
+    let peek = || deck_host::tsp_peek(&ns, &name).expect("tsp_peek");
+    wait_for("a sendable composer", TURN, || editor(&peek()).map(|_| ()));
+    wait_idle(&client, &target.key);
+    let command = |c| Mutation::Submit {
+        target: target.clone(),
+        command: c,
+    };
+    // A prompt makes omp write the session file.
+    let Ok(Outcome::Done(_)) = run(
+        &client,
+        command(deck_service::controller::Command::Prompt {
+            text: "Reply with ok. model".to_owned(),
+        }),
+    ) else {
+        panic!("prompt")
+    };
+    let info = wait_for("the session file", TURN, || {
+        controller(&client, &target.key).filter(|c| {
+            c.activity == Activity::Idle && c.session_path.as_ref().is_some_and(|p| p.is_file())
+        })
+    });
+    let file = info.session_path.expect("session file");
+    let before = changes(&file).len();
+
+    // A draft in the composer.
+    let Ok(Outcome::Done(_)) = run(
+        &client,
+        command(deck_service::controller::Command::Review {
+            text: "my half-typed draft".to_owned(),
+            send: false,
+        }),
+    ) else {
+        panic!("insert the draft")
+    };
+    wait_for("the draft in the composer", TURN, || {
+        (draft(&peek()).as_deref() == Some("my half-typed draft")).then_some(())
+    });
+    let requests = |client: &GatewayClient| {
+        controller(client, &target.key)
+            .map(|c| c.requests.len())
+            .unwrap_or_default()
+    };
+    let typed_before = requests(&client);
+
+    // The picker's model change: omp's own answer, no confirmation, nothing typed.
+    let switched = run(
+        &client,
+        command(deck_service::controller::Command::SwitchModel {
+            selector: "fake/fake-2".to_owned(),
+            level: None,
+        }),
+    );
+    let Ok(Outcome::Done(done)) = switched else {
+        panic!("model switch: {switched:?}")
+    };
+    assert!(
+        matches!(&*done, Done::Message(m) if m.contains("fake/fake-2")),
+        "{done:?}"
+    );
+    assert_eq!(
+        requests(&client),
+        typed_before,
+        "nothing was typed into omp"
+    );
+    assert_eq!(draft(&peek()).as_deref(), Some("my half-typed draft"));
+
+    // The thinking level (`model:level`, as the picker's level chips send it): the same.
+    let effort = run(
+        &client,
+        command(deck_service::controller::Command::SwitchModel {
+            selector: "fake/fake-2".to_owned(),
+            level: Some("low".to_owned()),
+        }),
+    );
+    let Ok(Outcome::Done(done)) = effort else {
+        panic!("effort: {effort:?}")
+    };
+    assert!(
+        matches!(&*done, Done::Message(m) if m.contains("fake/fake-2")),
+        "{done:?}"
+    );
+    assert_eq!(
+        requests(&client),
+        typed_before,
+        "nothing was typed into omp"
+    );
+    assert_eq!(draft(&peek()).as_deref(), Some("my half-typed draft"));
+    let entries = wait_for("omp's entries", TURN, || {
+        let all = changes(&file);
+        (all.len() >= before + 2).then_some(all)
+    });
+    let new = &entries[before..];
+    assert!(
+        new.iter().any(|e| e["type"] == "model_change"
+            && e["model"] == "fake/fake-2"
+            && e["role"] == "temporary"),
+        "{new:?}"
+    );
+    assert!(
+        new.iter()
+            .any(|e| e["type"] == "thinking_level_change" && e["thinkingLevel"] == "low"),
+        "{new:?}"
+    );
+
+    // omp's refusal is the error, and nothing is typed instead.
+    let unknown = run(
+        &client,
+        command(deck_service::controller::Command::SwitchModel {
+            selector: "fake/nope-9".to_owned(),
+            level: None,
+        }),
+    );
+    assert!(
+        matches!(&unknown, Ok(Outcome::Failed(t)) if t.contains("Unknown model"))
+            || unknown.is_err(),
+        "{unknown:?}"
+    );
+    assert_eq!(requests(&client), typed_before);
+    assert_eq!(draft(&peek()).as_deref(), Some("my half-typed draft"));
+}

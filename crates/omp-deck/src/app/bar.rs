@@ -6,7 +6,9 @@
 //! [`SessionTarget`] the user acted on; this module only turns the controller's events into
 //! dialogs and toasts.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -483,22 +485,37 @@ impl App {
     }
 
     /// Submits `command` to the session `target` names. A refusal is told to the user (one that
-    /// only restates a no-op stays silent). The final delivery arrives as a controller event.
+    /// only restates a no-op stays silent). The final delivery arrives as a controller event,
+    /// except for a change the gateway made over live control without typing anything: that one
+    /// ends with omp's own message (a quiet toast) or its error.
     pub(super) fn send_command(&mut self, target: &SessionTarget, command: Command) {
         // Actions and model switches that find omp gone stay silent, as the bar always did.
         let quiet_exit = matches!(
             command,
             Command::Action(_) | Command::SwitchModel { .. } | Command::SetEffort { .. }
         );
+        let direct = Rc::new(Cell::new(false));
+        let handled = Rc::clone(&direct);
         self.gw.submit(
             target.clone(),
             command,
             move |app, _key, result| match result {
-                Ok(_) => app.ctx.request_repaint(),
+                Ok(submitted) => {
+                    handled.set(submitted.is_none());
+                    app.ctx.request_repaint();
+                }
                 Err(GatewayError::Rejected(why)) => app.report_rejected(&why, quiet_exit),
                 Err(e) => app.toasts.error(&app.ctx, format!("Nothing was sent: {e}")),
             },
-            |app, result| {
+            move |app, result| {
+                if direct.get() {
+                    match direct_notice(result, quiet_exit) {
+                        DirectNotice::Success(text) => app.toasts.success(&app.ctx, text),
+                        DirectNotice::Failure(text) => app.toasts.error(&app.ctx, text),
+                        DirectNotice::Quiet => {}
+                    }
+                    return;
+                }
                 // The delivery itself is reported by the controller's events; what is left is a
                 // request whose fate the gateway could not record.
                 if let Err(e) = result
@@ -784,5 +801,83 @@ fn focus_editor(ui: &mut Ui, text: &mut String, first: &mut bool, multiline: boo
     if *first {
         r.request_focus();
         *first = false;
+    }
+}
+
+/// What the end of a change the gateway made over live control (nothing typed into omp) tells
+/// the user.
+#[derive(Debug, PartialEq, Eq)]
+enum DirectNotice {
+    /// omp's own words about what it did (`Session-only model: p/m`).
+    Success(String),
+    /// omp (or the gateway) could not make the change.
+    Failure(String),
+    /// Nothing to say: the typed fallback reports itself through the controller's events, and a
+    /// refusal that only restates the session's state stays silent as it always did.
+    Quiet,
+}
+
+/// The final result of a live-control change. A typed fallback (omp must compact first) ends
+/// with some other [`Done`] after its draft confirm; cancelling that confirm is not an error.
+fn direct_notice(result: Result<Done, String>, quiet_exit: bool) -> DirectNotice {
+    match result {
+        Ok(Done::Message(text)) if !text.trim().is_empty() => DirectNotice::Success(text),
+        Ok(_) => DirectNotice::Quiet,
+        Err(e) => {
+            let rejected = |why: Rejected| GatewayError::Rejected(why).to_string();
+            let restated = e == rejected(Rejected::NoChange)
+                || e == rejected(Rejected::NotInjected)
+                || (quiet_exit && e == rejected(Rejected::Exited));
+            if restated || e == GatewayError::Cancelled.to_string() {
+                DirectNotice::Quiet
+            } else {
+                DirectNotice::Failure(e)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[test]
+    fn omps_message_of_a_live_control_change_is_a_quiet_success() {
+        assert_eq!(
+            direct_notice(
+                Ok(Done::Message("Session-only model: fake/fake-2".into())),
+                true
+            ),
+            DirectNotice::Success("Session-only model: fake/fake-2".into())
+        );
+        assert_eq!(
+            direct_notice(Ok(Done::Message("  ".into())), true),
+            DirectNotice::Quiet
+        );
+    }
+
+    #[test]
+    fn a_failed_live_control_change_is_told_and_a_restated_state_is_not() {
+        assert_eq!(
+            direct_notice(Err("Unknown model: nope".into()), true),
+            DirectNotice::Failure("Unknown model: nope".into())
+        );
+        let text = |why| GatewayError::Rejected(why).to_string();
+        for quiet in [Rejected::NoChange, Rejected::NotInjected] {
+            assert_eq!(direct_notice(Err(text(quiet)), true), DirectNotice::Quiet);
+        }
+        assert_eq!(
+            direct_notice(Err(text(Rejected::Exited)), true),
+            DirectNotice::Quiet
+        );
+        assert_eq!(
+            direct_notice(Err(text(Rejected::Exited)), false),
+            DirectNotice::Failure(text(Rejected::Exited))
+        );
+        // The typed fallback: its draft confirm is the report, and declining it is not an error.
+        assert_eq!(
+            direct_notice(Err("cancelled".into()), true),
+            DirectNotice::Quiet
+        );
     }
 }

@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use deck_core::ctl::CtlCommand;
+
 /// How long an optimistic switch waits for the session file to show it.
 pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// Sessions that record no model yet (fresh, nothing persisted) can never confirm; give up sooner.
@@ -16,14 +18,27 @@ pub fn switch_command(selector: &str, level: Option<&str>) -> String {
     }
 }
 
+/// `/switch`'s live-control twin: the selector carries the `:level` suffix like the slash
+/// command's argument (omp's resolver reads it).
+fn ctl_switch(selector: &str, level: Option<&str>) -> CtlCommand {
+    CtlCommand::SwitchModel {
+        selector: match level {
+            Some(l) => format!("{selector}:{l}"),
+            None => selector.to_owned(),
+        },
+    }
+}
+
 pub fn effort_command(level: &str) -> String {
     format!("/effort {level}")
 }
 
 /// What picking something in the dropdown sends to omp.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     pub command: String,
+    /// The same change as a live-control command (omp applies it without touching the composer).
+    pub ctl: CtlCommand,
     pub selector: Option<String>,
     pub level: Option<String>,
 }
@@ -38,6 +53,7 @@ pub fn plan_switch(current: Option<&str>, selector: &str, level: Option<&str>) -
     if selector.starts_with('@') {
         return Some(Change {
             command: switch_command(selector, level),
+            ctl: ctl_switch(selector, level),
             selector: None,
             level: level.map(str::to_owned),
         });
@@ -45,12 +61,16 @@ pub fn plan_switch(current: Option<&str>, selector: &str, level: Option<&str>) -
     if current == Some(selector) {
         return level.map(|l| Change {
             command: effort_command(l),
+            ctl: CtlCommand::SetEffort {
+                level: l.to_owned(),
+            },
             selector: None,
             level: Some(l.to_owned()),
         });
     }
     Some(Change {
         command: switch_command(selector, level),
+        ctl: ctl_switch(selector, level),
         selector: Some(selector.to_owned()),
         level: level.map(str::to_owned),
     })
@@ -132,6 +152,38 @@ mod tests {
         assert_eq!(c.selector.as_deref(), Some("a/c"));
         let c = plan_switch(None, "a/c", None).expect("switch");
         assert_eq!(c.command, "/switch a/c");
+    }
+
+    #[test]
+    fn every_change_has_a_live_control_twin() {
+        let ctl =
+            |current, selector, level| plan_switch(current, selector, level).expect("a change").ctl;
+        assert_eq!(
+            ctl(Some("a/b"), "c/d", None),
+            CtlCommand::SwitchModel {
+                selector: "c/d".to_owned()
+            }
+        );
+        // The level rides on the selector, like `/switch c/d:high`.
+        assert_eq!(
+            ctl(Some("a/b"), "c/d", Some("high")),
+            CtlCommand::SwitchModel {
+                selector: "c/d:high".to_owned()
+            }
+        );
+        assert_eq!(
+            ctl(None, "@smol", Some("low")),
+            CtlCommand::SwitchModel {
+                selector: "@smol:low".to_owned()
+            }
+        );
+        // The session's own model with a level is an effort change.
+        assert_eq!(
+            ctl(Some("a/b"), "a/b", Some("low")),
+            CtlCommand::SetEffort {
+                level: "low".to_owned()
+            }
+        );
     }
 
     #[test]

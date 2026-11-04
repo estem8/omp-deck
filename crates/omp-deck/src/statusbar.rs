@@ -190,9 +190,10 @@ pub struct Defaults {
     pub level: Option<String>,
 }
 
-/// The session's model and thinking level: the file's once it records a model, else omp's live
-/// in-memory state (omp persists a session only with its first message, so model and thinking
-/// changes before it never reach the file).
+/// The session's model and thinking level: omp's live in-memory state while live control is
+/// connected (what the session runs *now*: a switch made mid-turn shows at once, and the reply
+/// the previous model finishes afterwards does not undo it), else the session file's newest
+/// record (omp also persists nothing before the first message, which live state covers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModelState<'a> {
     pub model: Option<&'a str>,
@@ -201,7 +202,7 @@ pub struct ModelState<'a> {
 }
 
 pub fn model_state<'a>(stats: &'a SessionStats, live: Option<&'a LiveModel>) -> ModelState<'a> {
-    match live.filter(|_| stats.model.is_none()) {
+    match live {
         Some(l) => ModelState {
             model: Some(&l.selector),
             thinking: Some(&l.thinking),
@@ -2229,41 +2230,54 @@ mod tests {
         v.set_live_model(Some(&high));
         assert!(v.update(Some(&fresh), Path::new("/w"), &catalog()));
         assert_eq!(v.current_level(), Some("high"));
-        // Once the file records a model (first message on), the file wins.
-        let persisted = Arc::new(status());
-        assert!(v.update(Some(&persisted), Path::new("/w"), &catalog()));
-        assert_eq!(v.level.as_deref(), Some("high"));
-        assert_eq!(v.current_level(), Some("auto"));
+        // The file recording a model (first message on) does not displace omp's live state: a
+        // reply written by the model before a mid-turn switch must not show as the model now.
         let mut file_model = status();
         file_model.stats.model = Some("openai/gpt-x".into());
+        assert!(v.update(
+            Some(&Arc::new(file_model.clone())),
+            Path::new("/w"),
+            &catalog()
+        ));
+        assert_eq!(v.model_name, "Claude Opus 5.5");
+        assert_eq!(v.current_level(), Some("high"));
+        // Without live control the file is all there is.
+        v.set_live_model(None);
         assert!(v.update(Some(&Arc::new(file_model)), Path::new("/w"), &catalog()));
         assert_eq!(v.model_name, "gpt-x");
     }
 
     #[test]
-    fn model_state_prefers_the_file_once_it_records_a_model() {
+    fn model_state_follows_live_control_and_falls_back_to_the_file() {
         let live = LiveModel {
             selector: "p/live".into(),
             thinking: "off".into(),
             thinking_configured: Some("off".into()),
+        };
+        let live_state = ModelState {
+            model: Some("p/live"),
+            thinking: Some("off"),
+            configured: Some("off"),
         };
         // A fresh file may carry a thinking_level_change without any model: live wins whole.
         let fresh = SessionStats {
             thinking: Some("max".into()),
             ..SessionStats::default()
         };
-        assert_eq!(
-            model_state(&fresh, Some(&live)),
-            ModelState {
-                model: Some("p/live"),
-                thinking: Some("off"),
-                configured: Some("off"),
-            }
-        );
+        assert_eq!(model_state(&fresh, Some(&live)), live_state);
         assert_eq!(model_state(&fresh, None).model, None);
-        let stats = status().stats;
+        // The file's last record can name the model that wrote a reply after the user switched
+        // away mid-turn (omp's `model_change` precedes that reply): the live model is the
+        // selected one.
+        let stale = status().stats;
         assert_eq!(
-            model_state(&stats, Some(&live)),
+            stale.model.as_deref(),
+            Some("anthropic/claude-opus-5-5"),
+            "the fixture's file model"
+        );
+        assert_eq!(model_state(&stale, Some(&live)), live_state);
+        assert_eq!(
+            model_state(&stale, None),
             ModelState {
                 model: Some("anthropic/claude-opus-5-5"),
                 thinking: Some("high"),

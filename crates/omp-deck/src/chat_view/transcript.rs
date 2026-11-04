@@ -327,7 +327,8 @@ pub fn role_node(cx: &Cx, ui: &mut Ui, n: &SNode) -> bool {
 fn assistant(cx: &Cx, ui: &mut Ui, n: &SNode, byline: bool) {
     let ink = cx.ink;
     if byline {
-        let model = model_name(cx);
+        let model = model_name(cx)
+            .map(|now| cx.loc(|l| l.bylines.entry(n.id.clone()).or_insert(now).clone()));
         let label = match model {
             Some(m) => format!("omp · {m}"),
             None => "omp".to_owned(),

@@ -260,6 +260,8 @@ pub struct SessionStatsReader {
     file_id: Option<FileId>,
     parsed_to: u64,
     stats: SessionStats,
+    /// A `model_change` was applied: from then on only further changes set `stats.model`.
+    model_from_change: bool,
     titles: Titles,
 }
 
@@ -270,6 +272,7 @@ impl SessionStatsReader {
             file_id: None,
             parsed_to: 0,
             stats: SessionStats::default(),
+            model_from_change: false,
             titles: Titles::default(),
         }
     }
@@ -296,6 +299,7 @@ impl SessionStatsReader {
         if self.file_id != Some(id) || len < self.parsed_to {
             changed = self.stats != SessionStats::default();
             self.stats = SessionStats::default();
+            self.model_from_change = false;
             self.titles = Titles::default();
             self.parsed_to = 0;
             self.file_id = Some(id);
@@ -391,8 +395,13 @@ impl SessionStatsReader {
             b"model_usage" => {
                 parse::<UsageEntry>(line).map(|e| self.add_usage(e.usage.as_ref(), true))
             }
-            b"model_change" => parse::<ModelChange>(line)
-                .map(|e| set(&mut self.stats.model, e.model.filter(|m| !m.is_empty()))),
+            b"model_change" => parse::<ModelChange>(line).map(|e| {
+                let model = e.model.filter(|m| !m.is_empty());
+                // The newest change is the session's model, whatever a later assistant record says (a switch mid-turn
+                // is followed by the old model's reply).
+                self.model_from_change |= model.is_some();
+                set(&mut self.stats.model, model)
+            }),
             b"thinking_level_change" => parse::<ThinkingChange>(line).map(|e| {
                 let level = Some(e.level.unwrap_or_else(|| "off".to_owned()));
                 set(&mut self.stats.thinking, level)
@@ -460,6 +469,7 @@ impl SessionStatsReader {
         if let (Some(p), Some(m)) = (&msg.provider, &msg.model)
             && !p.is_empty()
             && !m.is_empty()
+            && !self.model_from_change
         {
             changed |= set(&mut self.stats.model, Some(format!("{p}/{m}")));
         }
@@ -1477,9 +1487,10 @@ mod tests {
         assert!(r.refresh().unwrap(), "model switch of the aborted entry");
         assert!(!r.stats().last_turn_failed);
         assert_eq!(r.stats().context_tokens, ctx);
+        // The fixture has a model_change: an assistant record of another model does not move the selected model.
         assert_eq!(
             r.stats().model.as_deref(),
-            Some("openai-codex/gpt-5.6-luna")
+            Some("commandcode/deepseek/deepseek-v4.1-flash")
         );
     }
 
@@ -1530,6 +1541,54 @@ mod tests {
         );
         r.refresh().unwrap();
         assert_eq!(r.stats().thinking.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn the_newest_model_change_wins_over_an_assistant_of_the_old_model() {
+        let change = |m: &str| {
+            format!(
+                r#"{{"type":"model_change","id":"c","parentId":null,"timestamp":"t","model":"{m}","role":"temporary"}}"#
+            )
+        };
+        let reply = |m: &str| assistant_line(m, 10, 2, 0.1, "stop", "ok");
+        let model_of = |lines: &[String]| {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("s.jsonl");
+            write_lines(&p, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut r = SessionStatsReader::new(p);
+            r.refresh().unwrap();
+            r.stats().model.clone()
+        };
+        // A change after the last reply.
+        assert_eq!(
+            model_of(&[reply("a"), change("p/b")]).as_deref(),
+            Some("p/b")
+        );
+        // A switch mid-turn: the turn's reply is still the old model's, written after the change.
+        assert_eq!(
+            model_of(&[change("p/b"), reply("a")]).as_deref(),
+            Some("p/b")
+        );
+        // Older files without any model_change: the assistant tells.
+        assert_eq!(model_of(&[reply("a")]).as_deref(), Some("p/a"));
+    }
+
+    #[test]
+    fn a_rewind_forgets_that_a_model_change_was_seen() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let change = r#"{"type":"model_change","id":"c","parentId":null,"timestamp":"t","model":"p/b","role":"temporary"}"#;
+        write_lines(
+            &p,
+            &[change, &assistant_line("a", 10, 2, 0.1, "stop", "ok")],
+        );
+        let mut r = SessionStatsReader::new(p.clone());
+        r.refresh().unwrap();
+        assert_eq!(r.stats().model.as_deref(), Some("p/b"));
+        // Same inode, shorter: only a reply without any change remains.
+        write_lines(&p, &[&assistant_line("a", 1, 1, 0.1, "stop", "x")]);
+        r.refresh().unwrap();
+        assert_eq!(r.stats().model.as_deref(), Some("p/a"));
     }
 
     #[test]
@@ -1613,7 +1672,11 @@ mod tests {
         assert_eq!(s.output_tokens, base.output_tokens + 7);
         assert_eq!(s.last_assistant_text.as_deref(), Some("héllo → wörld ✓"));
         assert_eq!(s.context_tokens, Some(100));
-        assert_eq!(s.model.as_deref(), Some("p/p/new"));
+        assert_eq!(
+            s.model.as_deref(),
+            Some("commandcode/deepseek/deepseek-v4.1-flash"),
+            "the fixture's model_change stays the session's model"
+        );
     }
 
     #[test]

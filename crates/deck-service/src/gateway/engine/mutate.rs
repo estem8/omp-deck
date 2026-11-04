@@ -492,6 +492,8 @@ impl Engine {
         key: RequestKey,
         result: Result<impl Into<Box<Done>>, GatewayError>,
     ) {
+        // A model change that ended another way than through its reply (the session closed).
+        self.defer.model_changes.remove(&key);
         let state = self.jobs.remove(&key);
         let mut result = result.map(Into::into);
         let mut cancelled = false;
@@ -645,6 +647,9 @@ impl Engine {
                 let Some(i) = index else {
                     return self.vanished(conn, id, key);
                 };
+                if self.try_model_ctl(conn, id, &key, i, &target, &command) {
+                    return;
+                }
                 self.submit_now(conn, id, key, i, target, command);
             }
             Mutation::Answer {

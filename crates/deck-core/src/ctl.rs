@@ -476,6 +476,20 @@ pub enum CtlCommand {
         root: Option<PathBuf>,
         model: Option<String>,
     },
+    /// omp's TUI `/switch <selector>` on the main session, minus the UI notice (never gated on
+    /// idle, like the slash command): the session-only model change. Reply `value`
+    /// `{model: "provider/id", thinking}`, `message` `Session-only model: provider/id` (plus the
+    /// resolver's warning). `Unknown model: <selector>` when nothing matches; error
+    /// `needs_compact` (nothing changed) when the transcript exceeds the target's context window.
+    SwitchModel {
+        selector: String,
+    },
+    /// omp's TUI `/effort <level>` on the main session: reply `value` `{thinking}`, `message`
+    /// `Thinking set to <level>.`; omp's own text (`Unknown thinking level: … Available: …`) on a
+    /// refused level.
+    SetEffort {
+        level: String,
+    },
     /// Answer the pending UI request `id` ([`PendingUi::id`]) with `value`, the dialog
     /// function's own result: a label (`select`), `true`/`false` (`confirm`), text
     /// (`input`/`editor`), omp's `{kind:"submit",results:[…]}` (`ask`), or `"once"` / `"session"`
@@ -877,6 +891,12 @@ fn encode(rid: u64, cmd: &CtlCommand) -> Vec<u8> {
         CtlCommand::TaskModelOverride { root, model } => {
             serde_json::json!({"rid": rid, "t": "task_model_override", "root": root, "model": model})
         }
+        CtlCommand::SwitchModel { selector } => {
+            serde_json::json!({"rid": rid, "t": "switch_model", "selector": selector})
+        }
+        CtlCommand::SetEffort { level } => {
+            serde_json::json!({"rid": rid, "t": "set_effort", "level": level})
+        }
         CtlCommand::PinAccount {
             root,
             provider,
@@ -1229,6 +1249,44 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_and_effort_commands_round_trip_and_encode() {
+        for cmd in [
+            CtlCommand::SwitchModel {
+                selector: "@slow:high".into(),
+            },
+            CtlCommand::SetEffort {
+                level: "low".into(),
+            },
+        ] {
+            let back: CtlCommand =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(back, cmd);
+        }
+        let line = encode(
+            7,
+            &CtlCommand::SwitchModel {
+                selector: "a/b".into(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_slice(line.trim_ascii()).unwrap();
+        assert_eq!(
+            (v["t"].as_str(), v["selector"].as_str(), v["rid"].as_u64()),
+            (Some("switch_model"), Some("a/b"), Some(7))
+        );
+        let line = encode(
+            8,
+            &CtlCommand::SetEffort {
+                level: "off".into(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_slice(line.trim_ascii()).unwrap();
+        assert_eq!(
+            (v["t"].as_str(), v["level"].as_str()),
+            (Some("set_effort"), Some("off"))
+        );
+    }
 
     #[test]
     fn navigate_payloads_without_a_summary_still_decode() {
